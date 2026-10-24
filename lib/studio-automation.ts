@@ -1,5 +1,7 @@
 import fs from 'fs'
+import os from 'os'
 import path from 'path'
+import { execFileSync } from 'child_process'
 import { chromium, type BrowserContext, type Page, type Response as PlaywrightResponse } from 'playwright'
 import { DATA_DIR } from './paths'
 import {
@@ -8,6 +10,7 @@ import {
   findFirstVisibleLocator,
 } from './studio-selectors'
 import {
+  DEFAULT_STUDIO_UPLOAD_GATE,
   computeEffectiveMaxInputTokens,
   encryptSecret,
   loadDecryptedPlaywrightCookies,
@@ -64,6 +67,132 @@ export interface StudioLiveSnapshot {
 const VIEWPORT = { width: 1366, height: 840 }
 const STUDIO_CHROME_PROFILE_NAME = 'studio-chrome-profile'
 
+export function readAutomationRamPercent(): number {
+  try {
+    if (fs.existsSync('/proc/meminfo')) {
+      const meminfo = fs.readFileSync('/proc/meminfo', 'utf8')
+      const totalMatch = meminfo.match(/MemTotal:\s+(\d+)\s+kB/i)
+      const availMatch = meminfo.match(/MemAvailable:\s+(\d+)\s+kB/i)
+      if (totalMatch && availMatch) {
+        const total = Number(totalMatch[1])
+        const avail = Number(availMatch[1])
+        if (total > 0) {
+          return Math.round(((total - avail) / total) * 100)
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  const total = os.totalmem()
+  const free = os.freemem()
+  if (total <= 0) return 0
+  return Math.round(((total - free) / total) * 100)
+}
+
+/**
+ * Global Upload Gate across all workers/scans:
+ * Ensures at most N workers (default 2) attach/upload video files to AI Studio concurrently
+ * so 10 Chrome processes never buffer 300+ MB files in RAM at the same time.
+ */
+class GlobalStudioUploadGate {
+  private maxConcurrent = DEFAULT_STUDIO_UPLOAD_GATE
+  private inUse = 0
+  private activeHolders = new Set<string>()
+  private waiters: Array<{
+    holderId: string
+    grant: () => void
+    cancelled: boolean
+  }> = []
+
+  public setMaxConcurrent(limit: number) {
+    if (Number.isFinite(limit) && limit >= 1) {
+      this.maxConcurrent = Math.max(1, Math.min(10, Math.round(limit)))
+      this.pump()
+    }
+  }
+
+  public getStatus() {
+    return {
+      inUse: this.inUse,
+      maxConcurrent: this.maxConcurrent,
+      waiting: this.waiters.filter((w) => !w.cancelled).length,
+      holders: Array.from(this.activeHolders),
+    }
+  }
+
+  public async acquire(
+    holderId: string,
+    opts?: {
+      onWaiting?: (inUse: number, maxConcurrent: number, queuePos: number) => void
+      isAborted?: () => boolean
+    },
+  ): Promise<() => void> {
+    if (this.inUse < this.maxConcurrent) {
+      this.inUse += 1
+      this.activeHolders.add(holderId)
+      let released = false
+      return () => {
+        if (released) return
+        released = true
+        this.inUse = Math.max(0, this.inUse - 1)
+        this.activeHolders.delete(holderId)
+        this.pump()
+      }
+    }
+
+    const waiter = {
+      holderId,
+      grant: () => {},
+      cancelled: false,
+    }
+    this.waiters.push(waiter)
+    const activeWaiters = this.waiters.filter((w) => !w.cancelled)
+    opts?.onWaiting?.(this.inUse, this.maxConcurrent, activeWaiters.length)
+
+    await new Promise<void>((resolve, reject) => {
+      const pollTimer = setInterval(() => {
+        if (opts?.isAborted?.()) {
+          waiter.cancelled = true
+          clearInterval(pollTimer)
+          reject(new Error('STOPPED BY USER'))
+        }
+      }, 400)
+      waiter.grant = () => {
+        clearInterval(pollTimer)
+        resolve()
+      }
+    })
+
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.inUse = Math.max(0, this.inUse - 1)
+      this.activeHolders.delete(holderId)
+      this.pump()
+    }
+  }
+
+  private pump() {
+    while (this.inUse < this.maxConcurrent && this.waiters.length > 0) {
+      const next = this.waiters.shift()!
+      if (next.cancelled) continue
+      this.inUse += 1
+      this.activeHolders.add(next.holderId)
+      next.grant()
+    }
+  }
+}
+
+const globalForUploadGate = globalThis as unknown as {
+  __cmtStudioUploadGate?: GlobalStudioUploadGate
+}
+
+export const globalStudioUploadGate: GlobalStudioUploadGate =
+  globalForUploadGate.__cmtStudioUploadGate ||
+  (globalForUploadGate.__cmtStudioUploadGate = new GlobalStudioUploadGate())
+
 let globalClipboardLockPromise: Promise<void> = Promise.resolve()
 
 async function withClipboardLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -91,6 +220,7 @@ export class StudioBrowserController {
   public readonly workerTag: string
   private context: BrowserContext | null = null
   private page: Page | null = null
+  private pageCrashed = false
   private launching: Promise<Page> | null = null
   private paused = false
   private stoppedScanIds = new Set<string>()
@@ -156,7 +286,53 @@ export class StudioBrowserController {
     this.logs = []
   }
 
+  public isBrowserOrTargetCrashError(msg: string): boolean {
+    if (this.pageCrashed) return true
+    return /target\s+crashed|page\s+crashed|frame\s+crashed|target\s+page,\s*context\s+or\s+browser\s+has\s+been\s+closed|browser\s+has\s+been\s+closed|context\s+closed|target\s+closed|cdp\s+session.*closed|inspector.*detached/i.test(
+      msg || '',
+    )
+  }
+
+  /**
+   * Immediately close a dead/crashed Playwright context, kill any zombie Chrome processes
+   * bound to this worker's profile directory, and clean SingletonLock files so the next
+   * `ensurePage` launches a fresh Chrome browser from the same worker profile.
+   */
+  public async forceRestartDeadBrowser(): Promise<void> {
+    this.pageCrashed = false
+    const ctx = this.context
+    this.context = null
+    this.page = null
+    this.launching = null
+
+    if (ctx) {
+      try {
+        await Promise.race([
+          ctx.close(),
+          new Promise((r) => setTimeout(r, 3000)),
+        ])
+      } catch {
+        /* ignore dead context close error */
+      }
+    }
+
+    const profileDir = path.join(DATA_DIR, this.profileDirName)
+    try {
+      execFileSync('pkill', ['-9', '-f', profileDir], { stdio: 'ignore' })
+    } catch {
+      /* ignore if no lingering processes */
+    }
+    for (const lockName of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+      try {
+        fs.rmSync(path.join(profileDir, lockName), { force: true })
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   public async closeContext(): Promise<void> {
+    this.pageCrashed = false
     if (this.context) {
       try {
         await this.context.close()
@@ -367,8 +543,22 @@ export class StudioBrowserController {
     return display
   }
 
+  private attachPageLifecycleListeners(p: Page) {
+    p.on('crash', () => {
+      this.pageCrashed = true
+    })
+    p.on('close', () => {
+      if (this.page === p) {
+        this.page = null
+      }
+    })
+  }
+
   public async ensurePage(username: string): Promise<Page> {
-    if (this.page && !this.page.isClosed() && this.context) {
+    if (this.pageCrashed) {
+      await this.forceRestartDeadBrowser()
+    }
+    if (this.page && !this.page.isClosed() && !this.pageCrashed && this.context) {
       await this.context
         .grantPermissions(['clipboard-read', 'clipboard-write'], {
           origin: 'https://aistudio.google.com',
@@ -411,6 +601,9 @@ export class StudioBrowserController {
           '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--disable-extensions',
+          '--disable-background-networking',
           '--disable-blink-features=AutomationControlled',
           '--disable-background-timer-throttling',
           '--disable-renderer-backgrounding',
@@ -485,6 +678,8 @@ export class StudioBrowserController {
 
         const pages = this.context.pages()
         this.page = pages.length > 0 ? pages[0] : await this.context.newPage()
+        this.pageCrashed = false
+        this.attachPageLifecycleListeners(this.page)
         await this.page.setViewportSize(VIEWPORT)
 
         this.lastInjectedCookieUser = username
@@ -837,7 +1032,7 @@ export class StudioBrowserController {
    * model list / thinking level dropdown selectors are not found or verification fails.
    */
   private async dumpRunSettingsPanelDiagnostics(page: Page, reason: string): Promise<void> {
-    if (this.suppressDiagDumps) return
+    if (this.suppressDiagDumps || this.pageCrashed || page.isClosed()) return
     try {
       const dump = await page.evaluate(() => {
         const isVisible = (el: Element | null): el is HTMLElement => {
@@ -924,7 +1119,12 @@ export class StudioBrowserController {
       }
       console.warn(`[Studio RunSettings Diag] controls:`, dump.controls)
     } catch (err) {
-      this.logStep('diag panel err', (err as Error).message, 'warn')
+      const msg = (err as Error)?.message || String(err)
+      if (this.isBrowserOrTargetCrashError(msg)) {
+        this.pageCrashed = true
+        return
+      }
+      this.logStep('diag panel err', msg, 'warn')
     }
   }
 
@@ -1754,16 +1954,22 @@ export class StudioBrowserController {
     label: string,
     uploadedBasename: string,
   ): Promise<void> {
-    if (this.suppressDiagDumps) return
+    if (this.suppressDiagDumps || this.pageCrashed || page.isClosed()) return
     try {
       fs.mkdirSync(DATA_DIR, { recursive: true })
       const shotPath = path.join(DATA_DIR, `studio-attach-fail-${label}-${Date.now()}.png`)
       await page.screenshot({ path: shotPath, fullPage: true })
       this.logStep('diag screenshot', `Saved to ${shotPath}`, 'warn')
     } catch (shotErr) {
-      this.logStep('diag screenshot err', (shotErr as Error).message, 'warn')
+      const msg = (shotErr as Error)?.message || String(shotErr)
+      if (this.isBrowserOrTargetCrashError(msg)) {
+        this.pageCrashed = true
+        return
+      }
+      this.logStep('diag screenshot err', msg, 'warn')
     }
 
+    if (this.pageCrashed || page.isClosed()) return
     try {
       const diag = await page.evaluate((basename) => {
         const needle = (basename || '.mp4').toLowerCase()
@@ -1854,7 +2060,12 @@ export class StudioBrowserController {
       console.warn(`[Studio Attach Diag - ${label}] (b) ancestors:`, diag.ancestors)
       console.warn(`[Studio Attach Diag - ${label}] (c) buttons:`, diag.buttons)
     } catch (diagErr) {
-      this.logStep('diag eval err', (diagErr as Error).message, 'warn')
+      const msg = (diagErr as Error)?.message || String(diagErr)
+      if (this.isBrowserOrTargetCrashError(msg)) {
+        this.pageCrashed = true
+        return
+      }
+      this.logStep('diag eval err', msg, 'warn')
     }
   }
 
@@ -1862,7 +2073,7 @@ export class StudioBrowserController {
    * Problem 1(c): Dump open Video Settings dialog / popover DOM + all inputs when start/end/FPS inputs are not found.
    */
   private async dumpVideoDialogDiagnostics(page: Page, label: string, reason: string): Promise<void> {
-    if (this.suppressDiagDumps) return
+    if (this.suppressDiagDumps || this.pageCrashed || page.isClosed()) return
     try {
       const dump = await page.evaluate(() => {
         // Prioritize non-empty dialog / overlay panes that contain inputs or buttons (skipping empty tooltip panes)
@@ -1895,7 +2106,12 @@ export class StudioBrowserController {
       console.warn(`[Studio Dialog Diag - ${label}] ${reason} ::`, dump.dialogHtml)
       console.warn(`[Studio Dialog Diag - ${label}] inputs:`, dump.inputs)
     } catch (err) {
-      this.logStep('diag dialog err', (err as Error).message, 'warn')
+      const msg = (err as Error)?.message || String(err)
+      if (this.isBrowserOrTargetCrashError(msg)) {
+        this.pageCrashed = true
+        return
+      }
+      this.logStep('diag dialog err', msg, 'warn')
     }
   }
 
@@ -3163,28 +3379,80 @@ export class StudioBrowserController {
         await this.configureRunSettings(page, { modelName: activeModelName, maxOutputTokens }, scope)
 
         // (c) Attach Video 1 = short part & Video 2 = movie_360p, set start/end & 24 FPS (waits 10s after each Save)
-        currentStage = 'setup/attach_short'
-        await this.attachVideoAndConfigureRange(page, {
-          label: 'short',
-          youtubeUrl: shortYoutubeUrl,
-          driveFileName: shortDriveFileName,
-          localFilePath: shortLocalPath,
-          startSec: shortStartSec,
-          endSec: shortEndSec,
-          fps: 24,
-          scope,
-        })
+        // Guarded by RAM > 90% check and Global UPLOAD GATE (max 2 concurrent uploads across all scans/workers)
+        globalStudioUploadGate.setMaxConcurrent(
+          userCfg.studioUploadGateConcurrency || DEFAULT_STUDIO_UPLOAD_GATE,
+        )
 
-        currentStage = 'setup/attach_movie'
-        await this.attachVideoAndConfigureRange(page, {
-          label: 'movie',
-          driveFileName: movieDriveFileName,
-          localFilePath: movieLocalPath,
-          startSec: movieStartSec,
-          endSec: movieEndSec,
-          fps: 24,
-          scope,
-        })
+        const waitUntilRamSafeForAttach = async (stageLabel: string) => {
+          let ramNow = readAutomationRamPercent()
+          let loggedRamWait = false
+          while (ramNow > 90) {
+            await this.waitIfPausedOrThrowIfStopped(scope)
+            currentStage = 'WAITING FOR RAM'
+            if (!loggedRamWait) {
+              loggedRamWait = true
+              this.logStep(
+                'WAITING FOR RAM',
+                `RAM ${ramNow}% > 90% before ${stageLabel} — pausing media attach until RAM <= 90%`,
+                'warn',
+              )
+              onLog?.('warn', `WAITING FOR RAM (${ramNow}% > 90%) before ${stageLabel} on ${jobLabel}`)
+            }
+            await new Promise((r) => setTimeout(r, 3000))
+            ramNow = readAutomationRamPercent()
+          }
+        }
+
+        await waitUntilRamSafeForAttach('attach_short')
+
+        let releaseUploadGate: (() => void) | null = null
+        if (parallelMode) {
+          currentStage = 'WAITING FOR UPLOAD GATE'
+          const holderKey = `${this.workerTag || this.profileDirName}:${scanId}`
+          releaseUploadGate = await globalStudioUploadGate.acquire(holderKey, {
+            isAborted: () => this.isStopping(scope),
+            onWaiting: (inUse, maxConc, qPos) => {
+              this.logStep(
+                'WAITING FOR UPLOAD GATE',
+                `Upload gate ${inUse}/${maxConc} busy (queue #${qPos}) — waiting before attaching videos`,
+                'info',
+              )
+            },
+          })
+        }
+
+        try {
+          await waitUntilRamSafeForAttach('attach_short')
+          currentStage = 'setup/attach_short'
+          await this.attachVideoAndConfigureRange(page, {
+            label: 'short',
+            youtubeUrl: shortYoutubeUrl,
+            driveFileName: shortDriveFileName,
+            localFilePath: shortLocalPath,
+            startSec: shortStartSec,
+            endSec: shortEndSec,
+            fps: 24,
+            scope,
+          })
+
+          await waitUntilRamSafeForAttach('attach_movie')
+          currentStage = 'setup/attach_movie'
+          await this.attachVideoAndConfigureRange(page, {
+            label: 'movie',
+            driveFileName: movieDriveFileName,
+            localFilePath: movieLocalPath,
+            startSec: movieStartSec,
+            endSec: movieEndSec,
+            fps: 24,
+            scope,
+          })
+        } finally {
+          if (releaseUploadGate) {
+            releaseUploadGate()
+            releaseUploadGate = null
+          }
+        }
 
         // (d) Paste the chunk prompt text BEFORE reading the input token counter and BEFORE pressing Run
         currentStage = 'setup/prompt_paste'
@@ -3770,8 +4038,37 @@ export class StudioBrowserController {
           throw new Error(`POLICY_BLOCKED: ${msg}`)
         }
 
+        const isCrash = this.isBrowserOrTargetCrashError(msg)
+        const backoffSec = 15
+
+        if (isCrash) {
+          const workerLabel = this.workerTag.replace(/^\[|\]$/g, '') || 'W00'
+          const crashStep = `ERROR [crash] ${workerLabel} Target crashed -> browser restart`
+          this.logStep(
+            crashStep,
+            `stage=${currentStage} · attempt=${attempt}/${MAX_ATTEMPTS} · ${msg.slice(0, 140)}`,
+            'error',
+          )
+          onLog?.(
+            'error',
+            `${crashStep} (stage=${currentStage}, attempt=${attempt}/${MAX_ATTEMPTS}: ${msg.slice(0, 140)}) — restarting worker Chrome profile ${this.profileDirName} and retrying in ${backoffSec}s`,
+          )
+          // Immediately close dead context and clean up crashed Chrome processes for this worker profile
+          await this.forceRestartDeadBrowser()
+
+          if (attempt >= MAX_ATTEMPTS) {
+            throw new Error(`${crashStep}: ${msg}`)
+          }
+          this.logStep(
+            `RETRY [runWindowJob] (${attempt}/${MAX_ATTEMPTS})`,
+            `crash recovery -> fresh browser & new_chat in ${backoffSec}s`,
+            'warn',
+          )
+          await new Promise((r) => setTimeout(r, backoffSec * 1000))
+          continue
+        }
+
         this.logStep(`ERROR [${currentStage}]`, msg.slice(0, 180), 'error')
-        const backoffSec = attempt * 15
         this.logStep(
           `RETRY [runWindowJob] (${attempt}/${MAX_ATTEMPTS})`,
           `stage=${currentStage} · ${msg.slice(0, 100)} — waiting ${backoffSec}s`,
@@ -3782,11 +4079,11 @@ export class StudioBrowserController {
           `ERROR [${currentStage}] Studio job ${jobLabel} attempt ${attempt}/${MAX_ATTEMPTS}: ${msg} — retrying in ${backoffSec}s...`,
         )
         if (attempt >= MAX_ATTEMPTS) {
-          // Dump diagnostic HTML on final failed attempt
+          // Dump diagnostic HTML on final failed attempt (only if page is alive and not crashed)
           this.suppressDiagDumps = false
           try {
             const p = this.page
-            if (p && !p.isClosed()) {
+            if (p && !p.isClosed() && !this.pageCrashed) {
               await this.dumpRunSettingsPanelDiagnostics(p, `Final failed attempt (${attempt}/${MAX_ATTEMPTS}): ${msg.slice(0, 120)}`)
             }
           } catch {

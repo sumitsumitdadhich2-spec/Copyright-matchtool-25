@@ -6,7 +6,10 @@ import {
   studioController,
   type StudioTestClipLine,
 } from '@/lib/studio-automation'
-import { getStudioParallelManager } from '@/lib/studio-parallel-manager'
+import {
+  getStudioParallelManager,
+  resolveScanMovieDurationSec,
+} from '@/lib/studio-parallel-manager'
 import { prepareStudioMovie360pAndDrive, ensureStudioShortReady } from '@/lib/media'
 import { getScan, saveScan } from '@/lib/store'
 import { MEDIA_DIR } from '@/lib/paths'
@@ -114,6 +117,7 @@ export async function POST(req: NextRequest) {
     scanId?: string
     cookiesJson?: string
     minuteInput?: string
+    minuteInputSource?: 'auto' | 'manual'
     concurrency?: number
     resumeExisting?: boolean
     windowId?: string
@@ -479,6 +483,25 @@ export async function POST(req: NextRequest) {
         void prepareStudioMovie360pAndDrive(body.scanId, undefined, undefined, scan.ownerUsername || username)
         return NextResponse.json({ ok: true })
       }
+      case 'reset_parallel_minutes': {
+        const targetScanId = (body.scanId || '').trim()
+        if (!targetScanId) {
+          return NextResponse.json({ ok: false, error: 'Select or create a scan first (missing scanId)' }, { status: 400 })
+        }
+        const scanObj = getScan(targetScanId)
+        if (scanObj && session.role !== 'admin' && scanObj.ownerUsername && scanObj.ownerUsername !== username) {
+          return NextResponse.json({ ok: false, error: 'Forbidden: scan belongs to another user' }, { status: 403 })
+        }
+        const parallelMgr = getStudioParallelManager(targetScanId)
+        const resetRes = parallelMgr.resetMinuteInputToFound()
+        const liveSnap = await parallelMgr.getLiveSnapshot(false)
+        return NextResponse.json({
+          ok: true,
+          scanId: targetScanId,
+          ...resetRes,
+          parallelSnapshot: liveSnap,
+        })
+      }
       case 'save_parallel_config': {
         const targetScanId = (body.scanId || '').trim()
         if (!targetScanId) {
@@ -495,16 +518,20 @@ export async function POST(req: NextRequest) {
           })
         }
         const parallelMgr = getStudioParallelManager(targetScanId)
+        const movieDur = resolveScanMovieDurationSec(scanObj)
         const planned = parallelMgr.previewPlan(
           body.minuteInput,
           body.concurrency !== undefined ? Number(body.concurrency) : undefined,
-          scanObj?.movieDuration || undefined,
+          movieDur || undefined,
+          { source: body.minuteInputSource },
         )
         const liveSnap = await parallelMgr.getLiveSnapshot(false)
         return NextResponse.json({
           ok: true,
           scanId: targetScanId,
           minuteInput: liveSnap.minuteInput,
+          minuteInputSource: liveSnap.minuteInputSource,
+          foundMinutesInput: liveSnap.foundMinutesInput,
           concurrency: liveSnap.concurrency,
           plannedWindows: planned,
           parallelSnapshot: liveSnap,
@@ -516,59 +543,35 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ ok: false, error: 'Select or create a scan first (missing scanId)' }, { status: 400 })
         }
         const targetScan: Scan | null = getScan(targetScanId) || null
-        if (targetScan && session.role !== 'admin' && targetScan.ownerUsername && targetScan.ownerUsername !== username) {
+        if (!targetScan) {
+          return NextResponse.json({ ok: false, error: `Scan ${targetScanId} not found` }, { status: 404 })
+        }
+        if (session.role !== 'admin' && targetScan.ownerUsername && targetScan.ownerUsername !== username) {
           return NextResponse.json({ ok: false, error: 'Forbidden: scan belongs to another user' }, { status: 403 })
         }
 
-        let shortLocalPath: string | null = null
-        let shortYoutubeUrl: string | null = null
-        let shortDurationSec = 150
-        let movieLocalPath: string | null = null
-        let movieDurationSec = 6600
-
-        if (targetScan) {
-          if (body.minuteInput !== undefined && body.minuteInput.trim()) {
-            targetScan.studioMinuteInput = body.minuteInput.trim()
-          }
-          if (body.concurrency !== undefined && Number.isFinite(Number(body.concurrency))) {
-            targetScan.studioParallelConcurrency = Number(body.concurrency)
-          }
-          saveScan(targetScan)
-
-          const mediaDir = path.join(MEDIA_DIR, targetScan.id)
-          const movie360Path = path.join(mediaDir, 'movie_360p.mp4')
-          if (!fs.existsSync(movie360Path)) {
-            await prepareStudioMovie360pAndDrive(
-              targetScan.id,
-              undefined,
-              targetScan.movieDuration || undefined,
-              targetScan.ownerUsername || username,
-            )
-          }
-          movieLocalPath = fs.existsSync(movie360Path)
-            ? movie360Path
-            : path.join(mediaDir, 'movie.mp4')
-          if (targetScan.shortYoutubeUrl) {
-            shortYoutubeUrl = targetScan.shortYoutubeUrl
-          } else {
-            const ready = await ensureStudioShortReady(targetScan.id, targetScan.ownerUsername || username)
-            shortLocalPath = ready.localPath
-          }
-          shortDurationSec = targetScan.shortDuration || 150
-          movieDurationSec = targetScan.movieDuration || 6600
+        if (body.minuteInput !== undefined && body.minuteInput.trim()) {
+          targetScan.studioMinuteInput = body.minuteInput.trim()
         }
+        if (body.minuteInputSource) {
+          targetScan.studioMinuteInputSource = body.minuteInputSource
+        }
+        if (body.concurrency !== undefined && Number.isFinite(Number(body.concurrency))) {
+          targetScan.studioParallelConcurrency = Number(body.concurrency)
+        }
+        saveScan(targetScan)
+
+        const movieDurationSec = resolveScanMovieDurationSec(targetScan) || 0
 
         const parallelMgr = getStudioParallelManager(targetScanId)
         const started = await parallelMgr.startParallelScan({
           username,
           scanId: targetScanId,
-          minuteInput: body.minuteInput ?? targetScan?.studioMinuteInput ?? undefined,
-          concurrency: body.concurrency ?? targetScan?.studioParallelConcurrency ?? undefined,
-          shortLocalPath,
-          shortYoutubeUrl,
-          shortDurationSec,
-          movieLocalPath,
-          movieDurationSec,
+          minuteInput: body.minuteInput ?? targetScan.studioMinuteInput ?? undefined,
+          minuteInputSource: body.minuteInputSource ?? targetScan.studioMinuteInputSource ?? undefined,
+          concurrency: body.concurrency ?? targetScan.studioParallelConcurrency ?? undefined,
+          shortDurationSec: targetScan.shortDuration || 150,
+          movieDurationSec: movieDurationSec > 0 ? movieDurationSec : undefined,
           resumeExisting: Boolean(body.resumeExisting),
           onWindowMatches: async (_winState, matches) => {
             if (!targetScan) return

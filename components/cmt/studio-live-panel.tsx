@@ -755,10 +755,13 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
         <div className="px-4 pb-4">
           <StudioParallelGrid
             key={scan?.id || 'no-scan'}
+            scan={scan}
             parallelSnapshot={snap?.parallelSnapshot ?? null}
             scanId={scan?.id ?? null}
             scanTitle={scan?.customName || scan?.movieName || scan?.shortName || null}
             scanMinuteInput={scan?.studioMinuteInput ?? null}
+            scanMinuteInputSource={scan?.studioMinuteInputSource ?? null}
+            scanMovieDuration={scan?.movieDuration ?? null}
             scanConcurrency={scan?.studioParallelConcurrency ?? null}
             onActionCompleted={(nextParallel) =>
               setSnap((prev) => (prev ? { ...prev, parallelSnapshot: nextParallel } : prev))

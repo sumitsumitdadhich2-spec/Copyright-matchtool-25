@@ -6,8 +6,14 @@ import { DATA_DIR, MEDIA_DIR } from './paths'
 import { getScan, saveScan } from './store'
 import {
   StudioBrowserController,
+  globalStudioUploadGate,
   type StudioStepLog,
 } from './studio-automation'
+import {
+  ensureStudioShortReady,
+  prepareStudioMovie360pAndDrive,
+  verifyStudioMovie360pFile,
+} from './media'
 import {
   buildParallelWindowsFromMinuteInput,
   mergeParallelWindowResults,
@@ -18,13 +24,17 @@ import {
 import {
   DEFAULT_STUDIO_CONCURRENCY,
   DEFAULT_STUDIO_MINUTE_INPUT,
+  DEFAULT_STUDIO_UPLOAD_GATE,
   loadStudioUserConfig,
 } from './studio-settings'
-import type { ChunkMatch } from './types'
+import type { ChunkMatch, Scan } from './types'
 
 export type ParallelWindowStatus =
   | 'QUEUED'
+  | 'ASSIGNED'
   | 'WAITING_FOR_WORKER'
+  | 'WAITING_FOR_UPLOAD_GATE'
+  | 'WAITING_FOR_RAM'
   | 'SETUP'
   | 'RUNNING'
   | 'VALIDATING'
@@ -61,7 +71,27 @@ export interface ParallelResourceSnapshot {
   activeWorkers: number
   slotsInUse: number
   totalSlots: number
+  chromeProcessCount: number
   note?: string
+}
+
+export interface ParallelMediaVerificationInfo {
+  scanId: string
+  shortPath: string | null
+  shortSizeBytes: number | null
+  shortDurationSec: number | null
+  movie360Path: string | null
+  movie360SizeBytes: number | null
+  movie360DurationSec: number | null
+  verifiedAt: number | null
+}
+
+export interface ParallelCompressionProgressInfo {
+  active: boolean
+  progress: number
+  statusText: string
+  sizeBytes?: number | null
+  error?: string | null
 }
 
 export interface ParallelSlotPoolSummary {
@@ -123,12 +153,19 @@ export interface ParallelWorkerCardSnapshot {
 
 export interface ParallelScanLiveSnapshot {
   active: boolean
+  starting: boolean
   paused: boolean
   waitingForWorkerSlots: boolean
+  hasResumableState: boolean
+  compressing360p: ParallelCompressionProgressInfo | null
+  mediaInfo: ParallelMediaVerificationInfo | null
   scanId: string
   scanName: string
   username: string | null
   minuteInput: string
+  minuteInputSource: 'auto' | 'manual'
+  foundMinutesInput: string
+  movieDurationSec: number | null
   concurrency: number
   measuredTokenRate: number | null
   startedAt: number | null
@@ -142,6 +179,7 @@ export interface ParallelScanLiveSnapshot {
   totalWindows: number
   ramUsedPercent: number
   freeDiskGb: number
+  chromeProcessCount: number
   resourceWarning: string | null
   slotPool: ParallelSlotPoolSummary
   workers: ParallelWorkerCardSnapshot[]
@@ -158,7 +196,10 @@ interface PersistedParallelState {
   scanName: string
   username: string
   minuteInput: string
+  minuteInputSource?: 'auto' | 'manual'
   concurrency: number
+  hasStartedRun?: boolean
+  mediaInfo?: ParallelMediaVerificationInfo | null
   shortLocalPath: string | null
   shortYoutubeUrl: string | null
   shortDriveFileName: string | null
@@ -166,7 +207,7 @@ interface PersistedParallelState {
   movieLocalPath: string | null
   movieDriveFileName: string | null
   movieDurationSec: number
-  startedAt: number
+  startedAt: number | null
   finishedAt: number | null
   updatedAt: number
   windows: ParallelWindowState[]
@@ -174,6 +215,7 @@ interface PersistedParallelState {
 }
 
 const LEGACY_PARALLEL_STATE_FILE = path.join(DATA_DIR, 'studio-parallel-state.json')
+const LEGACY_PARALLEL_STATE_MIGRATED_FILE = path.join(DATA_DIR, 'studio-parallel-state.json.migrated')
 const BASE_PROFILE_NAME = 'studio-chrome-profile'
 const MAX_LOG_FILE_BYTES = 50 * 1024 * 1024 // 50 MB rotation cap
 const UI_COMBINED_LOG_LIMIT = 2000
@@ -211,6 +253,38 @@ export function readFreeDiskGb(): number {
   }
 }
 
+export function readChromeProcessCount(): number {
+  try {
+    if (fs.existsSync('/proc')) {
+      const pids = fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d))
+      let count = 0
+      for (const pid of pids) {
+        try {
+          const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8')
+          if (/chrome|chromium/i.test(cmdline)) {
+            count++
+          }
+        } catch {
+          /* process exited */
+        }
+      }
+      return count
+    }
+  } catch {
+    /* fallback to pgrep */
+  }
+  try {
+    const out = execFileSync('pgrep', ['-c', '-f', 'chrome|chromium'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 1500,
+    }).toString('utf8')
+    const n = parseInt(out.trim(), 10)
+    return Number.isFinite(n) ? n : 0
+  } catch {
+    return 0
+  }
+}
+
 export function resolveScanDisplayLabel(scanId: string): string {
   if (!scanId || scanId === 'default') return 'Default Scan'
   try {
@@ -228,6 +302,88 @@ export function resolveScanDisplayLabel(scanId: string): string {
     /* ignore */
   }
   return `Scan #${scanId.slice(0, 8)}`
+}
+
+export function resolveScanMovieDurationSec(scan?: Scan | null): number | null {
+  if (!scan) return null
+  if (typeof scan.movieDuration === 'number' && scan.movieDuration > 0) {
+    return scan.movieDuration
+  }
+  if (typeof scan.movieTrimEnd === 'number' && scan.movieTrimEnd > 0) {
+    return scan.movieTrimEnd
+  }
+  if (
+    scan.geminiPrescan?.movieCopy?.trimEnd &&
+    scan.geminiPrescan.movieCopy.trimEnd > 0
+  ) {
+    return scan.geminiPrescan.movieCopy.trimEnd
+  }
+  return null
+}
+
+/**
+ * Format sorted 0-based movie minute numbers into compact ranges (e.g. "8-24,45-50"),
+ * filtering out any minute that starts at or after movieDurationSec.
+ */
+export function formatCompactMinuteRanges(
+  minutes: number[],
+  movieDurationSec?: number | null,
+): string {
+  const maxDur = movieDurationSec && movieDurationSec > 0 ? movieDurationSec : null
+  const valid = [...new Set(minutes)]
+    .filter((m) => Number.isFinite(m) && m >= 0 && (maxDur === null || m * 60 < maxDur))
+    .map((m) => Math.floor(m))
+    .sort((a, b) => a - b)
+
+  if (valid.length === 0) return ''
+  const parts: string[] = []
+  let i = 0
+  while (i < valid.length) {
+    let j = i
+    while (j + 1 < valid.length && valid[j + 1] === valid[j] + 1) {
+      j += 1
+    }
+    parts.push(i === j ? `${valid[i]}` : `${valid[i]}-${valid[j]}`)
+    i = j + 1
+  }
+  return parts.join(',')
+}
+
+/**
+ * Extract THIS scan's own "Minutes found" list (already includes ±1 min buffer from window scan).
+ * Returns [] if the window scan has not produced found minutes yet.
+ */
+export function extractScanFoundMinutes(scan?: Scan | null): number[] {
+  if (!scan) return []
+  const prescan = scan.geminiPrescan
+  if (prescan?.appliedMinutes && prescan.appliedMinutes.length > 0) {
+    return [...prescan.appliedMinutes]
+  }
+  if (prescan?.minuteSuggestions && prescan.minuteSuggestions.length > 0) {
+    return prescan.minuteSuggestions.map((s) => s.minute)
+  }
+  if (scan.mergePipeline?.approvedMinutes && scan.mergePipeline.approvedMinutes.length > 0) {
+    return [...scan.mergePipeline.approvedMinutes]
+  }
+  if (
+    scan.mergePipeline?.minuteSuggestions &&
+    scan.mergePipeline.minuteSuggestions.length > 0
+  ) {
+    return scan.mergePipeline.minuteSuggestions.map((s) => s.minute)
+  }
+  const segMins = (scan.shortSegments || [])
+    .filter((s) => s.selected !== false && Array.isArray(s.movieMinutes) && s.movieMinutes.length > 0)
+    .flatMap((s) => s.movieMinutes!)
+  if (segMins.length > 0) {
+    return segMins
+  }
+  return []
+}
+
+export function extractScanFoundMinutesCompact(scan?: Scan | null): string {
+  const mins = extractScanFoundMinutes(scan)
+  const dur = resolveScanMovieDurationSec(scan)
+  return formatCompactMinuteRanges(mins, dur)
 }
 
 /**
@@ -321,6 +477,9 @@ function syncWorkerProfileFromBase(slotIndex: number): string {
 function mapStepToWindowStatus(step: string): ParallelWindowStatus {
   const s = (step || '').toLowerCase()
   if (s.includes('needs attention')) return 'NEEDS_ATTENTION'
+  if (s.includes('waiting for upload gate')) return 'WAITING_FOR_UPLOAD_GATE'
+  if (s.includes('waiting for ram')) return 'WAITING_FOR_RAM'
+  if (s.includes('waiting for worker')) return 'WAITING_FOR_WORKER'
   if (s.includes('permission denied') || s.includes('403 ->') || s.includes('403 permission_denied')) {
     return '403_WAIT'
   }
@@ -336,6 +495,13 @@ export function classifyParallelLogLevel(
   detail?: string,
 ): ParallelLogLevel {
   const combined = `${step || ''} ${detail || ''}`.toLowerCase()
+  if (
+    combined.includes('error [crash]') ||
+    combined.includes('target crashed') ||
+    combined.includes('page crashed')
+  ) {
+    return 'ERROR'
+  }
   if (
     combined.includes('403') ||
     combined.includes('permission_denied') ||
@@ -597,12 +763,18 @@ export class StudioParallelManager {
   private scanName: string
   private windows: ParallelWindowState[] = []
   private active = false
+  private starting = false
+  private hasStartedRun = false
   private paused = false
   private stoppingAll = false
   private waitingForWorkerSlots = false
+  private compressing360p: ParallelCompressionProgressInfo | null = null
+  private mediaInfo: ParallelMediaVerificationInfo | null = null
   private stoppedWindowIds = new Set<string>()
   private username: string | null = null
-  private minuteInput: string = DEFAULT_STUDIO_MINUTE_INPUT
+  private minuteInput: string = ''
+  private minuteInputSource: 'auto' | 'manual' = 'auto'
+  private foundMinutesInput: string = ''
   private concurrency: number = DEFAULT_STUDIO_CONCURRENCY
   private maxTotalPoolSlots: number = DEFAULT_STUDIO_CONCURRENCY
   private measuredTokenRate: number | null = null
@@ -614,25 +786,38 @@ export class StudioParallelManager {
   private shortDurationSec: number = 150
   private movieLocalPath: string | null = null
   private movieDriveFileName: string | null = null
-  private movieDurationSec: number = 6600
+  private movieDurationSec: number = 0
   private resourceWarning: string | null = null
   private combinedLogs: ParallelCombinedLogEntry[] = []
   private nextLogSeq = 1
   private totalLogLinesOnDisk = 0
   private resourceSnapshots: ParallelResourceSnapshot[] = []
   private lastResourceSnapAt = 0
+  private resourceTimer: ReturnType<typeof setInterval> | null = null
   private onMatchCallback?: (windowState: ParallelWindowState, matches: ChunkMatch[]) => Promise<void>
   private onLogCallback?: (level: 'info' | 'warn' | 'error' | 'success', msg: string) => void
 
   constructor(scanId: string) {
     this.scanId = scanId || 'default'
     this.scanName = resolveScanDisplayLabel(this.scanId)
+    this.migrateStaleScanStateOnce()
     this.tryRestorePersistedState()
     this.tryLoadCombinedLogsFromDisk()
   }
 
   public getScanDir(): string {
     return path.join(DATA_DIR, 'scans', this.scanId)
+  }
+
+  public getScanMediaDir(): string {
+    return path.join(MEDIA_DIR, this.scanId)
+  }
+
+  public isPathStrictlyInsideThisScanMediaDir(candidatePath?: string | null): boolean {
+    if (!candidatePath || !this.scanId || this.scanId === 'default') return false
+    const scanMediaDir = path.resolve(this.getScanMediaDir())
+    const resolvedCandidate = path.resolve(candidatePath)
+    return resolvedCandidate.startsWith(scanMediaDir + path.sep)
   }
 
   public getStateFilePath(): string {
@@ -647,27 +832,143 @@ export class StudioParallelManager {
     return path.join(this.getScanDir(), 'parallel-log.1.jsonl')
   }
 
+  /**
+   * One-time migration to clear stale global default studioMinuteInput ("7,8,9,10,...,71-100")
+   * and stale 18-window parallel-state for scan 2238bf22dd532047 (and any scan that had the old
+   * global default prefilled without manual edit).
+   */
+  private migrateStaleScanStateOnce() {
+    if (!this.scanId || this.scanId === 'default') return
+    try {
+      const scanDir = this.getScanDir()
+      const markerFile = path.join(scanDir, '.migrated-stale-minutes-v2')
+      if (fs.existsSync(markerFile)) return
+
+      const scan = getScan(this.scanId)
+      const foundCompact = extractScanFoundMinutesCompact(scan)
+      const isTargetStaleScan = this.scanId === '2238bf22dd532047'
+      const hasOldGlobalDefaultOnScan =
+        scan?.studioMinuteInput?.trim() === DEFAULT_STUDIO_MINUTE_INPUT &&
+        scan?.studioMinuteInputSource !== 'manual'
+
+      let hasOldGlobalDefaultInStateFile = false
+      const stateFile = this.getStateFilePath()
+      if (fs.existsSync(stateFile)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(stateFile, 'utf8')) as Partial<PersistedParallelState>
+          if (
+            parsed?.minuteInput?.trim() === DEFAULT_STUDIO_MINUTE_INPUT &&
+            parsed?.minuteInputSource !== 'manual' &&
+            foundCompact !== DEFAULT_STUDIO_MINUTE_INPUT
+          ) {
+            hasOldGlobalDefaultInStateFile = true
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+
+      if (isTargetStaleScan || hasOldGlobalDefaultOnScan || hasOldGlobalDefaultInStateFile) {
+        for (const f of [
+          stateFile,
+          path.join(scanDir, 'parallel-windows.json'),
+          path.join(scanDir, 'parallel-merged-report.json'),
+          path.join(scanDir, 'parallel-merged-report.txt'),
+        ]) {
+          try {
+            if (fs.existsSync(f)) fs.rmSync(f, { force: true })
+          } catch {
+            /* ignore */
+          }
+        }
+
+        if (fs.existsSync(LEGACY_PARALLEL_STATE_FILE)) {
+          try {
+            const legacy = JSON.parse(fs.readFileSync(LEGACY_PARALLEL_STATE_FILE, 'utf8'))
+            if (
+              legacy?.scanId === this.scanId ||
+              legacy?.minuteInput?.trim() === DEFAULT_STUDIO_MINUTE_INPUT
+            ) {
+              fs.renameSync(LEGACY_PARALLEL_STATE_FILE, LEGACY_PARALLEL_STATE_MIGRATED_FILE)
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+
+        if (scan) {
+          scan.studioMinuteInput = foundCompact || null
+          scan.studioMinuteInputSource = 'auto'
+          saveScan(scan, { immediate: true })
+        }
+
+        this.windows = []
+        this.hasStartedRun = false
+        this.minuteInput = foundCompact
+        this.minuteInputSource = 'auto'
+        this.foundMinutesInput = foundCompact
+        this.startedAt = null
+        this.finishedAt = null
+      }
+
+      fs.mkdirSync(scanDir, { recursive: true })
+      fs.writeFileSync(markerFile, String(Date.now()), 'utf8')
+    } catch {
+      /* ignore migration error */
+    }
+  }
+
   private refreshScanMetadataFromStore() {
     this.scanName = resolveScanDisplayLabel(this.scanId)
     if (this.scanId && this.scanId !== 'default') {
       try {
         const scan = getScan(this.scanId)
         if (scan) {
-          if (scan.studioMinuteInput && (!this.windows.length || !this.active)) {
-            this.minuteInput = scan.studioMinuteInput
-          }
-          if (
-            typeof scan.studioParallelConcurrency === 'number' &&
-            scan.studioParallelConcurrency >= 1 &&
-            !this.active
-          ) {
-            this.concurrency = scan.studioParallelConcurrency
+          const dur = resolveScanMovieDurationSec(scan)
+          if (dur && dur > 0) {
+            this.movieDurationSec = dur
           }
           if (scan.shortDuration && scan.shortDuration > 0) {
             this.shortDurationSec = scan.shortDuration
           }
-          if (scan.movieDuration && scan.movieDuration > 0) {
-            this.movieDurationSec = scan.movieDuration
+          if (
+            typeof scan.studioParallelConcurrency === 'number' &&
+            scan.studioParallelConcurrency >= 1 &&
+            !this.active &&
+            !this.starting
+          ) {
+            this.concurrency = scan.studioParallelConcurrency
+          }
+
+          const foundCompact = extractScanFoundMinutesCompact(scan)
+          this.foundMinutesInput = foundCompact
+
+          // Never allow old global DEFAULT_STUDIO_MINUTE_INPUT to masquerade as scan's minuteInput unless manually set
+          if (
+            scan.studioMinuteInput?.trim() === DEFAULT_STUDIO_MINUTE_INPUT &&
+            scan.studioMinuteInputSource !== 'manual' &&
+            foundCompact !== DEFAULT_STUDIO_MINUTE_INPUT
+          ) {
+            scan.studioMinuteInput = foundCompact || null
+            scan.studioMinuteInputSource = 'auto'
+            saveScan(scan)
+          }
+
+          const source: 'auto' | 'manual' =
+            scan.studioMinuteInputSource === 'manual' ? 'manual' : 'auto'
+          this.minuteInputSource = source
+
+          if (!this.active && !this.starting) {
+            if (source === 'auto') {
+              this.minuteInput = foundCompact
+              if ((scan.studioMinuteInput || '') !== foundCompact) {
+                scan.studioMinuteInput = foundCompact || null
+                scan.studioMinuteInputSource = 'auto'
+                saveScan(scan)
+              }
+            } else {
+              this.minuteInput = (scan.studioMinuteInput ?? this.minuteInput ?? '').trim()
+            }
           }
         }
       } catch {
@@ -681,44 +982,101 @@ export class StudioParallelManager {
       const primaryFile = this.getStateFilePath()
       const legacyScanWindowsFile = path.join(this.getScanDir(), 'parallel-windows.json')
       let raw: Partial<PersistedParallelState> | null = null
+      let migratedFromLegacyGlobal = false
 
       if (fs.existsSync(primaryFile)) {
         raw = JSON.parse(fs.readFileSync(primaryFile, 'utf8'))
       } else if (fs.existsSync(legacyScanWindowsFile)) {
         raw = JSON.parse(fs.readFileSync(legacyScanWindowsFile, 'utf8'))
-      } else if (fs.existsSync(LEGACY_PARALLEL_STATE_FILE)) {
-        // One-time migration from legacy single global state file if it belonged to this scanId
-        const legacyGlobal = JSON.parse(fs.readFileSync(LEGACY_PARALLEL_STATE_FILE, 'utf8'))
-        if (legacyGlobal && legacyGlobal.scanId === this.scanId) {
-          raw = legacyGlobal
+      } else if (
+        this.scanId &&
+        this.scanId !== 'default' &&
+        fs.existsSync(LEGACY_PARALLEL_STATE_FILE)
+      ) {
+        // Strict one-time migration: ONLY migrate to the scanId written inside data/studio-parallel-state.json,
+        // then immediately rename it to data/studio-parallel-state.json.migrated so it never touches any other scan.
+        try {
+          const legacyGlobal = JSON.parse(fs.readFileSync(LEGACY_PARALLEL_STATE_FILE, 'utf8'))
+          if (legacyGlobal && legacyGlobal.scanId === this.scanId) {
+            raw = legacyGlobal
+            migratedFromLegacyGlobal = true
+            try {
+              fs.renameSync(LEGACY_PARALLEL_STATE_FILE, LEGACY_PARALLEL_STATE_MIGRATED_FILE)
+            } catch {
+              /* ignore rename error */
+            }
+          }
+        } catch {
+          /* ignore */
         }
+      }
+
+      if (raw && raw.scanId && raw.scanId !== this.scanId) {
+        // Never allow another scan's state file to load into this scan
+        raw = null
       }
 
       if (raw && Array.isArray(raw.windows) && raw.windows.length > 0) {
         this.username = raw.username || 'admin'
         this.scanName = raw.scanName || resolveScanDisplayLabel(this.scanId)
-        this.minuteInput = raw.minuteInput || DEFAULT_STUDIO_MINUTE_INPUT
+        this.minuteInputSource = raw.minuteInputSource === 'manual' ? 'manual' : 'auto'
+        this.minuteInput =
+          raw.minuteInput && raw.minuteInput.trim() !== DEFAULT_STUDIO_MINUTE_INPUT
+            ? raw.minuteInput.trim()
+            : raw.minuteInputSource === 'manual'
+              ? (raw.minuteInput || '').trim()
+              : ''
         this.concurrency = raw.concurrency || DEFAULT_STUDIO_CONCURRENCY
-        this.shortLocalPath = raw.shortLocalPath ?? null
+
+        // Strictly accept saved paths ONLY if they belong to data/media/<this.scanId>/
+        this.shortLocalPath = this.isPathStrictlyInsideThisScanMediaDir(raw.shortLocalPath)
+          ? (raw.shortLocalPath ?? null)
+          : null
         this.shortYoutubeUrl = raw.shortYoutubeUrl ?? null
         this.shortDriveFileName = raw.shortDriveFileName ?? null
         this.shortDurationSec = raw.shortDurationSec || 150
-        this.movieLocalPath = raw.movieLocalPath ?? null
+        this.movieLocalPath =
+          this.isPathStrictlyInsideThisScanMediaDir(raw.movieLocalPath) &&
+          path.basename(raw.movieLocalPath || '') === 'movie_360p.mp4'
+            ? (raw.movieLocalPath ?? null)
+            : null
         this.movieDriveFileName = raw.movieDriveFileName ?? null
-        this.movieDurationSec = raw.movieDurationSec || 6600
+        this.movieDurationSec = raw.movieDurationSec || 0
         this.startedAt = raw.startedAt || null
         this.finishedAt = raw.finishedAt || null
-        this.resourceSnapshots = Array.isArray(raw.resourceSnapshots) ? raw.resourceSnapshots : []
+        this.mediaInfo =
+          raw.mediaInfo && raw.mediaInfo.scanId === this.scanId ? raw.mediaInfo : null
+        this.resourceSnapshots = Array.isArray(raw.resourceSnapshots)
+          ? raw.resourceSnapshots.map((s) => ({
+              ...s,
+              chromeProcessCount:
+                typeof s.chromeProcessCount === 'number' ? s.chromeProcessCount : 0,
+            }))
+          : []
+
+        const anyWindowRan = raw.windows.some(
+          (w) =>
+            w.status === 'DONE' ||
+            w.status === 'FAILED' ||
+            w.status === 'RETRYING' ||
+            (typeof w.attempt === 'number' && w.attempt > 0) ||
+            w.startedAt !== null,
+        )
+        this.hasStartedRun =
+          typeof raw.hasStartedRun === 'boolean' ? raw.hasStartedRun : anyWindowRan
 
         // Any window that was in-flight when container restarted goes back to QUEUED; DONE stays DONE
         this.windows = raw.windows.map((w) => {
           if (
+            w.status === 'ASSIGNED' ||
             w.status === 'SETUP' ||
             w.status === 'RUNNING' ||
             w.status === 'VALIDATING' ||
             w.status === 'RETRYING' ||
             w.status === '403_WAIT' ||
-            w.status === 'WAITING_FOR_WORKER'
+            w.status === 'WAITING_FOR_WORKER' ||
+            w.status === 'WAITING_FOR_UPLOAD_GATE' ||
+            w.status === 'WAITING_FOR_RAM'
           ) {
             return {
               ...w,
@@ -732,12 +1090,46 @@ export class StudioParallelManager {
             workerId: null,
           }
         })
+
+        if (migratedFromLegacyGlobal) {
+          this.persistStateToDisk()
+        }
       }
 
       this.refreshScanMetadataFromStore()
     } catch {
       /* ignore corrupt state file */
     }
+  }
+
+  /**
+   * True ONLY if this scan has its own `data/scans/<scanId>/parallel-state.json` on disk
+   * from an actual started run and has at least one DONE or incomplete (QUEUED/FAILED/RETRYING) window.
+   */
+  public hasResumableStateOnDisk(): boolean {
+    if (!this.scanId || this.scanId === 'default') return false
+    if (!fs.existsSync(this.getStateFilePath())) return false
+    if (this.windows.length === 0) return false
+    const anyDoneOrAttempted =
+      this.hasStartedRun ||
+      this.windows.some(
+        (w) =>
+          w.status === 'DONE' ||
+          w.status === 'FAILED' ||
+          w.status === 'RETRYING' ||
+          (typeof w.attempt === 'number' && w.attempt > 0) ||
+          w.startedAt !== null,
+      )
+    if (!anyDoneOrAttempted) return false
+    return this.windows.some(
+      (w) =>
+        w.status === 'DONE' ||
+        w.status === 'QUEUED' ||
+        w.status === 'FAILED' ||
+        w.status === 'RETRYING' ||
+        w.status === 'STOPPED' ||
+        w.status === 'NEEDS_ATTENTION',
+    )
   }
 
   private tryLoadCombinedLogsFromDisk() {
@@ -859,7 +1251,7 @@ export class StudioParallelManager {
 
   private recordResourceSnapshotIfNeeded(force = false, note?: string) {
     const now = Date.now()
-    if (!force && now - this.lastResourceSnapAt < 15_000) return
+    if (!force && now - this.lastResourceSnapAt < 10_000) return
     this.lastResourceSnapAt = now
 
     const slotSummary = globalProfileSlotPool.getSummary(this.maxTotalPoolSlots)
@@ -872,11 +1264,28 @@ export class StudioParallelManager {
       activeWorkers: activeForThisScan,
       slotsInUse: slotSummary.inUseSlots,
       totalSlots: slotSummary.totalSlots,
+      chromeProcessCount: readChromeProcessCount(),
       ...(note ? { note } : {}),
     }
     this.resourceSnapshots.push(snap)
-    if (this.resourceSnapshots.length > 300) {
-      this.resourceSnapshots.splice(0, this.resourceSnapshots.length - 300)
+    if (this.resourceSnapshots.length > 400) {
+      this.resourceSnapshots.splice(0, this.resourceSnapshots.length - 400)
+    }
+  }
+
+  private startResourceSnapshotTimer() {
+    this.stopResourceSnapshotTimer()
+    this.resourceTimer = setInterval(() => {
+      if (this.active || this.starting) {
+        this.recordResourceSnapshotIfNeeded(true)
+      }
+    }, 10_000)
+  }
+
+  private stopResourceSnapshotTimer() {
+    if (this.resourceTimer) {
+      clearInterval(this.resourceTimer)
+      this.resourceTimer = null
     }
   }
 
@@ -890,7 +1299,10 @@ export class StudioParallelManager {
         scanName: this.scanName,
         username: this.username || 'admin',
         minuteInput: this.minuteInput,
+        minuteInputSource: this.minuteInputSource,
         concurrency: this.concurrency,
+        hasStartedRun: this.hasStartedRun,
+        mediaInfo: this.mediaInfo,
         shortLocalPath: this.shortLocalPath,
         shortYoutubeUrl: this.shortYoutubeUrl,
         shortDriveFileName: this.shortDriveFileName,
@@ -898,7 +1310,7 @@ export class StudioParallelManager {
         movieLocalPath: this.movieLocalPath,
         movieDriveFileName: this.movieDriveFileName,
         movieDurationSec: this.movieDurationSec,
-        startedAt: this.startedAt || Date.now(),
+        startedAt: this.startedAt,
         finishedAt: this.finishedAt,
         updatedAt: Date.now(),
         windows: this.windows,
@@ -909,29 +1321,37 @@ export class StudioParallelManager {
       fs.writeFileSync(path.join(scanDir, 'parallel-windows.json'), jsonStr, 'utf8')
 
       const report = this.getMergedReport()
-      if (report) {
-        fs.writeFileSync(
-          path.join(scanDir, 'parallel-merged-report.json'),
-          JSON.stringify(report, null, 2),
-          'utf8',
-        )
-        fs.writeFileSync(
-          path.join(scanDir, 'parallel-merged-report.txt'),
-          report.formattedTxt,
-          'utf8',
-        )
+      const reportJsonPath = path.join(scanDir, 'parallel-merged-report.json')
+      const reportTxtPath = path.join(scanDir, 'parallel-merged-report.txt')
+      if (report && report.totalShortSegments > 0) {
+        fs.writeFileSync(reportJsonPath, JSON.stringify(report, null, 2), 'utf8')
+        fs.writeFileSync(reportTxtPath, report.formattedTxt, 'utf8')
+      } else {
+        try {
+          if (fs.existsSync(reportJsonPath)) fs.rmSync(reportJsonPath, { force: true })
+          if (fs.existsSync(reportTxtPath)) fs.rmSync(reportTxtPath, { force: true })
+        } catch {
+          /* ignore */
+        }
       }
     } catch {
       /* ignore disk write error */
     }
   }
 
-  private persistMinuteInputOnScanRecord(minuteInput: string, concurrency: number) {
+  private persistMinuteInputOnScanRecord(
+    minuteInput: string,
+    concurrency: number,
+    source?: 'auto' | 'manual',
+  ) {
     if (!this.scanId || this.scanId === 'default') return
     try {
       const scan = getScan(this.scanId)
       if (scan) {
-        scan.studioMinuteInput = minuteInput
+        scan.studioMinuteInput = minuteInput || null
+        if (source) {
+          scan.studioMinuteInputSource = source
+        }
         scan.studioParallelConcurrency = concurrency
         saveScan(scan)
       }
@@ -941,7 +1361,7 @@ export class StudioParallelManager {
   }
 
   public isRunning(): boolean {
-    return this.active
+    return this.active || this.starting
   }
 
   public getWindows(): ParallelWindowState[] {
@@ -952,6 +1372,10 @@ export class StudioParallelManager {
     return this.resourceSnapshots
   }
 
+  public getMediaInfo(): ParallelMediaVerificationInfo | null {
+    return this.mediaInfo
+  }
+
   public getMergedReport(): ParallelMergedReport | null {
     if (this.windows.length === 0) return null
     return mergeParallelWindowResults({
@@ -960,12 +1384,46 @@ export class StudioParallelManager {
   }
 
   /**
-   * Build / preview the windows from minuteInput for THIS scan and persist config.
+   * Reset this scan's minuteInput back to its own "Minutes found" compact range and set source='auto'.
    */
-  public previewPlan(minuteInput?: string, concurrency?: number, movieDurationSec?: number): ParallelWindowState[] {
+  public resetMinuteInputToFound(): {
+    minuteInput: string
+    minuteInputSource: 'auto'
+    foundMinutesInput: string
+  } {
     this.refreshScanMetadataFromStore()
-    if (minuteInput !== undefined && minuteInput.trim()) {
-      this.minuteInput = minuteInput.trim()
+    this.minuteInputSource = 'auto'
+    this.minuteInput = this.foundMinutesInput
+    this.persistMinuteInputOnScanRecord(this.minuteInput, this.concurrency, 'auto')
+    return {
+      minuteInput: this.minuteInput,
+      minuteInputSource: 'auto',
+      foundMinutesInput: this.foundMinutesInput,
+    }
+  }
+
+  /**
+   * Build / preview the windows from minuteInput for THIS scan, clearing stale windows/state, and persist config.
+   */
+  public previewPlan(
+    minuteInput?: string,
+    concurrency?: number,
+    movieDurationSec?: number,
+    options?: { source?: 'auto' | 'manual' },
+  ): ParallelWindowState[] {
+    this.refreshScanMetadataFromStore()
+    if (options?.source) {
+      this.minuteInputSource = options.source
+    }
+    if (minuteInput !== undefined) {
+      const trimmed = minuteInput.trim()
+      this.minuteInput = trimmed
+      if (!options?.source) {
+        this.minuteInputSource =
+          trimmed && trimmed !== this.foundMinutesInput ? 'manual' : 'auto'
+      }
+    } else if (this.minuteInputSource === 'auto') {
+      this.minuteInput = this.foundMinutesInput
     }
     if (concurrency !== undefined && Number.isFinite(Number(concurrency))) {
       this.concurrency = Math.max(1, Math.min(20, Math.round(Number(concurrency))))
@@ -974,10 +1432,24 @@ export class StudioParallelManager {
       this.movieDurationSec = movieDurationSec
     }
 
-    this.persistMinuteInputOnScanRecord(this.minuteInput, this.concurrency)
+    this.persistMinuteInputOnScanRecord(
+      this.minuteInput,
+      this.concurrency,
+      this.minuteInputSource,
+    )
 
-    const { windows } = buildParallelWindowsFromMinuteInput(this.minuteInput, this.movieDurationSec)
-    if (!this.active) {
+    const effectiveMovieDur =
+      this.movieDurationSec && this.movieDurationSec > 0 ? this.movieDurationSec : undefined
+    const { windows } = buildParallelWindowsFromMinuteInput(this.minuteInput, effectiveMovieDur)
+    if (!this.active && !this.starting) {
+      // Clear old parallel state (stale windows, failed counts, merged report) for this scan
+      this.startedAt = null
+      this.finishedAt = null
+      this.hasStartedRun = false
+      this.stoppedWindowIds.clear()
+      this.waitingForWorkerSlots = false
+      this.resourceWarning = null
+      this.resourceSnapshots = []
       this.windows = windows.map((w) => ({
         ...w,
         status: 'QUEUED',
@@ -1000,34 +1472,146 @@ export class StudioParallelManager {
     return this.windows
   }
 
-  private resolveMediaPaths(): {
-    shortLocalPath: string | null
-    movieLocalPath: string | null
-  } {
-    if (this.scanId && this.scanId !== 'default') {
-      const dir = path.join(MEDIA_DIR, this.scanId)
-      const shortP = path.join(dir, 'short.mp4')
-      const movie360 = path.join(dir, 'movie_360p.mp4')
-      const movieRaw = path.join(dir, 'movie.mp4')
-      return {
-        shortLocalPath: fs.existsSync(shortP) ? shortP : null,
-        movieLocalPath: fs.existsSync(movie360)
-          ? movie360
-          : fs.existsSync(movieRaw)
-            ? movieRaw
-            : null,
+  /**
+   * Verify and (if needed) compress `data/media/<scanId>/movie_360p.mp4` and verify `short.mp4`
+   * strictly inside `data/media/<scanId>/` BEFORE launching any parallel worker.
+   * Never falls back to raw `movie.mp4` or another scan's media directory.
+   */
+  private async verifyAndEnsureScanMediaReadyBeforeStart(): Promise<ParallelMediaVerificationInfo> {
+    if (!this.scanId || this.scanId === 'default') {
+      throw new Error('Cannot start Parallel Scan without a valid scanId')
+    }
+
+    const scan = getScan(this.scanId)
+    if (!scan) {
+      throw new Error(`Scan ${this.scanId} not found in store`)
+    }
+
+    // 1. Verify short media strictly from data/media/<this.scanId>/
+    const shortReady = await ensureStudioShortReady(this.scanId)
+    if (!this.isPathStrictlyInsideThisScanMediaDir(shortReady.localPath)) {
+      throw new Error(
+        `Short media path (${shortReady.localPath}) is not inside data/media/${this.scanId}/`,
+      )
+    }
+
+    const expectedMovieDuration =
+      resolveScanMovieDurationSec(scan) ||
+      (this.movieDurationSec > 0 ? this.movieDurationSec : null)
+
+    // 2. Check existing data/media/<this.scanId>/movie_360p.mp4
+    let movieCheck = await verifyStudioMovie360pFile(this.scanId, expectedMovieDuration)
+
+    if (!movieCheck.valid) {
+      const reasonMsg = movieCheck.reason || 'movie_360p.mp4 missing or invalid'
+      this.appendCombinedLog({
+        workerId: 'SYS',
+        level: 'INFO',
+        step: 'compress 360p start',
+        message: `movie_360p.mp4 check failed (${reasonMsg}) -> running 360p compression pipeline for scan ${this.scanId} (no fallback to raw movie.mp4)`,
+      })
+
+      this.compressing360p = {
+        active: true,
+        progress: 0,
+        statusText: 'Compressing movie 360p... 0%',
+        sizeBytes: null,
+        error: null,
+      }
+
+      const pollTimer = setInterval(() => {
+        try {
+          const latestScan = getScan(this.scanId)
+          const m360 = latestScan?.movie360p
+          if (m360 && this.compressing360p?.active) {
+            const pct = Math.max(0, Math.min(100, Math.round(m360.progress || 0)))
+            const sizePart =
+              m360.sizeBytes && m360.sizeBytes > 0
+                ? ` (${(m360.sizeBytes / (1024 * 1024)).toFixed(1)} MB)`
+                : ''
+            this.compressing360p = {
+              active: true,
+              progress: pct,
+              statusText: `Compressing movie 360p... ${pct}%${sizePart}`,
+              sizeBytes: m360.sizeBytes ?? null,
+              error: m360.error ?? null,
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+      }, 1000)
+
+      try {
+        await prepareStudioMovie360pAndDrive(this.scanId)
+      } finally {
+        clearInterval(pollTimer)
+      }
+
+      if (this.stoppingAll) {
+        this.compressing360p = null
+        throw new Error('STOPPED BY USER')
+      }
+
+      const postScan = getScan(this.scanId)
+      const prepState = postScan?.movie360p
+      if (prepState?.status === 'error') {
+        const errMsg =
+          prepState.error || 'Failed to compress movie_360p.mp4 (<= 390 MB required)'
+        this.compressing360p = {
+          active: false,
+          progress: 0,
+          statusText: `360p compression failed: ${errMsg}`,
+          error: errMsg,
+        }
+        throw new Error(`360p compression failed for scan ${this.scanId}: ${errMsg}`)
+      }
+
+      movieCheck = await verifyStudioMovie360pFile(this.scanId, expectedMovieDuration)
+      if (!movieCheck.valid) {
+        const errMsg =
+          movieCheck.reason || 'movie_360p.mp4 verification failed after compression'
+        this.compressing360p = {
+          active: false,
+          progress: 0,
+          statusText: `360p verification failed: ${errMsg}`,
+          error: errMsg,
+        }
+        throw new Error(`360p verification failed for scan ${this.scanId}: ${errMsg}`)
       }
     }
-    return { shortLocalPath: null, movieLocalPath: null }
+
+    this.compressing360p = null
+
+    if (!this.isPathStrictlyInsideThisScanMediaDir(movieCheck.filePath)) {
+      throw new Error(
+        `Movie 360p path (${movieCheck.filePath}) is not inside data/media/${this.scanId}/`,
+      )
+    }
+
+    const verifiedInfo: ParallelMediaVerificationInfo = {
+      scanId: this.scanId,
+      shortPath: shortReady.localPath,
+      shortSizeBytes: shortReady.sizeBytes,
+      shortDurationSec: shortReady.durationSec,
+      movie360Path: movieCheck.filePath,
+      movie360SizeBytes: movieCheck.sizeBytes,
+      movie360DurationSec: movieCheck.durationSec,
+      verifiedAt: Date.now(),
+    }
+
+    return verifiedInfo
   }
 
   /**
    * Start or resume a Parallel Window Scan for THIS scanId using the Global Profile Slot Pool.
+   * Idempotent: if already active or starting for this scan, ignores duplicate Start requests.
    */
   public async startParallelScan(params: {
     username: string
     scanId?: string | null
     minuteInput?: string
+    minuteInputSource?: 'auto' | 'manual'
     concurrency?: number
     shortLocalPath?: string | null
     shortYoutubeUrl?: string | null
@@ -1039,143 +1623,365 @@ export class StudioParallelManager {
     resumeExisting?: boolean
     onWindowMatches?: (windowState: ParallelWindowState, matches: ChunkMatch[]) => Promise<void>
     onLog?: (level: 'info' | 'warn' | 'error' | 'success', msg: string) => void
-  }): Promise<{ totalWindows: number; concurrency: number; scanId: string }> {
-    if (this.active) {
-      throw new Error(`Parallel Window Scan is already running for ${this.scanName}`)
-    }
-
-    this.refreshScanMetadataFromStore()
-    const cfg = await loadStudioUserConfig(params.username)
-    this.username = params.username
-
-    if (params.minuteInput !== undefined && params.minuteInput.trim()) {
-      this.minuteInput = params.minuteInput.trim()
-    } else if (!this.minuteInput) {
-      this.minuteInput = cfg.studioMinuteInput || DEFAULT_STUDIO_MINUTE_INPUT
-    }
-
-    const globalMaxSlots = Math.max(
-      1,
-      Math.min(20, Number(cfg.studioConcurrency || DEFAULT_STUDIO_CONCURRENCY)),
-    )
-    this.maxTotalPoolSlots = globalMaxSlots
-    globalProfileSlotPool.setMaxTotalSlots(globalMaxSlots)
-
-    this.concurrency = Math.max(
-      1,
-      Math.min(
-        20,
-        Number(params.concurrency ?? this.concurrency ?? cfg.studioConcurrency ?? DEFAULT_STUDIO_CONCURRENCY),
-      ),
-    )
-
-    this.persistMinuteInputOnScanRecord(this.minuteInput, this.concurrency)
-
-    this.measuredTokenRate = cfg.studioMeasuredTokenRate ?? null
-    if (params.onWindowMatches) this.onMatchCallback = params.onWindowMatches
-    if (params.onLog) this.onLogCallback = params.onLog
-
-    const mediaResolved = this.resolveMediaPaths()
-    this.shortLocalPath = params.shortLocalPath ?? mediaResolved.shortLocalPath ?? this.shortLocalPath
-    this.shortYoutubeUrl = params.shortYoutubeUrl ?? this.shortYoutubeUrl
-    this.shortDriveFileName = params.shortDriveFileName ?? this.shortDriveFileName
-    this.shortDurationSec = params.shortDurationSec || this.shortDurationSec || 150
-    this.movieLocalPath = params.movieLocalPath ?? mediaResolved.movieLocalPath ?? this.movieLocalPath
-    this.movieDriveFileName = params.movieDriveFileName ?? this.movieDriveFileName
-    this.movieDurationSec = params.movieDurationSec || this.movieDurationSec || 6600
-
-    const canResume =
-      params.resumeExisting &&
-      this.windows.length > 0 &&
-      this.windows.some((w) => w.status === 'DONE' || w.status === 'QUEUED')
-
-    if (!canResume) {
-      const { windows } = buildParallelWindowsFromMinuteInput(
-        this.minuteInput,
-        this.movieDurationSec,
-      )
-      this.windows = windows.map((w) => ({
-        ...w,
-        status: 'QUEUED',
-        workerId: null,
-        modelName: cfg.studioModelName || 'Gemini 3.8 Flash',
-        stage: 'queued',
-        tokens: null,
-        attempt: 0,
-        maxAttempts: 5,
-        permRetry: 0,
-        startedAt: null,
-        finishedAt: null,
-        elapsedSec: 0,
-        matchCount: 0,
-        summaryText: 'Queued',
-        error: null,
-      }))
-      this.startedAt = Date.now()
-      this.finishedAt = null
-    } else {
-      for (const w of this.windows) {
-        if (w.status !== 'DONE' && w.status !== 'SKIPPED') {
-          w.status = 'QUEUED'
-          w.workerId = null
-          w.stage = 'queued'
-          w.error = null
-        }
+  }): Promise<{ totalWindows: number; concurrency: number; scanId: string; alreadyRunning?: boolean }> {
+    // 6. Double-start prevention: idempotent per-scan guard
+    if (this.active || this.starting) {
+      this.appendCombinedLog({
+        workerId: 'SYS',
+        level: 'INFO',
+        step: 'duplicate start ignored',
+        message: `Ignored duplicate Start click for ${this.scanName} (already running/starting)`,
+      })
+      return {
+        totalWindows: this.windows.length,
+        concurrency: this.concurrency,
+        scanId: this.scanId,
+        alreadyRunning: true,
       }
-      if (!this.startedAt) this.startedAt = Date.now()
-      this.finishedAt = null
     }
 
-    this.active = true
-    this.paused = false
+    this.starting = true
     this.stoppingAll = false
-    this.waitingForWorkerSlots = false
-    this.stoppedWindowIds.clear()
-    this.recordResourceSnapshotIfNeeded(true, 'Parallel scan started')
-    this.persistStateToDisk()
+    this.paused = false
 
-    this.appendCombinedLog({
-      workerId: 'SYS',
-      level: 'INFO',
-      step: 'parallel scan start',
-      message: `Started Parallel Window Scan for ${this.scanName} (${this.windows.length} windows, scan concurrency=${this.concurrency}, global pool max=${this.maxTotalPoolSlots}, minutes="${this.minuteInput}")`,
-    })
+    try {
+      this.refreshScanMetadataFromStore()
+      const cfg = await loadStudioUserConfig(params.username)
+      this.username = params.username
 
-    this.runWorkerPoolLoop().catch((err) => {
-      const msg = (err as Error).message
+      if (params.minuteInputSource) {
+        this.minuteInputSource = params.minuteInputSource
+      }
+      if (params.minuteInput !== undefined && params.minuteInput.trim()) {
+        const trimmed = params.minuteInput.trim()
+        this.minuteInput = trimmed
+        if (!params.minuteInputSource) {
+          this.minuteInputSource =
+            trimmed !== this.foundMinutesInput ? 'manual' : 'auto'
+        }
+      } else if (!this.minuteInput) {
+        this.minuteInput = this.foundMinutesInput
+        this.minuteInputSource = 'auto'
+      }
+
+      if (!this.minuteInput || !this.minuteInput.trim()) {
+        throw new Error('Pehle window scan poora chalao (Minutes found khali hai)')
+      }
+
+      const globalMaxSlots = Math.max(
+        1,
+        Math.min(20, Number(cfg.studioConcurrency || DEFAULT_STUDIO_CONCURRENCY)),
+      )
+      this.maxTotalPoolSlots = globalMaxSlots
+      globalProfileSlotPool.setMaxTotalSlots(globalMaxSlots)
+
+      const uploadGateLimit = Math.max(
+        1,
+        Math.min(10, Number(cfg.studioUploadGateConcurrency || DEFAULT_STUDIO_UPLOAD_GATE)),
+      )
+      globalStudioUploadGate.setMaxConcurrent(uploadGateLimit)
+
+      this.concurrency = Math.max(
+        1,
+        Math.min(
+          20,
+          Number(params.concurrency ?? this.concurrency ?? cfg.studioConcurrency ?? DEFAULT_STUDIO_CONCURRENCY),
+        ),
+      )
+
+      this.persistMinuteInputOnScanRecord(
+        this.minuteInput,
+        this.concurrency,
+        this.minuteInputSource,
+      )
+
+      this.measuredTokenRate = cfg.studioMeasuredTokenRate ?? null
+      if (params.onWindowMatches) this.onMatchCallback = params.onWindowMatches
+      if (params.onLog) this.onLogCallback = params.onLog
+
+      // Build/update windows list upfront so the UI shows the planned windows even if 360p compression runs first
+      const canResume =
+        Boolean(params.resumeExisting) &&
+        this.hasResumableStateOnDisk() &&
+        this.windows.length > 0 &&
+        this.windows.some(
+          (w) =>
+            w.status === 'DONE' ||
+            w.status === 'QUEUED' ||
+            w.status === 'FAILED' ||
+            w.status === 'RETRYING' ||
+            w.status === 'STOPPED' ||
+            w.status === 'NEEDS_ATTENTION',
+        )
+
+      if (!canResume) {
+        const effectiveMovieDur =
+          this.movieDurationSec && this.movieDurationSec > 0 ? this.movieDurationSec : undefined
+        const { windows } = buildParallelWindowsFromMinuteInput(
+          this.minuteInput,
+          effectiveMovieDur,
+        )
+        this.windows = windows.map((w) => ({
+          ...w,
+          status: 'QUEUED',
+          workerId: null,
+          modelName: cfg.studioModelName || 'Gemini 3.8 Flash',
+          stage: 'queued',
+          tokens: null,
+          attempt: 0,
+          maxAttempts: 5,
+          permRetry: 0,
+          startedAt: null,
+          finishedAt: null,
+          elapsedSec: 0,
+          matchCount: 0,
+          summaryText: 'Queued',
+          error: null,
+        }))
+        this.startedAt = Date.now()
+        this.finishedAt = null
+      } else {
+        for (const w of this.windows) {
+          if (w.status !== 'DONE' && w.status !== 'SKIPPED') {
+            w.status = 'QUEUED'
+            w.workerId = null
+            w.stage = 'queued'
+            w.error = null
+          }
+        }
+        if (!this.startedAt) this.startedAt = Date.now()
+        this.finishedAt = null
+      }
+
+      // 1. Pre-check short media & check whether movie_360p.mp4 is already verified
+      if (!this.scanId || this.scanId === 'default') {
+        throw new Error('Cannot start Parallel Scan without a valid scanId')
+      }
+      const scanRecord = getScan(this.scanId)
+      if (!scanRecord) {
+        throw new Error(`Scan ${this.scanId} not found in store`)
+      }
+
+      const shortReady = await ensureStudioShortReady(this.scanId)
+      if (!this.isPathStrictlyInsideThisScanMediaDir(shortReady.localPath)) {
+        throw new Error(
+          `Short media path (${shortReady.localPath}) is not inside data/media/${this.scanId}/`,
+        )
+      }
+
+      const expectedMovieDuration =
+        resolveScanMovieDurationSec(scanRecord) ||
+        (this.movieDurationSec > 0 ? this.movieDurationSec : null)
+
+      const initialMovieCheck = await verifyStudioMovie360pFile(
+        this.scanId,
+        expectedMovieDuration,
+      )
+
+      const finalizeMediaAndLaunchWorkers = (verifiedMedia: ParallelMediaVerificationInfo) => {
+        this.mediaInfo = verifiedMedia
+        this.shortLocalPath = verifiedMedia.shortPath
+        this.shortYoutubeUrl = null
+        this.shortDriveFileName = null
+        if (verifiedMedia.shortDurationSec && verifiedMedia.shortDurationSec > 0) {
+          this.shortDurationSec = verifiedMedia.shortDurationSec
+        }
+        this.movieLocalPath = verifiedMedia.movie360Path
+        this.movieDriveFileName = null
+        if (verifiedMedia.movie360DurationSec && verifiedMedia.movie360DurationSec > 0) {
+          this.movieDurationSec = verifiedMedia.movie360DurationSec
+        }
+
+        for (const w of this.windows) {
+          if (w.status === 'QUEUED') {
+            w.stage = 'queued'
+            w.summaryText = 'Queued'
+          }
+        }
+
+        const shortSizeMb = verifiedMedia.shortSizeBytes
+          ? (verifiedMedia.shortSizeBytes / (1024 * 1024)).toFixed(2)
+          : '0'
+        const movieSizeMb = verifiedMedia.movie360SizeBytes
+          ? (verifiedMedia.movie360SizeBytes / (1024 * 1024)).toFixed(2)
+          : '0'
+
+        this.hasStartedRun = true
+        this.active = true
+        this.starting = false
+        this.paused = false
+        this.stoppingAll = false
+        this.waitingForWorkerSlots = false
+        this.stoppedWindowIds.clear()
+        this.recordResourceSnapshotIfNeeded(true, 'Parallel scan started')
+        this.startResourceSnapshotTimer()
+        this.persistStateToDisk()
+
+        this.appendCombinedLog({
+          workerId: 'SYS',
+          level: 'INFO',
+          step: 'media verified',
+          message: `scanId=${this.scanId} | short=${verifiedMedia.shortPath} (${shortSizeMb} MB, ${(verifiedMedia.shortDurationSec || 0).toFixed(1)}s) | movie_360p=${verifiedMedia.movie360Path} (${movieSizeMb} MB, ${(verifiedMedia.movie360DurationSec || 0).toFixed(1)}s)`,
+        })
+
+        this.appendCombinedLog({
+          workerId: 'SYS',
+          level: 'INFO',
+          step: 'parallel scan start',
+          message: `Started Parallel Window Scan for ${this.scanName} (${this.windows.length} windows, scan concurrency=${this.concurrency}, global pool max=${this.maxTotalPoolSlots}, uploadGate=${uploadGateLimit}, minutes="${this.minuteInput}")`,
+        })
+
+        this.runWorkerPoolLoop().catch((err) => {
+          const msg = (err as Error).message
+          this.appendCombinedLog({
+            workerId: 'SYS',
+            level: 'ERROR',
+            step: 'worker pool error',
+            message: `Parallel worker pool error: ${msg}`,
+          })
+          this.onLogCallback?.('error', `Parallel worker pool error: ${msg}`)
+        })
+      }
+
+      if (initialMovieCheck.valid) {
+        // movie_360p.mp4 is already valid on persistent disk -> launch workers immediately without re-compressing
+        this.compressing360p = null
+        finalizeMediaAndLaunchWorkers({
+          scanId: this.scanId,
+          shortPath: shortReady.localPath,
+          shortSizeBytes: shortReady.sizeBytes,
+          shortDurationSec: shortReady.durationSec,
+          movie360Path: initialMovieCheck.filePath,
+          movie360SizeBytes: initialMovieCheck.sizeBytes,
+          movie360DurationSec: initialMovieCheck.durationSec,
+          verifiedAt: Date.now(),
+        })
+      } else {
+        // Ensure source movie.mp4 exists before starting background 360p compression
+        const rawMoviePath = path.join(this.getScanMediaDir(), 'movie.mp4')
+        if (!fs.existsSync(rawMoviePath) || fs.statSync(rawMoviePath).size <= 0) {
+          throw new Error(
+            `Source movie file missing at ${rawMoviePath} (cannot build movie_360p.mp4)`,
+          )
+        }
+
+        this.compressing360p = {
+          active: true,
+          progress: 0,
+          statusText: 'Compressing movie 360p... 0%',
+          sizeBytes: null,
+          error: null,
+        }
+        for (const w of this.windows) {
+          if (w.status === 'QUEUED') {
+            w.stage = 'Compressing movie 360p...'
+            w.summaryText = 'Waiting for movie_360p.mp4 compression...'
+          }
+        }
+        this.startResourceSnapshotTimer()
+        this.persistStateToDisk()
+
+        // Run compression in background while holding workers (this.starting = true)
+        void (async () => {
+          try {
+            const verifiedMedia = await this.verifyAndEnsureScanMediaReadyBeforeStart()
+            if (this.stoppingAll) {
+              this.starting = false
+              this.active = false
+              this.stopResourceSnapshotTimer()
+              return
+            }
+            finalizeMediaAndLaunchWorkers(verifiedMedia)
+          } catch (bgErr) {
+            const msg = bgErr instanceof Error ? bgErr.message : String(bgErr)
+            this.starting = false
+            this.active = false
+            this.stopResourceSnapshotTimer()
+            this.resourceWarning = `ERROR: ${msg}`
+            this.compressing360p = {
+              active: false,
+              progress: 0,
+              statusText: `Compression error: ${msg}`,
+              error: msg,
+            }
+            this.appendCombinedLog({
+              workerId: 'SYS',
+              level: 'ERROR',
+              step: 'parallel start failed',
+              message: `Parallel Scan start aborted for ${this.scanName}: ${msg}`,
+            })
+            this.onLogCallback?.('error', `Parallel Scan start aborted: ${msg}`)
+            this.persistStateToDisk()
+          }
+        })()
+      }
+
+      return {
+        totalWindows: this.windows.length,
+        concurrency: this.concurrency,
+        scanId: this.scanId,
+      }
+    } catch (err) {
+      this.starting = false
+      this.active = false
+      this.stopResourceSnapshotTimer()
+      const msg = err instanceof Error ? err.message : String(err)
       this.appendCombinedLog({
         workerId: 'SYS',
         level: 'ERROR',
-        step: 'worker pool error',
-        message: `Parallel worker pool error: ${msg}`,
+        step: 'parallel start failed',
+        message: `Parallel Scan start aborted for ${this.scanName}: ${msg}`,
       })
-      this.onLogCallback?.('error', `Parallel worker pool error: ${msg}`)
-    })
-
-    return {
-      totalWindows: this.windows.length,
-      concurrency: this.concurrency,
-      scanId: this.scanId,
+      throw err
     }
   }
 
   public async waitForCompletion(): Promise<ParallelMergedReport | null> {
-    while (this.active) {
+    while (this.active || this.starting) {
       await new Promise((r) => setTimeout(r, 1000))
     }
     return this.getMergedReport()
   }
 
-  private pullNextQueuedWindow(): ParallelWindowState | null {
+  /**
+   * 5. Atomic, synchronous window claim:
+   * Picks the next highest-priority QUEUED / WAITING_FOR_WORKER window and immediately marks
+   * `status = 'ASSIGNED'` and `workerId = laneClaimTag` in the same synchronous turn so two
+   * worker lanes can NEVER claim the same window (e.g. Window #13).
+   */
+  private claimNextQueuedWindow(laneClaimTag: string): ParallelWindowState | null {
     if (this.stoppingAll) return null
     const candidates = this.windows
       .filter(
         (w) =>
           (w.status === 'QUEUED' || w.status === 'WAITING_FOR_WORKER') &&
+          !w.workerId &&
           !this.stoppedWindowIds.has(w.id),
       )
       .sort((a, b) => a.priorityRank - b.priorityRank || a.windowNumber - b.windowNumber)
-    return candidates[0] || null
+
+    const chosen = candidates[0] || null
+    if (!chosen) return null
+
+    chosen.status = 'ASSIGNED'
+    chosen.workerId = laneClaimTag
+    chosen.stage = 'assigned'
+    chosen.summaryText = `Assigned to ${laneClaimTag}`
+    return chosen
+  }
+
+  private releaseClaimedWindow(win: ParallelWindowState | null, reason = 'queued') {
+    if (!win) return
+    if (
+      win.status === 'ASSIGNED' ||
+      win.status === 'WAITING_FOR_WORKER' ||
+      win.status === 'WAITING_FOR_RAM'
+    ) {
+      win.status = 'QUEUED'
+      win.workerId = null
+      win.stage = reason
+      win.summaryText = 'Queued'
+    }
   }
 
   private async runWorkerPoolLoop(): Promise<void> {
@@ -1187,8 +1993,10 @@ export class StudioParallelManager {
     }
 
     await Promise.allSettled(workerPromises)
+    this.stopResourceSnapshotTimer()
     globalProfileSlotPool.releaseAllSlotsForScan(this.scanId)
     this.active = false
+    this.starting = false
     this.waitingForWorkerSlots = false
     this.finishedAt = Date.now()
     this.recordResourceSnapshotIfNeeded(true, 'Parallel scan finished')
@@ -1206,6 +2014,7 @@ export class StudioParallelManager {
 
   private async runSingleWorkerLane(laneIndex: number): Promise<void> {
     let preferredSlotIndex: number | null = laneIndex <= this.maxTotalPoolSlots ? laneIndex : null
+    const laneClaimTag = `LANE-${String(laneIndex).padStart(2, '0')}`
 
     while (!this.stoppingAll) {
       while (this.paused && !this.stoppingAll) {
@@ -1213,10 +2022,15 @@ export class StudioParallelManager {
       }
       if (this.stoppingAll) break
 
-      const candidateWin = this.pullNextQueuedWindow()
-      if (!candidateWin) {
+      // Atomically claim a window before any async wait so no other lane can pick it
+      const claimedWin = this.claimNextQueuedWindow(laneClaimTag)
+      if (!claimedWin) {
         const anyInFlight = this.windows.some(
           (w) =>
+            w.status === 'ASSIGNED' ||
+            w.status === 'WAITING_FOR_WORKER' ||
+            w.status === 'WAITING_FOR_RAM' ||
+            w.status === 'WAITING_FOR_UPLOAD_GATE' ||
             w.status === 'SETUP' ||
             w.status === 'RUNNING' ||
             w.status === 'VALIDATING' ||
@@ -1224,7 +2038,7 @@ export class StudioParallelManager {
             w.status === '403_WAIT',
         )
         const anyQueued = this.windows.some(
-          (w) => w.status === 'QUEUED' || w.status === 'WAITING_FOR_WORKER',
+          (w) => w.status === 'QUEUED' && !this.stoppedWindowIds.has(w.id),
         )
         if (!anyQueued && !anyInFlight) {
           break
@@ -1233,49 +2047,76 @@ export class StudioParallelManager {
           await new Promise((r) => setTimeout(r, 1500))
           continue
         }
+        break
       }
-      if (!candidateWin) break
 
-      // Resource check before leasing a slot and starting window (RAM & Disk)
+      // Resource check before leasing a slot and starting window (Disk & RAM < 70%)
       const freeDiskGb = readFreeDiskGb()
       if (freeDiskGb < 5) {
         this.resourceWarning = `WARN: Low disk space (${freeDiskGb} GB free < 5 GB)`
         this.recordResourceSnapshotIfNeeded(true, this.resourceWarning)
         this.appendCombinedLog({
           workerId: 'SYS',
-          windowId: candidateWin.id,
-          windowNumber: candidateWin.windowNumber,
-          windowRange: `${candidateWin.startFormatted}–${candidateWin.endFormatted}`,
+          windowId: claimedWin.id,
+          windowNumber: claimedWin.windowNumber,
+          windowRange: `${claimedWin.startFormatted}–${claimedWin.endFormatted}`,
           level: 'ERROR',
           step: 'WARN [low-disk]',
           message: this.resourceWarning,
         })
       }
 
+      // 4b. Only start a new worker/Chrome when RAM < 70% (was 85%)
       let ramPct = readSystemRamUsedPercent()
-      while (ramPct > 85 && !this.stoppingAll) {
-        this.resourceWarning = `WARN: High RAM usage (${ramPct}% > 85%) — throttling new worker start`
-        this.recordResourceSnapshotIfNeeded(true, this.resourceWarning)
-        await new Promise((r) => setTimeout(r, 3000))
+      let loggedWaitingForRam = false
+      while (ramPct >= 70 && !this.stoppingAll && !this.paused) {
+        const totalInUseAcrossScans = globalProfileSlotPool.getSummary(this.maxTotalPoolSlots).inUseSlots
+        // If 0 workers are running anywhere and baseline OS RAM is between 70-88%, allow 1 worker so scan doesn't deadlock
+        if (totalInUseAcrossScans === 0 && ramPct < 88) {
+          break
+        }
+        claimedWin.status = 'WAITING_FOR_RAM'
+        claimedWin.stage = `WAITING FOR RAM (${ramPct}% >= 70%)`
+        claimedWin.summaryText = `WAITING FOR RAM (${ramPct}%)`
+        this.resourceWarning = `WAITING FOR RAM: ${ramPct}% used (threshold 70% for new worker launch)`
+        this.recordResourceSnapshotIfNeeded(false, this.resourceWarning)
+        if (!loggedWaitingForRam) {
+          loggedWaitingForRam = true
+          this.appendCombinedLog({
+            workerId: 'SYS',
+            windowId: claimedWin.id,
+            windowNumber: claimedWin.windowNumber,
+            windowRange: `${claimedWin.startFormatted}–${claimedWin.endFormatted}`,
+            level: 'INFO',
+            step: 'WAITING FOR RAM',
+            message: `RAM is ${ramPct}% (>= 70%) — waiting before starting worker for Window #${claimedWin.windowNumber}`,
+          })
+        }
+        await new Promise((r) => setTimeout(r, 2500))
         ramPct = readSystemRamUsedPercent()
-        const activeCount = globalProfileSlotPool.getLeasedSlotsForScan(this.scanId).length
-        if (activeCount === 0) break
       }
 
-      // Lease a free worker slot from the GLOBAL Profile Slot Pool
+      if (this.stoppingAll || this.stoppedWindowIds.has(claimedWin.id)) {
+        this.releaseClaimedWindow(claimedWin)
+        if (this.stoppingAll) break
+        continue
+      }
+      if (this.paused) {
+        this.releaseClaimedWindow(claimedWin)
+        continue
+      }
+
+      // Lease a free worker slot from the GLOBAL Profile Slot Pool for `claimedWin`
       let leasedSlot: ProfileSlotEntry | null = null
       let loggedWaitingForSlot = false
 
-      while (!this.stoppingAll && !this.paused) {
-        const checkWin = this.pullNextQueuedWindow()
-        if (!checkWin) break
-
+      while (!this.stoppingAll && !this.paused && !this.stoppedWindowIds.has(claimedWin.id)) {
         leasedSlot = globalProfileSlotPool.tryAcquireSlot({
           scanId: this.scanId,
           scanLabel: this.scanName,
-          windowId: checkWin.id,
-          windowNumber: checkWin.windowNumber,
-          windowRange: `${checkWin.startFormatted}–${checkWin.endFormatted}`,
+          windowId: claimedWin.id,
+          windowNumber: claimedWin.windowNumber,
+          windowRange: `${claimedWin.startFormatted}–${claimedWin.endFormatted}`,
           preferredSlotIndex,
           poolLimit: this.maxTotalPoolSlots,
         })
@@ -1286,21 +2127,19 @@ export class StudioParallelManager {
           break
         }
 
-        // All global profile slots are currently in use (e.g. by another scan or this scan's other workers)
+        // All global profile slots are currently in use
         this.waitingForWorkerSlots = true
-        if (checkWin.status === 'QUEUED') {
-          checkWin.status = 'WAITING_FOR_WORKER'
-          checkWin.stage = 'WAITING FOR WORKER (global slot pool full)'
-          checkWin.summaryText = 'WAITING FOR WORKER (slots full)'
-        }
+        claimedWin.status = 'WAITING_FOR_WORKER'
+        claimedWin.stage = 'WAITING FOR WORKER (global slot pool full)'
+        claimedWin.summaryText = 'WAITING FOR WORKER (slots full)'
         if (!loggedWaitingForSlot) {
           loggedWaitingForSlot = true
           const poolSnap = globalProfileSlotPool.getSummary(this.maxTotalPoolSlots)
           this.appendCombinedLog({
             workerId: 'SYS',
-            windowId: checkWin.id,
-            windowNumber: checkWin.windowNumber,
-            windowRange: `${checkWin.startFormatted}–${checkWin.endFormatted}`,
+            windowId: claimedWin.id,
+            windowNumber: claimedWin.windowNumber,
+            windowRange: `${claimedWin.startFormatted}–${claimedWin.endFormatted}`,
             level: 'INFO',
             step: 'WAITING FOR WORKER',
             message: `Waiting for free profile slot (${poolSnap.summaryText})`,
@@ -1310,21 +2149,26 @@ export class StudioParallelManager {
       }
 
       if (!leasedSlot) {
+        this.releaseClaimedWindow(claimedWin)
         if (this.stoppingAll) break
         continue
       }
 
-      // Re-verify the window to run now that we hold `leasedSlot`
-      const nextWin = this.pullNextQueuedWindow()
-      if (!nextWin) {
+      // Assert no other slot is concurrently leased for the same windowId
+      const duplicateLeases = globalProfileSlotPool
+        .getLeasedSlotsForScan(this.scanId)
+        .filter((s) => s.leasedWindowId === claimedWin.id && s.slotIndex !== leasedSlot!.slotIndex)
+      if (duplicateLeases.length > 0) {
         globalProfileSlotPool.releaseSlot(leasedSlot.slotIndex, this.scanId)
-        continue
+        throw new Error(
+          `Assertion failed: Window #${claimedWin.windowNumber} (${claimedWin.id}) already leased by ${duplicateLeases.map((d) => d.workerId).join(',')}`,
+        )
       }
 
-      // Update slot lease metadata with the exact pulled window
-      leasedSlot.leasedWindowId = nextWin.id
-      leasedSlot.leasedWindowNumber = nextWin.windowNumber
-      leasedSlot.leasedWindowRange = `${nextWin.startFormatted}–${nextWin.endFormatted}`
+      // Bind the claimed window to the leased worker ID immediately
+      claimedWin.workerId = leasedSlot.workerId
+      claimedWin.status = 'ASSIGNED'
+      claimedWin.stage = `assigned to ${leasedSlot.workerId}`
 
       try {
         // Global stagger on first browser launch for this slot
@@ -1333,9 +2177,9 @@ export class StudioParallelManager {
           const waitSec = Math.round(staggerMs / 1000)
           this.appendCombinedLog({
             workerId: leasedSlot.workerId,
-            windowId: nextWin.id,
-            windowNumber: nextWin.windowNumber,
-            windowRange: `${nextWin.startFormatted}–${nextWin.endFormatted}`,
+            windowId: claimedWin.id,
+            windowNumber: claimedWin.windowNumber,
+            windowRange: `${claimedWin.startFormatted}–${claimedWin.endFormatted}`,
             level: 'INFO',
             step: 'stagger wait',
             message: `Waiting ${waitSec}s stagger before launching ${leasedSlot.workerId} (${leasedSlot.profileDirName})`,
@@ -1347,20 +2191,21 @@ export class StudioParallelManager {
         }
 
         if (this.stoppingAll) {
+          this.releaseClaimedWindow(claimedWin)
           break
         }
 
-        await this.executeWindowOnSlot(leasedSlot, nextWin)
+        await this.executeWindowOnSlot(leasedSlot, claimedWin)
 
-        if (nextWin.status === 'NEEDS_ATTENTION') {
+        if ((claimedWin.status as ParallelWindowStatus) === 'NEEDS_ATTENTION') {
           this.appendCombinedLog({
             workerId: leasedSlot.workerId,
-            windowId: nextWin.id,
-            windowNumber: nextWin.windowNumber,
-            windowRange: `${nextWin.startFormatted}–${nextWin.endFormatted}`,
+            windowId: claimedWin.id,
+            windowNumber: claimedWin.windowNumber,
+            windowRange: `${claimedWin.startFormatted}–${claimedWin.endFormatted}`,
             level: 'ERROR',
             step: 'worker halted',
-            message: `Halted ${leasedSlot.workerId} due to NEEDS ATTENTION on Window #${nextWin.windowNumber}`,
+            message: `Halted ${leasedSlot.workerId} due to NEEDS ATTENTION on Window #${claimedWin.windowNumber}`,
           })
           break
         }
@@ -1425,12 +2270,12 @@ export class StudioParallelManager {
         maxOutputTokens: cfg.studioMaxOutputTokens || 65536,
         maxInputTokens: cfg.studioMaxInputTokens,
         pageRecycleInterval: cfg.studioPageRecycleInterval || 5,
-        shortYoutubeUrl: this.shortYoutubeUrl,
-        shortDriveFileName: this.shortDriveFileName,
+        shortYoutubeUrl: null,
+        shortDriveFileName: null,
         shortLocalPath: this.shortLocalPath,
         shortStartSec: 0,
         shortEndSec: this.shortDurationSec,
-        movieDriveFileName: this.movieDriveFileName,
+        movieDriveFileName: null,
         movieLocalPath: this.movieLocalPath,
         movieStartSec: win.startSec,
         movieEndSec: win.endSec,
@@ -1613,6 +2458,8 @@ export class StudioParallelManager {
     this.stoppingAll = true
     this.paused = false
     this.waitingForWorkerSlots = false
+    this.compressing360p = null
+    this.stopResourceSnapshotTimer()
 
     // Only stop slots leased by THIS scan! Never touch slots leased by other scans.
     const leased = globalProfileSlotPool.getLeasedSlotsForScan(this.scanId)
@@ -1627,13 +2474,21 @@ export class StudioParallelManager {
     }
 
     for (const w of this.windows) {
-      if (w.status === 'QUEUED' || w.status === 'WAITING_FOR_WORKER') {
+      if (
+        w.status === 'QUEUED' ||
+        w.status === 'ASSIGNED' ||
+        w.status === 'WAITING_FOR_WORKER' ||
+        w.status === 'WAITING_FOR_RAM' ||
+        w.status === 'WAITING_FOR_UPLOAD_GATE'
+      ) {
         w.status = 'STOPPED'
+        w.workerId = null
         w.stage = 'stopped'
         w.summaryText = 'STOPPED BY USER'
       }
     }
     this.active = false
+    this.starting = false
     this.finishedAt = Date.now()
     this.persistStateToDisk()
 
@@ -1650,8 +2505,14 @@ export class StudioParallelManager {
     const win = this.windows.find((w) => w.id === windowId)
     if (!win) return
 
-    if (win.status === 'QUEUED' || win.status === 'WAITING_FOR_WORKER') {
+    if (
+      win.status === 'QUEUED' ||
+      win.status === 'ASSIGNED' ||
+      win.status === 'WAITING_FOR_WORKER' ||
+      win.status === 'WAITING_FOR_RAM'
+    ) {
       win.status = 'STOPPED'
+      win.workerId = null
       win.stage = 'stopped'
       win.summaryText = 'STOPPED BY USER'
       this.persistStateToDisk()
@@ -1697,6 +2558,9 @@ export class StudioParallelManager {
     })
 
     if (
+      prevStatus === 'ASSIGNED' ||
+      prevStatus === 'WAITING_FOR_UPLOAD_GATE' ||
+      prevStatus === 'WAITING_FOR_RAM' ||
       prevStatus === 'SETUP' ||
       prevStatus === 'RUNNING' ||
       prevStatus === 'VALIDATING' ||
@@ -1734,7 +2598,7 @@ export class StudioParallelManager {
       message: `Re-queued Window #${win.windowNumber} (${win.startFormatted}–${win.endFormatted}) for retry`,
     })
 
-    if (!this.active) {
+    if (!this.active && !this.starting) {
       await this.startParallelScan({
         username: username || this.username || 'admin',
         scanId: this.scanId,
@@ -1773,7 +2637,7 @@ export class StudioParallelManager {
       })
     }
 
-    if (count > 0 && !this.active) {
+    if (count > 0 && !this.active && !this.starting) {
       await this.startParallelScan({
         username: username || this.username || 'admin',
         scanId: this.scanId,
@@ -1913,17 +2777,42 @@ export class StudioParallelManager {
       }
     }
 
+    // Also reflect scan.movie360p compression state if active in store
+    let liveCompressing360p = this.compressing360p
+    if (!liveCompressing360p && this.scanId && this.scanId !== 'default') {
+      try {
+        const s = getScan(this.scanId)
+        if (s?.movie360p?.status === 'compressing') {
+          const pct = Math.max(0, Math.min(100, Math.round(s.movie360p.progress || 0)))
+          liveCompressing360p = {
+            active: true,
+            progress: pct,
+            statusText: `Compressing movie 360p... ${pct}%`,
+            sizeBytes: s.movie360p.sizeBytes ?? null,
+            error: s.movie360p.error ?? null,
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
     const activeWorkersCount = leasedByThisScan.length
     const doneCount = this.windows.filter((w) => w.status === 'DONE').length
     const queuedCount = this.windows.filter(
-      (w) => w.status === 'QUEUED' || w.status === 'WAITING_FOR_WORKER',
+      (w) =>
+        w.status === 'QUEUED' ||
+        w.status === 'ASSIGNED' ||
+        w.status === 'WAITING_FOR_WORKER' ||
+        w.status === 'WAITING_FOR_RAM' ||
+        w.status === 'WAITING_FOR_UPLOAD_GATE',
     ).length
     const failedCount = this.windows.filter(
       (w) => w.status === 'FAILED' || w.status === 'STOPPED',
     ).length
     const needsAttentionCount = this.windows.filter((w) => w.status === 'NEEDS_ATTENTION').length
     const elapsedSec =
-      this.startedAt && this.active
+      this.startedAt && (this.active || this.starting)
         ? Math.round((Date.now() - this.startedAt) / 1000)
         : this.startedAt && this.finishedAt
           ? Math.max(0, Math.round((this.finishedAt - this.startedAt) / 1000))
@@ -1931,12 +2820,19 @@ export class StudioParallelManager {
 
     return {
       active: this.active,
+      starting: this.starting,
       paused: this.paused,
       waitingForWorkerSlots: this.waitingForWorkerSlots,
+      hasResumableState: this.hasResumableStateOnDisk(),
+      compressing360p: liveCompressing360p,
+      mediaInfo: this.mediaInfo,
       scanId: this.scanId,
       scanName: this.scanName,
       username: this.username,
       minuteInput: this.minuteInput,
+      minuteInputSource: this.minuteInputSource,
+      foundMinutesInput: this.foundMinutesInput,
+      movieDurationSec: this.movieDurationSec > 0 ? this.movieDurationSec : null,
       concurrency: this.concurrency,
       measuredTokenRate: this.measuredTokenRate,
       startedAt: this.startedAt,
@@ -1950,6 +2846,7 @@ export class StudioParallelManager {
       totalWindows: this.windows.length,
       ramUsedPercent: readSystemRamUsedPercent(),
       freeDiskGb: readFreeDiskGb(),
+      chromeProcessCount: readChromeProcessCount(),
       resourceWarning: this.resourceWarning,
       slotPool,
       workers: workerCards,
@@ -1984,18 +2881,27 @@ function getManagersMap(): Map<string, StudioParallelManager> {
           }
         }
       }
-      // Also check legacy global file once for migration
+      // Also check legacy global file ONCE for migration ONLY to its own scanId, then rename to .migrated
       if (fs.existsSync(LEGACY_PARALLEL_STATE_FILE)) {
         try {
           const legacy = JSON.parse(fs.readFileSync(LEGACY_PARALLEL_STATE_FILE, 'utf8'))
-          if (legacy && typeof legacy.scanId === 'string' && legacy.scanId) {
+          if (legacy && typeof legacy.scanId === 'string' && legacy.scanId && legacy.scanId !== 'default') {
             if (!map.has(legacy.scanId)) {
               const mgr = new StudioParallelManager(legacy.scanId)
               map.set(legacy.scanId, mgr)
             }
           }
+          if (fs.existsSync(LEGACY_PARALLEL_STATE_FILE)) {
+            fs.renameSync(LEGACY_PARALLEL_STATE_FILE, LEGACY_PARALLEL_STATE_MIGRATED_FILE)
+          }
         } catch {
-          /* ignore */
+          try {
+            if (fs.existsSync(LEGACY_PARALLEL_STATE_FILE)) {
+              fs.renameSync(LEGACY_PARALLEL_STATE_FILE, LEGACY_PARALLEL_STATE_MIGRATED_FILE)
+            }
+          } catch {
+            /* ignore */
+          }
         }
       }
     } catch {

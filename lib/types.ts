@@ -900,6 +900,8 @@ export interface Scan {
   shortDriveFileName?: string | null
   /** Per-scan movie minute input list/ranges for Parallel Window Scan */
   studioMinuteInput?: string | null
+  /** Source of per-scan movie minute input: 'auto' (from scan's Minutes found) or 'manual' (edited by user) */
+  studioMinuteInputSource?: 'auto' | 'manual' | null
   /** Per-scan parallel worker concurrency */
   studioParallelConcurrency?: number | null
   /** Durable queue state; persisted so queued work can recover after restart. */

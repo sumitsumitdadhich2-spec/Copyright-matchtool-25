@@ -163,7 +163,13 @@ function isErrorRetry403OrStateChange(entry: ParallelCombinedLogEntry): boolean 
     s.includes('permission_denied') ||
     s.includes('parallel scan start') ||
     s.includes('parallel scan finished') ||
-    s.includes('waiting for worker')
+    s.includes('media verified') ||
+    s.includes('compress 360p') ||
+    s.includes('waiting for worker') ||
+    s.includes('waiting for upload gate') ||
+    s.includes('waiting for ram') ||
+    s.includes('target crashed') ||
+    s.includes('error [crash]')
   )
 }
 
@@ -250,10 +256,11 @@ export async function buildParallelScanPdfBuffer(params: {
 
   // ==========================================================================
   // SECTION (a): HEADER
-  // Scan ID/Name, generate time, concurrency, total windows, app/Chrome version, elapsed duration
+  // Scan ID/Name, generate time, concurrency, total windows, app/Chrome version,
+  // elapsed duration, AND exact verified media paths + sizes + durations
   // ==========================================================================
   doc.setFillColor(15, 23, 42)
-  doc.roundedRect(marginLeft, y, contentWidth, 28, 2, 2, 'F')
+  doc.roundedRect(marginLeft, y, contentWidth, 38, 2, 2, 'F')
 
   doc.setFont('helvetica', 'bold')
   doc.setFontSize(12)
@@ -265,13 +272,13 @@ export async function buildParallelScanPdfBuffer(params: {
   )
 
   doc.setFont(monoFontName, 'normal')
-  doc.setFontSize(7.8)
+  doc.setFontSize(7.5)
   doc.setTextColor(186, 230, 253)
   const scanDisplay = scan?.customName || scan?.movieName || snap.scanName || scanId
   doc.text(
     sanitizePdfText(`Scan ID: ${scanId}  |  Name: ${scanDisplay}`),
     marginLeft + 4,
-    y + 13,
+    y + 12.5,
   )
 
   doc.setTextColor(203, 213, 225)
@@ -280,7 +287,7 @@ export async function buildParallelScanPdfBuffer(params: {
       `Generated: ${new Date().toISOString()}  |  Elapsed: ${formatElapsedPlusMmSs(snap.elapsedSec)} (${snap.elapsedSec}s)  |  Concurrency: ${snap.concurrency} (${snap.slotPool.summaryText})`,
     ),
     marginLeft + 4,
-    y + 18.5,
+    y + 17.5,
   )
 
   doc.text(
@@ -288,10 +295,23 @@ export async function buildParallelScanPdfBuffer(params: {
       `Windows: ${snap.totalWindows} total (${snap.doneCount} DONE, ${snap.failedCount} FAILED/STOPPED, ${snap.queuedCount} QUEUED)  |  Env: ${getRuntimeChromeAndAppVersion()}`,
     ),
     marginLeft + 4,
-    y + 24,
+    y + 22.5,
   )
 
-  y += 33
+  const mi = snap.mediaInfo
+  const shortLine = mi?.shortPath
+    ? `Short: ${mi.shortPath}  (${mi.shortSizeBytes ? (mi.shortSizeBytes / (1024 * 1024)).toFixed(2) : '0'} MB, ${(mi.shortDurationSec || 0).toFixed(1)}s)`
+    : `Short: data/media/${scanId}/short.mp4 (not verified yet)`
+  const movieLine = mi?.movie360Path
+    ? `Movie 360p: ${mi.movie360Path}  (${mi.movie360SizeBytes ? (mi.movie360SizeBytes / (1024 * 1024)).toFixed(2) : '0'} MB, ${(mi.movie360DurationSec || 0).toFixed(1)}s)`
+    : `Movie 360p: data/media/${scanId}/movie_360p.mp4 (not verified yet)`
+
+  doc.setTextColor(167, 243, 208)
+  doc.setFontSize(7.0)
+  doc.text(sanitizePdfText(shortLine), marginLeft + 4, y + 28)
+  doc.text(sanitizePdfText(movieLine), marginLeft + 4, y + 33)
+
+  y += 43
 
   // ==========================================================================
   // SECTION (b): SUMMARY TABLE OF EVERY WINDOW
@@ -472,16 +492,16 @@ export async function buildParallelScanPdfBuffer(params: {
   }
 
   // ==========================================================================
-  // SECTION (d): RESOURCE SNAPSHOTS (RAM %, Free Disk GB, Active Workers, Global Slots)
+  // SECTION (d): RESOURCE SNAPSHOTS (RAM %, Free Disk GB, Chrome Procs, Active Workers, Global Slots)
   // ==========================================================================
   const resSnaps = snap.resourceSnapshots || []
-  ensureSpace(16, '3. System Resource Snapshots (RAM & Disk)')
+  ensureSpace(16, '3. System Resource Snapshots (RAM, Disk & Chrome Processes)')
   doc.setFont('helvetica', 'bold')
   doc.setFontSize(9.5)
   doc.setTextColor(15, 23, 42)
   doc.text(
     sanitizePdfText(
-      `3. Resource Snapshots (${resSnaps.length} samples | Current RAM: ${snap.ramUsedPercent}%, Free Disk: ${snap.freeDiskGb} GB)`,
+      `3. Resource Snapshots (${resSnaps.length} samples @ 10s | Current RAM: ${snap.ramUsedPercent}%, Chrome Procs: ${snap.chromeProcessCount ?? 0}, Free Disk: ${snap.freeDiskGb} GB)`,
     ),
     marginLeft,
     y,
@@ -494,7 +514,7 @@ export async function buildParallelScanPdfBuffer(params: {
     doc.setTextColor(100, 116, 139)
     doc.text(
       sanitizePdfText(
-        `Live snapshot: RAM ${snap.ramUsedPercent}% used | Free Disk ${snap.freeDiskGb} GB | ${snap.slotPool.summaryText}`,
+        `Live snapshot: RAM ${snap.ramUsedPercent}% used | Chrome Procs: ${snap.chromeProcessCount ?? 0} | Free Disk ${snap.freeDiskGb} GB | ${snap.slotPool.summaryText}`,
       ),
       marginLeft + 2,
       y + 3,
@@ -507,20 +527,21 @@ export async function buildParallelScanPdfBuffer(params: {
     doc.setFontSize(6.5)
     doc.setTextColor(51, 65, 85)
     doc.text(
-      sanitizePdfText('Time          Elapsed   RAM Used   Free Disk   Scan Workers   Global Slots   Note'),
+      sanitizePdfText('Time          Elapsed   RAM Used   Free Disk   Chrome Procs   Scan Workers   Global Slots   Note'),
       marginLeft + 1.5,
       y + 3.5,
     )
     y += 5.8
 
-    const displaySnaps = resSnaps.slice(-60)
+    const displaySnaps = resSnaps.slice(-80)
     for (let i = 0; i < displaySnaps.length; i++) {
       const rs = displaySnaps[i]
       ensureSpace(4.5, '3. System Resource Snapshots')
       doc.setFont(monoFontName, 'normal')
       doc.setFontSize(6.3)
       doc.setTextColor(30, 41, 59)
-      const rowStr = `${formatTimeHhMmSs(rs.t).padEnd(14, ' ')}${formatElapsedPlusMmSs(rs.elapsedSec).padEnd(10, ' ')}${`${rs.ramUsedPercent}%`.padEnd(11, ' ')}${`${rs.freeDiskGb} GB`.padEnd(12, ' ')}${String(rs.activeWorkers).padEnd(15, ' ')}${`${rs.slotsInUse}/${rs.totalSlots}`.padEnd(15, ' ')}${rs.note || ''}`
+      const chromeCnt = typeof rs.chromeProcessCount === 'number' ? String(rs.chromeProcessCount) : '--'
+      const rowStr = `${formatTimeHhMmSs(rs.t).padEnd(14, ' ')}${formatElapsedPlusMmSs(rs.elapsedSec).padEnd(10, ' ')}${`${rs.ramUsedPercent}%`.padEnd(11, ' ')}${`${rs.freeDiskGb} GB`.padEnd(12, ' ')}${chromeCnt.padEnd(15, ' ')}${String(rs.activeWorkers).padEnd(15, ' ')}${`${rs.slotsInUse}/${rs.totalSlots}`.padEnd(15, ' ')}${rs.note || ''}`
       doc.text(sanitizePdfText(rowStr), marginLeft + 1.5, y + 2.5)
       y += 4
     }

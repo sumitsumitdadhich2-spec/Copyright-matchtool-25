@@ -994,51 +994,109 @@ export async function compressVideoForStudio360p(params: {
 
   const outDir = path.dirname(outputFile)
   if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true })
-  const tmpFile = `${outputFile}.tmp-${Date.now()}.mp4`
+  const partialFile = `${outputFile}.partial`
+  const HARD_LIMIT_BYTES = 390 * 1024 * 1024
 
   try {
-    await runFfmpeg(
-      [
-        ...IN_FLAGS,
-        '-i',
-        inputFile,
-        '-vf',
-        `scale=-2:${height}:flags=bicubic,fps=${SCAN_FPS}`,
-        '-r',
-        String(SCAN_FPS),
-        '-vsync',
-        'cfr',
-        '-c:v',
-        'libx264',
-        '-preset',
-        'veryfast',
-        '-b:v',
-        `${videoKbps}k`,
-        '-maxrate',
-        `${maxrateKbps}k`,
-        '-bufsize',
-        `${bufsizeKbps}k`,
-        '-pix_fmt',
-        'yuv420p',
-        '-c:a',
-        'aac',
-        '-ac',
-        '1',
-        '-ar',
-        '48000',
-        '-b:a',
-        `${AUDIO_KBPS}k`,
-        '-movflags',
-        '+faststart',
-        tmpFile,
-      ],
-      {
-        durationSec: dur,
-        onProgress: (p) => onProgress?.(Math.min(99, Math.round(p))),
-        label: `studio-${resolution}`,
-        owner,
-      },
-    )
+    for (const stale of [partialFile]) {
+      try {
+        if (fs.existsSync(stale)) fs.unlinkSync(stale)
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const runSingleEncodePass = async (
+      targetRes: '360p' | '288p',
+      targetVideoKbps: number,
+      progressOffset = 0,
+      progressScale = 1,
+    ) => {
+      const h = targetRes === '288p' ? 288 : 360
+      const maxKbps = Math.max(targetVideoKbps + 25, Math.round(targetVideoKbps * 1.08))
+      const bufKbps = Math.max(targetVideoKbps * 2, 350)
+      try {
+        if (fs.existsSync(partialFile)) fs.unlinkSync(partialFile)
+      } catch {
+        /* ignore */
+      }
+      await runFfmpeg(
+        [
+          '-y',
+          ...IN_FLAGS,
+          '-i',
+          inputFile,
+          '-vf',
+          `scale=-2:${h}:flags=bicubic,fps=${SCAN_FPS}`,
+          '-r',
+          String(SCAN_FPS),
+          '-vsync',
+          'cfr',
+          '-c:v',
+          'libx264',
+          '-preset',
+          'veryfast',
+          '-b:v',
+          `${targetVideoKbps}k`,
+          '-maxrate',
+          `${maxKbps}k`,
+          '-bufsize',
+          `${bufKbps}k`,
+          '-pix_fmt',
+          'yuv420p',
+          '-c:a',
+          'aac',
+          '-ac',
+          '1',
+          '-ar',
+          '48000',
+          '-b:a',
+          `${AUDIO_KBPS}k`,
+          '-movflags',
+          '+faststart',
+          '-f',
+          'mp4',
+          partialFile,
+        ],
+        {
+          durationSec: dur,
+          onProgress: (p) =>
+            onProgress?.(Math.min(99, Math.round(progressOffset + p * progressScale))),
+          label: `studio-${targetRes}`,
+          owner,
+        },
+      )
+    }
+
+    await runSingleEncodePass(resolution, videoKbps, 0, 1)
+
+    let partialSize = fs.existsSync(partialFile) ? fs.statSync(partialFile).size : 0
+    if (partialSize > HARD_LIMIT_BYTES) {
+      // File exceeded 390 MB: reduce bitrate proportionally (and drop to 288p) and re-encode
+      const ratio = (365 * 1024 * 1024) / Math.max(1, partialSize)
+      const reducedKbps = Math.max(110, Math.floor(videoKbps * ratio * 0.92))
+      warning = `Initial 360p encode was ${(partialSize / (1024 * 1024)).toFixed(1)} MB (> 390 MB limit) — re-encoded at 288p / ${reducedKbps} kbps to fit <= 390 MB.`
+      resolution = '288p'
+      videoKbps = reducedKbps
+      await runSingleEncodePass(resolution, videoKbps, 50, 0.5)
+      partialSize = fs.existsSync(partialFile) ? fs.statSync(partialFile).size : 0
+    }
+
+    if (partialSize <= 0) {
+      throw new Error('Compressed 360p output file is empty (0 bytes)')
+    }
+    if (partialSize > HARD_LIMIT_BYTES) {
+      throw new Error(
+        `Compressed movie_360p.mp4 size (${(partialSize / (1024 * 1024)).toFixed(1)} MB) still exceeds 390 MB Studio limit`,
+      )
+    }
+
+    const probedDur = await probeDuration(partialFile)
+    if (!Number.isFinite(probedDur) || Math.abs(probedDur - dur) > 2.5) {
+      throw new Error(
+        `Compressed movie_360p.mp4 duration mismatch: probed ${probedDur.toFixed(1)}s vs original ${dur.toFixed(1)}s (exceeds ±2s tolerance)`,
+      )
+    }
 
     if (fs.existsSync(outputFile)) {
       try {
@@ -1047,7 +1105,7 @@ export async function compressVideoForStudio360p(params: {
         /* ignore */
       }
     }
-    fs.renameSync(tmpFile, outputFile)
+    fs.renameSync(partialFile, outputFile)
     const sizeBytes = fs.statSync(outputFile).size
     onProgress?.(100)
     return {
@@ -1059,7 +1117,7 @@ export async function compressVideoForStudio360p(params: {
     }
   } finally {
     try {
-      if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile)
+      if (fs.existsSync(partialFile)) fs.unlinkSync(partialFile)
     } catch {
       /* ignore */
     }

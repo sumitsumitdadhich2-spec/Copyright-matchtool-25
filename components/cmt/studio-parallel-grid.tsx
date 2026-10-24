@@ -21,6 +21,7 @@ import {
   Terminal,
   Filter,
   FileDown,
+  CheckCircle2,
 } from 'lucide-react'
 import type {
   ParallelCombinedLogEntry,
@@ -30,17 +31,76 @@ import type {
   ParallelWindowStatus,
   ParallelWorkerCardSnapshot,
 } from '@/lib/studio-parallel-manager'
+import {
+  buildParallelWindowsFromMinuteInput,
+  formatParallelTimecode,
+  parseMinuteInputToContiguousRuns,
+  type ParallelWindowSpec,
+} from '@/lib/studio-window-planner'
+import type { Scan } from '@/lib/types'
 
-const DEFAULT_MINUTES_STR =
+const LEGACY_GLOBAL_DEFAULT_MINUTES =
   '7,8,9,10,14,15,16,17,19,20,21,25-41,48-54,56,57,58,63-67,71-100'
 
 interface StudioParallelGridProps {
+  scan?: Scan | null
   parallelSnapshot: ParallelScanLiveSnapshot | null
   scanId?: string | null
   scanTitle?: string | null
   scanMinuteInput?: string | null
+  scanMinuteInputSource?: 'auto' | 'manual' | null
+  scanMovieDuration?: number | null
   scanConcurrency?: number | null
   onActionCompleted?: (nextParallel: ParallelScanLiveSnapshot) => void
+}
+
+function formatCompactMinutesClient(
+  minutes: number[],
+  movieDurationSec?: number | null,
+): string {
+  const maxDur = movieDurationSec && movieDurationSec > 0 ? movieDurationSec : null
+  const valid = [...new Set(minutes)]
+    .filter((m) => Number.isFinite(m) && m >= 0 && (maxDur === null || m * 60 < maxDur))
+    .map((m) => Math.floor(m))
+    .sort((a, b) => a - b)
+  if (valid.length === 0) return ''
+  const parts: string[] = []
+  let i = 0
+  while (i < valid.length) {
+    let j = i
+    while (j + 1 < valid.length && valid[j + 1] === valid[j] + 1) {
+      j += 1
+    }
+    parts.push(i === j ? `${valid[i]}` : `${valid[i]}-${valid[j]}`)
+    i = j + 1
+  }
+  return parts.join(',')
+}
+
+function extractScanFoundMinutesClient(
+  scan?: Scan | null,
+  movieDurationSec?: number | null,
+): string {
+  if (!scan) return ''
+  const prescan = scan.geminiPrescan
+  let raw: number[] = []
+  if (prescan?.appliedMinutes && prescan.appliedMinutes.length > 0) {
+    raw = [...prescan.appliedMinutes]
+  } else if (prescan?.minuteSuggestions && prescan.minuteSuggestions.length > 0) {
+    raw = prescan.minuteSuggestions.map((s) => s.minute)
+  } else if (scan.mergePipeline?.approvedMinutes && scan.mergePipeline.approvedMinutes.length > 0) {
+    raw = [...scan.mergePipeline.approvedMinutes]
+  } else if (
+    scan.mergePipeline?.minuteSuggestions &&
+    scan.mergePipeline.minuteSuggestions.length > 0
+  ) {
+    raw = scan.mergePipeline.minuteSuggestions.map((s) => s.minute)
+  } else {
+    raw = (scan.shortSegments || [])
+      .filter((s) => s.selected !== false && Array.isArray(s.movieMinutes) && s.movieMinutes.length > 0)
+      .flatMap((s) => s.movieMinutes!)
+  }
+  return formatCompactMinutesClient(raw, movieDurationSec)
 }
 
 function formatMmSs(sec: number): string {
@@ -74,11 +134,14 @@ function statusBadgeStyle(status: ParallelWindowStatus | 'IDLE'): string {
     case 'VALIDATING':
       return 'border-cyan-500/40 bg-cyan-500/15 text-cyan-300'
     case 'SETUP':
+    case 'ASSIGNED':
       return 'border-blue-500/40 bg-blue-500/15 text-blue-300'
     case '403_WAIT':
     case 'RETRYING':
       return 'border-amber-500/40 bg-amber-500/15 text-amber-300'
     case 'WAITING_FOR_WORKER':
+    case 'WAITING_FOR_UPLOAD_GATE':
+    case 'WAITING_FOR_RAM':
       return 'border-purple-500/40 bg-purple-500/15 text-purple-300'
     case 'NEEDS_ATTENTION':
       return 'border-rose-500/60 bg-rose-500/20 text-rose-200 animate-pulse'
@@ -120,19 +183,67 @@ function shortModelBadge(modelName: string): string {
 }
 
 export function StudioParallelGrid({
+  scan,
   parallelSnapshot,
   scanId,
   scanTitle,
   scanMinuteInput,
+  scanMinuteInputSource,
+  scanMovieDuration,
   scanConcurrency,
   onActionCompleted,
 }: StudioParallelGridProps) {
-  const [minuteInput, setMinuteInput] = useState<string>(
-    parallelSnapshot?.minuteInput || scanMinuteInput || DEFAULT_MINUTES_STR,
-  )
+  // Strictly bind snapshot to THIS scanId so another scan's Resume/Retry counts never leak
+  const snap = useMemo(() => {
+    if (!parallelSnapshot || !scanId) return null
+    return parallelSnapshot.scanId === scanId ? parallelSnapshot : null
+  }, [parallelSnapshot, scanId])
+
+  const effectiveMovieDurationSec = useMemo(() => {
+    if (typeof scanMovieDuration === 'number' && scanMovieDuration > 0) return scanMovieDuration
+    if (typeof scan?.movieDuration === 'number' && scan.movieDuration > 0) return scan.movieDuration
+    if (typeof scan?.movieTrimEnd === 'number' && scan.movieTrimEnd > 0) return scan.movieTrimEnd
+    if (
+      scan?.geminiPrescan?.movieCopy?.trimEnd &&
+      scan.geminiPrescan.movieCopy.trimEnd > 0
+    ) {
+      return scan.geminiPrescan.movieCopy.trimEnd
+    }
+    if (
+      typeof snap?.movieDurationSec === 'number' &&
+      snap.movieDurationSec > 0
+    ) {
+      return snap.movieDurationSec
+    }
+    return null
+  }, [scanMovieDuration, scan, snap?.movieDurationSec])
+
+  const effectiveFoundMinutes = useMemo(() => {
+    const fromScan = extractScanFoundMinutesClient(scan, effectiveMovieDurationSec)
+    if (fromScan) return fromScan
+    if (snap?.foundMinutesInput) return snap.foundMinutesInput
+    return ''
+  }, [scan, effectiveMovieDurationSec, snap?.foundMinutesInput])
+
+  const initialSource: 'auto' | 'manual' =
+    snap?.minuteInputSource === 'manual' || scanMinuteInputSource === 'manual'
+      ? 'manual'
+      : 'auto'
+
+  const resolveInitialMinutes = (): string => {
+    if (initialSource === 'manual') {
+      const manualVal = (snap?.minuteInput || scanMinuteInput || '').trim()
+      if (manualVal) return manualVal
+    }
+    return effectiveFoundMinutes
+  }
+
+  const [minuteInputSource, setMinuteInputSource] = useState<'auto' | 'manual'>(initialSource)
+  const [minuteInput, setMinuteInput] = useState<string>(resolveInitialMinutes)
   const [concurrency, setConcurrency] = useState<number>(
-    parallelSnapshot?.concurrency || scanConcurrency || 10,
+    snap?.concurrency || scanConcurrency || 4,
   )
+  const [confirmClearStateOpen, setConfirmClearStateOpen] = useState<boolean>(false)
   const [busyAction, setBusyAction] = useState<string | null>(null)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null)
@@ -149,22 +260,46 @@ export function StudioParallelGrid({
 
   const syncedScanIdRef = useRef<string | null>(null)
 
-  // Sync per-scan minuteInput & concurrency when scanId changes or snapshot arrives for this scan
+  // Sync per-scan minuteInput & concurrency when scanId changes
   useEffect(() => {
     const currentId = scanId || null
     if (syncedScanIdRef.current !== currentId) {
       syncedScanIdRef.current = currentId
-      setMinuteInput(parallelSnapshot?.minuteInput || scanMinuteInput || DEFAULT_MINUTES_STR)
-      setConcurrency(parallelSnapshot?.concurrency || scanConcurrency || 10)
+      const nextSource: 'auto' | 'manual' =
+        snap?.minuteInputSource === 'manual' || scanMinuteInputSource === 'manual'
+          ? 'manual'
+          : 'auto'
+      setMinuteInputSource(nextSource)
+      if (nextSource === 'manual') {
+        const manualVal = (snap?.minuteInput || scanMinuteInput || '').trim()
+        setMinuteInput(
+          manualVal && manualVal !== LEGACY_GLOBAL_DEFAULT_MINUTES
+            ? manualVal
+            : effectiveFoundMinutes,
+        )
+      } else {
+        setMinuteInput(effectiveFoundMinutes)
+      }
+      setConcurrency(snap?.concurrency || scanConcurrency || 4)
+      setConfirmClearStateOpen(false)
       setSelectedWorkerId(null)
       setErrorMsg(null)
-    } else if (parallelSnapshot && parallelSnapshot.scanId === currentId) {
-      // If user hasn't typed a different value before snapshot loaded, sync once
-      if (minuteInput === DEFAULT_MINUTES_STR && parallelSnapshot.minuteInput) {
-        setMinuteInput(parallelSnapshot.minuteInput)
-      }
     }
-  }, [scanId, scanMinuteInput, scanConcurrency, parallelSnapshot, minuteInput])
+  }, [
+    scanId,
+    scanMinuteInput,
+    scanMinuteInputSource,
+    scanConcurrency,
+    snap,
+    effectiveFoundMinutes,
+  ])
+
+  // Auto-update minuteInput whenever scan's "Minutes found" changes AND source is 'auto'
+  useEffect(() => {
+    if (minuteInputSource === 'auto') {
+      setMinuteInput(effectiveFoundMinutes)
+    }
+  }, [effectiveFoundMinutes, minuteInputSource])
 
   const postParallelControl = async (payload: Record<string, unknown>, label: string) => {
     if (!scanId) {
@@ -195,23 +330,124 @@ export function StudioParallelGrid({
     }
   }
 
-  const activeCount = parallelSnapshot?.activeWorkersCount ?? 0
-  const maxConcurrency = parallelSnapshot?.concurrency ?? concurrency
-  const doneCount = parallelSnapshot?.doneCount ?? 0
-  const totalWindows = parallelSnapshot?.totalWindows ?? 0
-  const queuedCount = parallelSnapshot?.queuedCount ?? 0
-  const failedCount = parallelSnapshot?.failedCount ?? 0
-  const needsAttentionCount = parallelSnapshot?.needsAttentionCount ?? 0
-  const elapsedSec = parallelSnapshot?.elapsedSec ?? 0
-  const workers = parallelSnapshot?.workers ?? []
-  const windows = parallelSnapshot?.windows ?? []
-  const mergedReport = parallelSnapshot?.mergedReport ?? null
-  const slotPool = parallelSnapshot?.slotPool ?? null
-  const combinedLogs = parallelSnapshot?.combinedLogs ?? []
-  const totalLogLinesOnDisk = parallelSnapshot?.totalLogLinesOnDisk ?? combinedLogs.length
+  const activeCount = snap?.activeWorkersCount ?? 0
+  const maxConcurrency = snap?.concurrency ?? concurrency
+  const doneCount = snap?.doneCount ?? 0
+  const totalWindows = snap?.totalWindows ?? 0
+  const queuedCount = snap?.queuedCount ?? 0
+  const failedCount = snap?.failedCount ?? 0
+  const needsAttentionCount = snap?.needsAttentionCount ?? 0
+  const elapsedSec = snap?.elapsedSec ?? 0
+  const workers = snap?.workers ?? []
+  const windows = snap?.windows ?? []
+  const mergedReport = snap?.mergedReport ?? null
+  const slotPool = snap?.slotPool ?? null
+  const combinedLogs = snap?.combinedLogs ?? []
+  const totalLogLinesOnDisk = snap?.totalLogLinesOnDisk ?? combinedLogs.length
+  const isRunningOrStarting = Boolean(snap?.active || snap?.starting)
+  const hasResumableState = Boolean(snap?.hasResumableState)
+  const compressing360p = snap?.compressing360p ?? null
+  const mediaInfo = snap?.mediaInfo ?? null
 
   const selectedWorker: ParallelWorkerCardSnapshot | null =
     selectedWorkerId ? workers.find((w) => w.workerId === selectedWorkerId) || null : null
+
+  // Live preview of windows from the current minuteInput + movie length validation
+  const previewValidation = useMemo(() => {
+    const trimmed = (minuteInput || '').trim()
+    if (!trimmed) {
+      return {
+        previewWindows: [] as ParallelWindowSpec[],
+        unclampedMaxEndSec: 0,
+        exceededInputCount: 0,
+        savedWindowsOutOfBounds: [] as ParallelWindowState[],
+      }
+    }
+    const rawRuns = parseMinuteInputToContiguousRuns(trimmed)
+    const unclampedMaxEndSec = rawRuns.reduce((max, r) => Math.max(max, r.endSec), 0)
+    const maxDurFloor =
+      effectiveMovieDurationSec && effectiveMovieDurationSec > 0
+        ? Math.floor(effectiveMovieDurationSec)
+        : null
+    const exceededInputCount =
+      maxDurFloor !== null
+        ? rawRuns.filter((r) => r.endSec > maxDurFloor || r.startSec >= maxDurFloor).length
+        : 0
+
+    let previewWindows: ParallelWindowSpec[] = []
+    try {
+      const built = buildParallelWindowsFromMinuteInput(
+        trimmed,
+        maxDurFloor !== null ? maxDurFloor : undefined,
+      )
+      previewWindows = built.windows
+    } catch {
+      previewWindows = []
+    }
+
+    const savedWindowsOutOfBounds =
+      maxDurFloor !== null
+        ? windows.filter((w) => w.endSec > maxDurFloor || w.startSec >= maxDurFloor)
+        : []
+
+    return {
+      previewWindows,
+      unclampedMaxEndSec,
+      exceededInputCount,
+      savedWindowsOutOfBounds,
+    }
+  }, [minuteInput, effectiveMovieDurationSec, windows])
+
+  const handleBuildPreviewClick = () => {
+    if (!minuteInput.trim()) {
+      setErrorMsg('Pehle window scan poora chalao (Minutes found khali hai)')
+      return
+    }
+    const savedMinuteStr = (snap?.minuteInput || '').trim()
+    const hasExistingState =
+      windows.length > 0 &&
+      (savedMinuteStr !== minuteInput.trim() ||
+        doneCount > 0 ||
+        failedCount > 0 ||
+        needsAttentionCount > 0)
+
+    if (hasExistingState) {
+      setConfirmClearStateOpen(true)
+      return
+    }
+
+    void postParallelControl(
+      {
+        action: 'save_parallel_config',
+        minuteInput: minuteInput.trim(),
+        minuteInputSource,
+        concurrency,
+      },
+      'save_config',
+    )
+  }
+
+  const handleConfirmRebuildWindows = () => {
+    setConfirmClearStateOpen(false)
+    void postParallelControl(
+      {
+        action: 'save_parallel_config',
+        minuteInput: minuteInput.trim(),
+        minuteInputSource,
+        concurrency,
+      },
+      'save_config',
+    )
+  }
+
+  const handleResetToMinutesFound = () => {
+    setMinuteInputSource('auto')
+    setMinuteInput(effectiveFoundMinutes)
+    setConfirmClearStateOpen(false)
+    if (scanId) {
+      void postParallelControl({ action: 'reset_parallel_minutes' }, 'reset_minutes')
+    }
+  }
 
   const filteredCombinedLogs = useMemo(() => {
     return combinedLogs
@@ -358,7 +594,7 @@ export function StudioParallelGrid({
             </span>
           )}
 
-          {parallelSnapshot?.waitingForWorkerSlots && (
+          {snap?.waitingForWorkerSlots && (
             <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded bg-purple-500/20 text-purple-200 border border-purple-500/40 animate-pulse">
               WAITING FOR WORKER
             </span>
@@ -371,20 +607,25 @@ export function StudioParallelGrid({
             </span>
           )}
 
-          {parallelSnapshot && (
+          {snap && (
             <div className="flex items-center gap-1.5 text-[10px] font-mono text-zinc-400">
               <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-950 border border-zinc-800">
                 <Cpu className="w-3 h-3 text-zinc-500" />
-                RAM {parallelSnapshot.ramUsedPercent}%
+                RAM {snap.ramUsedPercent}%
               </span>
               <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-950 border border-zinc-800">
                 <HardDrive className="w-3 h-3 text-zinc-500" />
-                Disk {parallelSnapshot.freeDiskGb} GB
+                Disk {snap.freeDiskGb} GB
               </span>
-              {parallelSnapshot.measuredTokenRate && (
+              {typeof snap.chromeProcessCount === 'number' && (
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-950 border border-zinc-800">
+                  Chrome: {snap.chromeProcessCount}
+                </span>
+              )}
+              {snap.measuredTokenRate && (
                 <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-950/40 border border-emerald-500/30 text-emerald-300">
                   <Sparkles className="w-3 h-3" />
-                  {parallelSnapshot.measuredTokenRate} tok/s
+                  {snap.measuredTokenRate} tok/s
                 </span>
               )}
             </div>
@@ -393,16 +634,22 @@ export function StudioParallelGrid({
 
         {/* Scan-scoped Global Action Buttons */}
         <div className="flex flex-wrap items-center gap-1.5">
-          {!parallelSnapshot?.active ? (
+          {!isRunningOrStarting ? (
             <>
               <button
                 type="button"
-                disabled={busyAction !== null || !scanId}
+                disabled={
+                  busyAction !== null ||
+                  Boolean(compressing360p?.active) ||
+                  !scanId ||
+                  !minuteInput.trim()
+                }
                 onClick={() =>
                   postParallelControl(
                     {
                       action: 'start_parallel_scan',
-                      minuteInput,
+                      minuteInput: minuteInput.trim(),
+                      minuteInputSource,
                       concurrency,
                       resumeExisting: false,
                     },
@@ -412,18 +659,28 @@ export function StudioParallelGrid({
                 className="inline-flex items-center gap-1 text-[11px] font-medium px-2.5 py-1 rounded bg-cyan-500/20 text-cyan-200 border border-cyan-500/40 hover:bg-cyan-500/30 disabled:opacity-50"
               >
                 <Play className="w-3 h-3" />
-                {busyAction === 'start_parallel' ? 'Starting...' : 'Start Parallel Scan'}
+                {busyAction === 'start_parallel'
+                  ? 'Starting...'
+                  : compressing360p?.active
+                    ? compressing360p.statusText || 'Compressing movie 360p...'
+                    : 'Start Parallel Scan'}
               </button>
 
-              {totalWindows > 0 && doneCount < totalWindows && (
+              {hasResumableState && totalWindows > 0 && doneCount < totalWindows && (
                 <button
                   type="button"
-                  disabled={busyAction !== null || !scanId}
+                  disabled={
+                    busyAction !== null ||
+                    Boolean(compressing360p?.active) ||
+                    !scanId ||
+                    !minuteInput.trim()
+                  }
                   onClick={() =>
                     postParallelControl(
                       {
                         action: 'start_parallel_scan',
-                        minuteInput,
+                        minuteInput: minuteInput.trim(),
+                        minuteInputSource,
                         concurrency,
                         resumeExisting: true,
                       },
@@ -431,7 +688,7 @@ export function StudioParallelGrid({
                     )
                   }
                   className="inline-flex items-center gap-1 text-[11px] px-2.5 py-1 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/25 disabled:opacity-50"
-                  title="Resume without re-running already DONE windows"
+                  title="Resume THIS scan from its data/scans/<scanId>/parallel-state.json without re-running DONE windows"
                 >
                   <Play className="w-3 h-3" />
                   Resume ({doneCount}/{totalWindows} done)
@@ -440,7 +697,15 @@ export function StudioParallelGrid({
             </>
           ) : (
             <>
-              {parallelSnapshot.paused ? (
+              <span className="inline-flex items-center gap-1 text-[11px] font-mono px-2.5 py-1 rounded bg-cyan-950/60 text-cyan-300 border border-cyan-500/30">
+                {compressing360p?.active
+                  ? compressing360p.statusText
+                  : snap?.starting
+                    ? 'Verifying 360p media...'
+                    : 'Parallel Scan Running'}
+              </span>
+
+              {snap?.paused ? (
                 <button
                   type="button"
                   disabled={busyAction !== null}
@@ -477,7 +742,7 @@ export function StudioParallelGrid({
           {(failedCount > 0 || needsAttentionCount > 0) && (
             <button
               type="button"
-              disabled={busyAction !== null || !scanId}
+              disabled={busyAction !== null || !scanId || isRunningOrStarting}
               onClick={() =>
                 postParallelControl({ action: 'retry_failed_parallel' }, 'retry_failed')
               }
@@ -490,51 +755,168 @@ export function StudioParallelGrid({
         </div>
       </div>
 
-      {/* Per-Scan Config Bar: Movie Minutes Input + Concurrency */}
-      <div className="px-4 py-2.5 border-b border-zinc-800/80 bg-zinc-900/40 flex flex-wrap items-center gap-3">
-        <div className="flex-1 min-w-[260px] flex items-center gap-2">
-          <label className="text-[11px] font-medium text-zinc-400 shrink-0">
-            Scan Movie Minutes:
-          </label>
-          <input
-            type="text"
-            value={minuteInput}
-            onChange={(e) => setMinuteInput(e.target.value)}
-            placeholder={DEFAULT_MINUTES_STR}
-            className="flex-1 rounded bg-zinc-950 border border-zinc-800 px-2.5 py-1 text-xs font-mono text-zinc-200 focus:outline-none focus:border-cyan-500/50"
-          />
+      {/* Per-Scan Config Bar: Movie Minutes Input + Source Badge + Reset + Concurrency */}
+      <div className="px-4 py-2.5 border-b border-zinc-800/80 bg-zinc-900/40 flex flex-col gap-2">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex-1 min-w-[260px] flex flex-wrap items-center gap-2">
+            <label className="text-[11px] font-medium text-zinc-400 shrink-0">
+              Scan Movie Minutes:
+            </label>
+            <span
+              className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+                minuteInputSource === 'manual'
+                  ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                  : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+              }`}
+              title={
+                minuteInputSource === 'manual'
+                  ? 'Manually edited by user — preserved across refreshes'
+                  : 'Auto-synced from this scan’s Minutes found (±1 min buffer)'
+              }
+            >
+              {minuteInputSource === 'manual' ? 'manual' : 'auto (Minutes found)'}
+            </span>
+            <input
+              type="text"
+              value={minuteInput}
+              onChange={(e) => {
+                setMinuteInput(e.target.value)
+                setMinuteInputSource('manual')
+              }}
+              placeholder={
+                effectiveFoundMinutes
+                  ? effectiveFoundMinutes
+                  : 'Pehle window scan poora chalao'
+              }
+              className="flex-1 min-w-[180px] rounded bg-zinc-950 border border-zinc-800 px-2.5 py-1 text-xs font-mono text-zinc-200 focus:outline-none focus:border-cyan-500/50"
+            />
+            <button
+              type="button"
+              disabled={busyAction !== null || !scanId}
+              onClick={handleResetToMinutesFound}
+              className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded bg-zinc-800/90 hover:bg-zinc-700 text-cyan-300 border border-zinc-700 disabled:opacity-50"
+              title="Reset box to this scan's Minutes found (±1 min buffer) and switch source back to auto"
+            >
+              <RotateCcw className="w-3 h-3" />
+              Reset to Minutes found
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] font-medium text-zinc-400">Concurrency:</label>
+            <input
+              type="number"
+              min={1}
+              max={20}
+              value={concurrency}
+              onChange={(e) => setConcurrency(Math.max(1, Math.min(20, Number(e.target.value) || 4)))}
+              className="w-16 rounded bg-zinc-950 border border-zinc-800 px-2 py-1 text-xs font-mono text-zinc-200 text-center focus:outline-none focus:border-cyan-500/50"
+            />
+            <button
+              type="button"
+              disabled={busyAction !== null || !scanId || !minuteInput.trim() || isRunningOrStarting}
+              onClick={handleBuildPreviewClick}
+              className="text-[11px] px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 disabled:opacity-50"
+            >
+              {busyAction === 'save_config' ? 'Building...' : 'Build / Preview Windows'}
+            </button>
+          </div>
         </div>
 
-        <div className="flex items-center gap-2">
-          <label className="text-[11px] font-medium text-zinc-400">Concurrency:</label>
-          <input
-            type="number"
-            min={1}
-            max={20}
-            value={concurrency}
-            onChange={(e) => setConcurrency(Math.max(1, Math.min(20, Number(e.target.value) || 10)))}
-            className="w-16 rounded bg-zinc-950 border border-zinc-800 px-2 py-1 text-xs font-mono text-zinc-200 text-center focus:outline-none focus:border-cyan-500/50"
-          />
-          <button
-            type="button"
-            disabled={busyAction !== null || !scanId}
-            onClick={() =>
-              postParallelControl(
-                { action: 'save_parallel_config', minuteInput, concurrency },
-                'save_config',
-              )
-            }
-            className="text-[11px] px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 disabled:opacity-50"
-          >
-            {busyAction === 'save_config' ? 'Saving...' : 'Build / Preview Windows'}
-          </button>
-        </div>
+        {/* 360p Compression Progress Bar Banner (blocks workers until ready) */}
+        {compressing360p?.active && (
+          <div className="rounded-lg border border-cyan-500/40 bg-cyan-950/30 px-3 py-2 flex flex-col gap-1.5">
+            <div className="flex items-center justify-between text-xs text-cyan-200 font-mono">
+              <span className="font-semibold">
+                {compressing360p.statusText ||
+                  `Compressing movie 360p... ${compressing360p.progress || 0}%`}
+              </span>
+              <span className="text-[11px] text-cyan-300/80">
+                Workers queued — waiting for data/media/{scanId}/movie_360p.mp4 (&le; 390 MB, 24fps CFR)
+              </span>
+            </div>
+            <div className="w-full h-2 rounded-full bg-zinc-900 overflow-hidden border border-cyan-500/30">
+              <div
+                className="h-full bg-cyan-400 transition-all duration-300"
+                style={{ width: `${Math.max(2, Math.min(100, compressing360p.progress || 0))}%` }}
+              />
+            </div>
+          </div>
+        )}
+
+        {compressing360p && !compressing360p.active && compressing360p.error && (
+          <div className="rounded border border-red-500/40 bg-red-950/30 px-3 py-1.5 text-xs text-red-300 font-mono">
+            360p Compression Error: {compressing360p.error}
+          </div>
+        )}
+
+        {/* Verified Per-Scan Media Badge */}
+        {mediaInfo && (
+          <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono text-emerald-300/90 bg-emerald-950/20 border border-emerald-500/25 rounded px-2.5 py-1">
+            <span className="font-semibold text-emerald-300">Verified Media ({mediaInfo.scanId}):</span>
+            <span>
+              short: {mediaInfo.shortPath} (
+              {mediaInfo.shortSizeBytes ? (mediaInfo.shortSizeBytes / (1024 * 1024)).toFixed(1) : '0'}{' '}
+              MB, {(mediaInfo.shortDurationSec || 0).toFixed(1)}s)
+            </span>
+            <span>·</span>
+            <span>
+              movie_360p: {mediaInfo.movie360Path} (
+              {mediaInfo.movie360SizeBytes
+                ? (mediaInfo.movie360SizeBytes / (1024 * 1024)).toFixed(1)
+                : '0'}{' '}
+              MB, {(mediaInfo.movie360DurationSec || 0).toFixed(1)}s)
+            </span>
+          </div>
+        )}
+
+        {/* Empty Minutes Found message */}
+        {!effectiveFoundMinutes && !minuteInput.trim() && (
+          <div className="flex items-center gap-2 rounded bg-amber-500/10 border border-amber-500/30 px-2.5 py-1.5 text-xs text-amber-300">
+            <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-amber-400" />
+            <span className="font-medium">Pehle window scan poora chalao</span>
+            <span className="text-[11px] text-amber-300/80">
+              (Is scan me abhi Minutes found nahi hain — window scan poora hone par ±1 min buffer ke saath compact ranges yahan apne aap aa jayengi)
+            </span>
+          </div>
+        )}
+
+        {/* Confirmation prompt before wiping old parallel state when minute list changed */}
+        {confirmClearStateOpen && (
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded bg-amber-500/15 border border-amber-500/40 px-3 py-2 text-xs text-amber-200">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400" />
+              <span>
+                Minute list badal gayi hai — purani{' '}
+                <strong>{windows.length} windows</strong> (Done: {doneCount}, Failed:{' '}
+                {failedCount}) ka parallel state saaf karke nayi{' '}
+                <strong>{previewValidation.previewWindows.length} windows</strong> banayein?
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleConfirmRebuildWindows}
+                className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-zinc-950 font-semibold text-[11px]"
+              >
+                Confirm &amp; Clear Old State
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmClearStateOpen(false)}
+                className="px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 text-[11px]"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
-      {parallelSnapshot?.resourceWarning && (
+      {snap?.resourceWarning && (
         <div className="px-4 py-1.5 bg-amber-500/10 border-b border-amber-500/30 text-[11px] text-amber-300 flex items-center gap-2">
           <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-          <span>{parallelSnapshot.resourceWarning}</span>
+          <span>{snap.resourceWarning}</span>
         </div>
       )}
 
@@ -730,12 +1112,78 @@ export function StudioParallelGrid({
         </div>
       </div>
 
+      {/* Preview Windows List & Movie Length Check (shown whenever minuteInput produces preview windows) */}
+      {previewValidation.previewWindows.length > 0 && (
+        <div className="px-4 pb-3">
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-cyan-300">
+                  Window Preview ({previewValidation.previewWindows.length} Windows · Max 5:00 · 5s seam overlap)
+                </span>
+                {effectiveMovieDurationSec && effectiveMovieDurationSec > 0 ? (
+                  previewValidation.savedWindowsOutOfBounds.length > 0 ? (
+                    <span className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded bg-red-500/15 border border-red-500/40 text-red-300">
+                      <AlertTriangle className="w-3 h-3" />
+                      {previewValidation.savedWindowsOutOfBounds.length} stale window(s) exceed Movie Length{' '}
+                      {formatParallelTimecode(Math.floor(effectiveMovieDurationSec))} — click Build / Preview Windows
+                    </span>
+                  ) : previewValidation.exceededInputCount > 0 ? (
+                    <span className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/40 text-amber-300">
+                      <CheckCircle2 className="w-3 h-3" />
+                      Clamped to Movie Length {formatParallelTimecode(Math.floor(effectiveMovieDurationSec))} (no window &gt;{' '}
+                      {formatParallelTimecode(Math.floor(effectiveMovieDurationSec))})
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-300">
+                      <CheckCircle2 className="w-3 h-3" />
+                      All {previewValidation.previewWindows.length} windows within Movie Length (
+                      {formatParallelTimecode(Math.floor(effectiveMovieDurationSec))})
+                    </span>
+                  )
+                ) : null}
+              </div>
+              <span className="text-[10px] font-mono text-zinc-400">
+                Minutes: <strong className="text-zinc-200">{minuteInput.trim()}</strong>
+              </span>
+            </div>
+
+            <div className="flex flex-wrap gap-1.5 max-h-40 overflow-y-auto pr-1">
+              {previewValidation.previewWindows.map((pw) => {
+                const maxDurFloor =
+                  effectiveMovieDurationSec && effectiveMovieDurationSec > 0
+                    ? Math.floor(effectiveMovieDurationSec)
+                    : null
+                const isWithinBounds = maxDurFloor === null || pw.endSec <= maxDurFloor
+                return (
+                  <span
+                    key={pw.id}
+                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[10px] font-mono ${
+                      isWithinBounds
+                        ? 'border-zinc-800 bg-zinc-950 text-zinc-200'
+                        : 'border-red-500/50 bg-red-950/40 text-red-300'
+                    }`}
+                    title={`Run ${pw.runLabel} · Part ${pw.partIndex}/${pw.partsInRun} · Priority #${pw.priorityRank}`}
+                  >
+                    <strong className="text-cyan-400">#{pw.windowNumber}</strong>
+                    <span>
+                      {pw.startFormatted}–{pw.endFormatted}
+                    </span>
+                    <span className="text-zinc-500">({formatMmSs(pw.durationSec)})</span>
+                  </span>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Planned Windows Status Table / Cards */}
       {windows.length > 0 && (
         <div className="px-4 pb-4">
           <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400 mb-2 flex items-center justify-between">
             <span>
-              Planned Movie Windows ({windows.length} Windows · Max 5:00 each · 5s seam overlap)
+              Active / Saved Scan Windows ({windows.length} Windows · Max 5:00 each · 5s seam overlap)
             </span>
             <span className="text-[10px] font-mono text-zinc-500">
               Queue Priority: Largest contiguous runs pulled first

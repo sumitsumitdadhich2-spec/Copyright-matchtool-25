@@ -802,6 +802,130 @@ export const STUDIO_DIRECT_UPLOAD = true
 
 const activeStudioMovieJobs = new Map<string, Promise<void>>()
 
+export const STUDIO_MOVIE_360P_MAX_BYTES = 390 * 1024 * 1024
+export const STUDIO_SHORT_MAX_BYTES = 400 * 1024 * 1024
+
+export function isStudioMovie360pJobActive(scanId: string): boolean {
+  return activeStudioMovieJobs.has(scanId)
+}
+
+/**
+ * Strictly verify that `data/media/<scanId>/movie_360p.mp4` exists, has size > 0 and <= 390 MB,
+ * is readable by ffprobe, and has duration within ±2s of original movie duration.
+ */
+export async function verifyStudioMovie360pFile(
+  scanId: string,
+  expectedOriginalDurationSec?: number | null,
+): Promise<{
+  valid: boolean
+  filePath: string
+  sizeBytes: number
+  durationSec: number
+  expectedDurationSec: number
+  reason?: string
+}> {
+  const mediaDir = scanMediaDir(scanId)
+  const out360pPath = path.join(mediaDir, 'movie_360p.mp4')
+  const rawMoviePath = localMediaPath(scanId, 'movie')
+  const scan = getScan(scanId)
+
+  let origDur =
+    expectedOriginalDurationSec && expectedOriginalDurationSec > 0
+      ? expectedOriginalDurationSec
+      : scan?.movieDuration || 0
+  if ((!origDur || origDur <= 0) && fs.existsSync(rawMoviePath)) {
+    try {
+      origDur = await probeDuration(rawMoviePath)
+    } catch {
+      origDur = 0
+    }
+  }
+
+  if (!fs.existsSync(out360pPath)) {
+    return {
+      valid: false,
+      filePath: out360pPath,
+      sizeBytes: 0,
+      durationSec: 0,
+      expectedDurationSec: origDur,
+      reason: 'movie_360p.mp4 does not exist yet',
+    }
+  }
+
+  let sizeBytes = 0
+  try {
+    sizeBytes = fs.statSync(out360pPath).size
+  } catch {
+    sizeBytes = 0
+  }
+
+  if (sizeBytes <= 0) {
+    return {
+      valid: false,
+      filePath: out360pPath,
+      sizeBytes,
+      durationSec: 0,
+      expectedDurationSec: origDur,
+      reason: 'movie_360p.mp4 is 0 bytes',
+    }
+  }
+
+  if (sizeBytes > STUDIO_MOVIE_360P_MAX_BYTES) {
+    return {
+      valid: false,
+      filePath: out360pPath,
+      sizeBytes,
+      durationSec: 0,
+      expectedDurationSec: origDur,
+      reason: `movie_360p.mp4 size (${(sizeBytes / (1024 * 1024)).toFixed(1)} MB) exceeds 390 MB limit`,
+    }
+  }
+
+  let probedDur = 0
+  try {
+    probedDur = await probeDuration(out360pPath)
+  } catch (err) {
+    return {
+      valid: false,
+      filePath: out360pPath,
+      sizeBytes,
+      durationSec: 0,
+      expectedDurationSec: origDur,
+      reason: `ffprobe failed on movie_360p.mp4: ${err instanceof Error ? err.message : String(err)}`,
+    }
+  }
+
+  if (!Number.isFinite(probedDur) || probedDur <= 0) {
+    return {
+      valid: false,
+      filePath: out360pPath,
+      sizeBytes,
+      durationSec: 0,
+      expectedDurationSec: origDur,
+      reason: 'movie_360p.mp4 duration is invalid (0s)',
+    }
+  }
+
+  if (origDur > 0 && Math.abs(probedDur - origDur) > 2.0) {
+    return {
+      valid: false,
+      filePath: out360pPath,
+      sizeBytes,
+      durationSec: probedDur,
+      expectedDurationSec: origDur,
+      reason: `movie_360p.mp4 duration (${probedDur.toFixed(1)}s) differs from original movie (${origDur.toFixed(1)}s) by > 2s`,
+    }
+  }
+
+  return {
+    valid: true,
+    filePath: out360pPath,
+    sizeBytes,
+    durationSec: probedDur,
+    expectedDurationSec: origDur || probedDur,
+  }
+}
+
 /**
  * Compress movie once into movie_360p.mp4 (360p or 288p if <300kbps, 24fps CFR, H.264, mono ~48k AAC, <=390 MB).
  * When STUDIO_DIRECT_UPLOAD is true, marks movie360p ready immediately after local compression.
@@ -823,6 +947,9 @@ export function prepareStudioMovie360pAndDrive(
     const owner = ownerOverride || initialScan?.ownerUsername || 'admin'
 
     try {
+      if (!fs.existsSync(inputPath) || fs.statSync(inputPath).size <= 0) {
+        throw new Error(`Original movie file missing at ${inputPath}`)
+      }
       const dur = durationOverride || initialScan?.movieDuration || (await probeDuration(inputPath))
       let resInfo: {
         outputFile: string
@@ -832,9 +959,10 @@ export function prepareStudioMovie360pAndDrive(
         warning?: string
       }
 
-      // Check if movie_360p.mp4 already exists on disk
-      if (fs.existsSync(out360pPath) && fs.statSync(out360pPath).size > 10_000) {
-        const sizeBytes = fs.statSync(out360pPath).size
+      // Check if movie_360p.mp4 already exists on disk AND passes strict verification (size > 0, <= 390MB, ffprobe within ±2s)
+      const existingCheck = await verifyStudioMovie360pFile(scanId, dur)
+      if (existingCheck.valid) {
+        const sizeBytes = existingCheck.sizeBytes
         const prevWarning = initialScan?.movie360p?.warning
         const cleanWarning =
           prevWarning && /google drive not connected/i.test(prevWarning) ? undefined : prevWarning
@@ -846,12 +974,20 @@ export function prepareStudioMovie360pAndDrive(
           warning: cleanWarning,
         }
       } else {
+        if (fs.existsSync(out360pPath)) {
+          try {
+            fs.unlinkSync(out360pPath)
+          } catch {
+            /* ignore */
+          }
+        }
         const s0 = getScan(scanId)
         if (s0) {
           s0.movie360p = {
             ...(s0.movie360p || {}),
             status: 'compressing',
             progress: 0,
+            error: undefined,
             updatedAt: Date.now(),
           }
           s0.status = 'chunking'
@@ -1025,24 +1161,29 @@ export function prepareStudioMovie360pAndDrive(
 
 /**
  * Ensure the short video is ready for Gemini Studio attachment when no YouTube URL was provided:
- * compresses to <= 390 MB if needed and returns the local path for direct upload to AI Studio.
+ * strictly located inside `data/media/<scanId>/`, compresses to <= 390 MB (< 400 MB limit) if needed,
+ * verifies via ffprobe, and returns `{ localPath, sizeBytes, durationSec }`.
  */
 export async function ensureStudioShortReady(
   scanId: string,
   _owner?: string,
-): Promise<{ localPath: string }> {
+): Promise<{ localPath: string; sizeBytes: number; durationSec: number }> {
   const scan = getScan(scanId)
   const mediaDir = scanMediaDir(scanId)
   const rawShortPath = localMediaPath(scanId, 'short')
-  if (!fs.existsSync(rawShortPath)) {
-    throw new Error('Short video file missing on server')
+  if (!fs.existsSync(rawShortPath) || fs.statSync(rawShortPath).size <= 0) {
+    throw new Error(`Short video file missing on server at ${rawShortPath}`)
   }
 
   let targetShortPath = rawShortPath
   const stat = fs.statSync(rawShortPath)
   if (stat.size > 385 * 1024 * 1024) {
     const short360p = path.join(mediaDir, 'short_360p.mp4')
-    if (!fs.existsSync(short360p) || fs.statSync(short360p).size < 1000) {
+    if (
+      !fs.existsSync(short360p) ||
+      fs.statSync(short360p).size < 1000 ||
+      fs.statSync(short360p).size >= STUDIO_SHORT_MAX_BYTES
+    ) {
       if (scan) {
         addLog(scan, 'info', 'Short file > 385 MB — compressing short_360p.mp4 (24fps CFR) for AI Studio...')
         saveScan(scan)
@@ -1057,7 +1198,18 @@ export async function ensureStudioShortReady(
     targetShortPath = short360p
   }
 
-  return { localPath: targetShortPath }
+  const finalStat = fs.statSync(targetShortPath)
+  if (finalStat.size <= 0 || finalStat.size >= STUDIO_SHORT_MAX_BYTES) {
+    throw new Error(
+      `Short video size (${(finalStat.size / (1024 * 1024)).toFixed(1)} MB) exceeds 400 MB Studio limit`,
+    )
+  }
+  const durationSec = await probeDuration(targetShortPath)
+  if (!Number.isFinite(durationSec) || durationSec <= 0) {
+    throw new Error(`Short video ffprobe duration invalid at ${targetShortPath}`)
+  }
+
+  return { localPath: targetShortPath, sizeBytes: finalStat.size, durationSec }
 }
 
 function fmtDur(sec: number): string {

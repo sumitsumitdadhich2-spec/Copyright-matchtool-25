@@ -29,8 +29,10 @@ export interface StudioUserConfig {
   encryptedDriveTokens?: string
   driveConnectedEmail?: string | null
   driveConnectedAt?: number | null
-  /** Parallel Window Scan worker concurrency (default 10) */
+  /** Parallel Window Scan worker concurrency (default 4) */
   studioConcurrency?: number
+  /** Max concurrent workers allowed in media upload/attach gate (default 2) */
+  studioUploadGateConcurrency?: number
   /** Movie minute input list/ranges for Parallel Window Scan */
   studioMinuteInput?: string
   /** Measured token rate (tokens/sec at 24 FPS) from Test Clip */
@@ -50,6 +52,7 @@ export interface PublicStudioSettings {
   studioWindowOverlapSec: number
   studioOffsetMode: 'auto' | 'relative' | 'absolute'
   studioConcurrency: number
+  studioUploadGateConcurrency: number
   studioMinuteInput: string
   studioMeasuredTokenRate: number | null
   hasCookies: boolean
@@ -104,7 +107,8 @@ export function computeEffectiveMaxInputTokens(
   return STUDIO_CONTEXT_WINDOW_TOKENS - out - STUDIO_SAFETY_MARGIN_TOKENS
 }
 
-export const DEFAULT_STUDIO_CONCURRENCY = 10
+export const DEFAULT_STUDIO_CONCURRENCY = 4
+export const DEFAULT_STUDIO_UPLOAD_GATE = 2
 export const DEFAULT_STUDIO_MINUTE_INPUT =
   '7,8,9,10,14,15,16,17,19,20,21,25-41,48-54,56,57,58,63-67,71-100'
 
@@ -119,6 +123,7 @@ const DEFAULT_STUDIO_CONFIG: StudioUserConfig = {
   studioWindowOverlapSec: 0,
   studioOffsetMode: 'auto',
   studioConcurrency: DEFAULT_STUDIO_CONCURRENCY,
+  studioUploadGateConcurrency: DEFAULT_STUDIO_UPLOAD_GATE,
   studioMinuteInput: DEFAULT_STUDIO_MINUTE_INPUT,
   studioMeasuredTokenRate: null,
   lastLoginStatus: 'untested',
@@ -198,6 +203,10 @@ export async function loadStudioUserConfig(username: string): Promise<StudioUser
     studioConcurrency: Math.max(
       1,
       Math.min(20, Math.round(Number(raw?.studioConcurrency) || DEFAULT_STUDIO_CONCURRENCY)),
+    ),
+    studioUploadGateConcurrency: Math.max(
+      1,
+      Math.min(10, Math.round(Number(raw?.studioUploadGateConcurrency) || DEFAULT_STUDIO_UPLOAD_GATE)),
     ),
     studioMinuteInput:
       typeof raw?.studioMinuteInput === 'string' && raw.studioMinuteInput.trim()
@@ -390,6 +399,7 @@ export async function getPublicStudioSettings(username: string): Promise<PublicS
     studioWindowOverlapSec: cfg.studioWindowOverlapSec,
     studioOffsetMode: cfg.studioOffsetMode,
     studioConcurrency: cfg.studioConcurrency ?? DEFAULT_STUDIO_CONCURRENCY,
+    studioUploadGateConcurrency: cfg.studioUploadGateConcurrency ?? DEFAULT_STUDIO_UPLOAD_GATE,
     studioMinuteInput: cfg.studioMinuteInput || DEFAULT_STUDIO_MINUTE_INPUT,
     studioMeasuredTokenRate: cfg.studioMeasuredTokenRate ?? null,
     hasCookies: cookieCount > 0,
