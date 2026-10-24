@@ -21,6 +21,7 @@ import { buildStudioChunkPrompt } from './studio-prompt'
 import { parseChunkMatches } from './gemini'
 import { validateStudioAnswer, type StudioValidationResult } from './studio-result-validator'
 import { extractHissa1And2EntriesFromResponse, formatParallelTimecode } from './studio-window-planner'
+import { maxMovieEndSecInHissa2, shiftMovieTimestampsInHissa2 } from './studio-clip-offset'
 import { fmtTime } from './format'
 import type { ChunkMatch } from './types'
 
@@ -3582,6 +3583,13 @@ export class StudioBrowserController {
     movieLocalPath?: string | null
     movieStartSec: number
     movieEndSec: number
+    windowClip?: {
+      clipPath: string
+      clipStartFrame: number
+      clipStartSec: number
+      frameCount: number
+      durationSec: number
+    } | null
     sanitized?: boolean
     parallelMode?: boolean
     maxAttempts?: number
@@ -3613,6 +3621,7 @@ export class StudioBrowserController {
       movieLocalPath,
       movieStartSec,
       movieEndSec,
+      windowClip = null,
       sanitized = false,
       parallelMode = false,
       measuredTokenRate = null,
@@ -3897,10 +3906,11 @@ export class StudioBrowserController {
 
           await waitUntilRamSafeForAttach('attach_movie')
           currentStage = 'setup/attach_movie'
+          const attachMovieFilePath = windowClip?.clipPath || movieLocalPath
           const movieSizeMbForAttach = (() => {
             try {
-              if (movieLocalPath && fs.existsSync(movieLocalPath)) {
-                return Number((fs.statSync(movieLocalPath).size / (1024 * 1024)).toFixed(1))
+              if (attachMovieFilePath && fs.existsSync(attachMovieFilePath)) {
+                return Number((fs.statSync(attachMovieFilePath).size / (1024 * 1024)).toFixed(1))
               }
             } catch {
               /* ignore */
@@ -3935,15 +3945,27 @@ export class StudioBrowserController {
             }
           }, 3000)
           try {
-            await this.attachVideoAndConfigureRange(page, {
-              label: 'movie',
-              driveFileName: movieDriveFileName,
-              localFilePath: movieLocalPath,
-              startSec: movieStartSec,
-              endSec: movieEndSec,
-              fps: 24,
-              scope,
-            })
+            if (windowClip) {
+              await this.attachVideoAndConfigureRange(page, {
+                label: 'movie',
+                driveFileName: null,
+                localFilePath: windowClip.clipPath,
+                startSec: 0,
+                endSec: windowClip.durationSec,
+                fps: 24,
+                scope,
+              })
+            } else {
+              await this.attachVideoAndConfigureRange(page, {
+                label: 'movie',
+                driveFileName: movieDriveFileName,
+                localFilePath: movieLocalPath,
+                startSec: movieStartSec,
+                endSec: movieEndSec,
+                fps: 24,
+                scope,
+              })
+            }
           } finally {
             clearInterval(attachMemTimer)
             const totalElapsedSec = Math.round((Date.now() - attachStartMs) / 1000)
@@ -4303,25 +4325,44 @@ export class StudioBrowserController {
         if (!transientBannerReason) {
           const fetched = await this.fetchStudioResultFromTurnOrFallback(page)
           fetchedSource = fetched.source
-          const answerText = fetched.text || lastCandidateText
+          let answerText = fetched.text || lastCandidateText
+          let clipDurationExceeded = false
 
-          // Wrap validation in try/catch so internal validator exceptions never cause a failure/retry
-          try {
-            validation = validateStudioAnswer(answerText, {
-              shortWindowSec: shortEndSec - shortStartSec,
-            })
-          } catch (valErr) {
-            const valErrMsg = valErr instanceof Error ? valErr.message : String(valErr)
-            this.logStep(
-              'validate error',
-              `ERROR [validate] validateStudioAnswer threw: ${valErrMsg} -> keeping answer as DONE (validation skipped)`,
-              'warn',
-            )
-            onLog?.(
-              'warn',
-              `ERROR [validate] Studio validator exception: ${valErrMsg}. Marking DONE (validation skipped) and accepting answer.`,
-            )
-            rawAnswer = answerText
+          if (windowClip && answerText) {
+            const maxMovieEnd = maxMovieEndSecInHissa2(answerText)
+            if (maxMovieEnd > windowClip.durationSec + 10) {
+              clipDurationExceeded = true
+              rawAnswer = ''
+              validationReason = 'movie_ts_exceed_clip_duration'
+              this.logStep(
+                'validate clip range',
+                `movie_ts_exceed_clip_duration (maxMovieEnd=${maxMovieEnd.toFixed(3)}s > clipDuration=${windowClip.durationSec.toFixed(3)}s + 10s)`,
+                'warn',
+              )
+            } else {
+              answerText = shiftMovieTimestampsInHissa2(answerText, windowClip.clipStartFrame)
+            }
+          }
+
+          if (!clipDurationExceeded) {
+            // Wrap validation in try/catch so internal validator exceptions never cause a failure/retry
+            try {
+              validation = validateStudioAnswer(answerText, {
+                shortWindowSec: shortEndSec - shortStartSec,
+              })
+            } catch (valErr) {
+              const valErrMsg = valErr instanceof Error ? valErr.message : String(valErr)
+              this.logStep(
+                'validate error',
+                `ERROR [validate] validateStudioAnswer threw: ${valErrMsg} -> keeping answer as DONE (validation skipped)`,
+                'warn',
+              )
+              onLog?.(
+                'warn',
+                `ERROR [validate] Studio validator exception: ${valErrMsg}. Marking DONE (validation skipped) and accepting answer.`,
+              )
+              rawAnswer = answerText
+            }
           }
 
           if (validation) {

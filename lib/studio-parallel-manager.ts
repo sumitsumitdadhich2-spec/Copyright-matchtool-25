@@ -19,6 +19,13 @@ import {
   prepareStudioMovie360pAndDrive,
   verifyStudioMovie360pFile,
 } from './media'
+import { probeDuration } from './ffmpeg'
+import { CancelToken, FfmpegCancelled } from './ffmpeg-pool'
+import {
+  cleanStaleWindowClipPartials,
+  ensureWindowClip,
+  type WindowClipResult,
+} from './studio-window-clips'
 import {
   buildParallelWindowsFromMinuteInput,
   mergeParallelWindowResults,
@@ -864,6 +871,10 @@ export class StudioParallelManager {
   private resourceTimer: ReturnType<typeof setInterval> | null = null
   private onMatchCallback?: (windowState: ParallelWindowState, matches: ChunkMatch[]) => Promise<void>
   private onLogCallback?: (level: 'info' | 'warn' | 'error' | 'success', msg: string) => void
+  private usingOriginalMovieClips = false
+  private clipCancelToken: CancelToken | null = null
+  private windowClipPromises = new Map<string, Promise<WindowClipResult>>()
+  private startWindowClipTask?: (w: ParallelWindowState) => Promise<WindowClipResult>
 
   constructor(scanId: string) {
     killAllLeftoverChromeProcessesOnceOnStartup()
@@ -1872,10 +1883,77 @@ export class StudioParallelManager {
         resolveScanMovieDurationSec(scanRecord) ||
         (this.movieDurationSec > 0 ? this.movieDurationSec : null)
 
-      const initialMovieCheck = await verifyStudioMovie360pFile(
-        this.scanId,
-        expectedMovieDuration,
-      )
+      const rawMoviePath = path.join(this.getScanMediaDir(), 'movie.mp4')
+      const hasOriginalMovie =
+        fs.existsSync(rawMoviePath) &&
+        (() => {
+          try {
+            return fs.statSync(rawMoviePath).size > 0
+          } catch {
+            return false
+          }
+        })()
+
+      const startWindowClipExtractionForWindow = (w: ParallelWindowState): Promise<WindowClipResult> => {
+        const existing = this.windowClipPromises.get(w.id)
+        if (existing) return existing
+
+        if (w.status === 'QUEUED') {
+          w.stage = 'Extracting clip...'
+          w.summaryText = 'Extracting window clip...'
+        }
+        const token = this.clipCancelToken ?? undefined
+        const t0 = Date.now()
+        const p = ensureWindowClip(
+          this.scanId,
+          {
+            windowNumber: w.windowNumber,
+            startSec: w.startSec,
+            endSec: w.endSec,
+          },
+          { token },
+        ).then((clipRes) => {
+          const sizeBytes = (() => {
+            try {
+              return fs.statSync(clipRes.clipPath).size
+            } catch {
+              return 0
+            }
+          })()
+          const sizeMb = (sizeBytes / (1024 * 1024)).toFixed(1)
+          const extractSec = ((Date.now() - t0) / 1000).toFixed(1)
+          const endFrame = clipRes.clipStartFrame + clipRes.frameCount
+          if (w.status === 'QUEUED' && w.stage === 'Extracting clip...') {
+            if (clipRes.cached) {
+              w.stage = 'Clip ready (cached)'
+              w.summaryText = `Clip ready (cached, ${sizeMb} MB)`
+            } else {
+              w.stage = `Clip ready (extracted, ${sizeMb} MB, ${extractSec} s)`
+              w.summaryText = `Clip ready (extracted, ${sizeMb} MB, ${extractSec} s)`
+            }
+          }
+          const winRange = `${w.startFormatted}–${w.endFormatted}`
+          this.appendCombinedLog({
+            workerId: 'SYS',
+            windowId: w.id,
+            windowNumber: w.windowNumber,
+            windowRange: winRange,
+            level: 'INFO',
+            step: clipRes.cached ? 'Clip ready (cached)' : 'Clip ready (extracted)',
+            message: clipRes.cached
+              ? `Window #${w.windowNumber} (${winRange}): Clip ready (cached, ${sizeMb} MB, frames ${clipRes.clipStartFrame}-${endFrame}) -> ${path.basename(clipRes.clipPath)}`
+              : `Window #${w.windowNumber} (${winRange}): Clip ready (extracted, ${sizeMb} MB, ${extractSec} s, frames ${clipRes.clipStartFrame}-${endFrame}) -> ${path.basename(clipRes.clipPath)}`,
+          })
+          this.persistStateToDisk()
+          return clipRes
+        })
+
+        // Prevent unhandled rejection when background extraction fails before a worker awaits it
+        p.catch(() => {})
+        this.windowClipPromises.set(w.id, p)
+        return p
+      }
+      this.startWindowClipTask = startWindowClipExtractionForWindow
 
       const finalizeMediaAndLaunchWorkers = (verifiedMedia: ParallelMediaVerificationInfo) => {
         this.mediaInfo = verifiedMedia
@@ -1887,17 +1965,25 @@ export class StudioParallelManager {
         }
         this.movieLocalPath = verifiedMedia.movie360Path
         const latestScanForDrive = getScan(this.scanId)
-        this.movieDriveFileName = cfg.studioAttachMovieFromDrive
-          ? (latestScanForDrive?.movie360p?.driveFileName ?? null)
-          : null
+        this.movieDriveFileName =
+          !this.usingOriginalMovieClips && cfg.studioAttachMovieFromDrive
+            ? (latestScanForDrive?.movie360p?.driveFileName ?? null)
+            : null
         if (verifiedMedia.movie360DurationSec && verifiedMedia.movie360DurationSec > 0) {
           this.movieDurationSec = verifiedMedia.movie360DurationSec
         }
 
-        for (const w of this.windows) {
-          if (w.status === 'QUEUED') {
-            w.stage = 'queued'
-            w.summaryText = 'Queued'
+        if (this.usingOriginalMovieClips) {
+          this.clipCancelToken?.cancel()
+          this.clipCancelToken = new CancelToken()
+          this.windowClipPromises.clear()
+          cleanStaleWindowClipPartials(this.scanId)
+        } else {
+          for (const w of this.windows) {
+            if (w.status === 'QUEUED') {
+              w.stage = 'queued'
+              w.summaryText = 'Queued'
+            }
           }
         }
 
@@ -1917,20 +2003,32 @@ export class StudioParallelManager {
         this.stoppedWindowIds.clear()
         this.recordResourceSnapshotIfNeeded(true, `Parallel scan started (${newRunId})`)
         this.startResourceSnapshotTimer()
+
+        if (this.usingOriginalMovieClips) {
+          const orderedWindows = [...this.windows]
+            .filter((w) => w.status !== 'DONE' && w.status !== 'SKIPPED')
+            .sort((a, b) => a.windowNumber - b.windowNumber)
+          for (const w of orderedWindows) {
+            startWindowClipExtractionForWindow(w)
+          }
+        }
+
         this.persistStateToDisk()
 
         this.appendCombinedLog({
           workerId: 'SYS',
           level: 'INFO',
           step: 'media verified',
-          message: `runId=${newRunId} | scanId=${this.scanId} | short=${verifiedMedia.shortPath} (${shortSizeMb} MB, ${(verifiedMedia.shortDurationSec || 0).toFixed(1)}s) | movie_360p=${verifiedMedia.movie360Path} (${movieSizeMb} MB, ${(verifiedMedia.movie360DurationSec || 0).toFixed(1)}s)`,
+          message: this.usingOriginalMovieClips
+            ? `runId=${newRunId} | scanId=${this.scanId} | short=${verifiedMedia.shortPath} (${shortSizeMb} MB, ${(verifiedMedia.shortDurationSec || 0).toFixed(1)}s) | original_movie=${verifiedMedia.movie360Path} (${movieSizeMb} MB, ${(verifiedMedia.movie360DurationSec || 0).toFixed(1)}s, per-window clip mode)`
+            : `runId=${newRunId} | scanId=${this.scanId} | short=${verifiedMedia.shortPath} (${shortSizeMb} MB, ${(verifiedMedia.shortDurationSec || 0).toFixed(1)}s) | movie_360p=${verifiedMedia.movie360Path} (${movieSizeMb} MB, ${(verifiedMedia.movie360DurationSec || 0).toFixed(1)}s)`,
         })
 
         this.appendCombinedLog({
           workerId: 'SYS',
           level: 'INFO',
           step: 'parallel scan start',
-          message: `Started Parallel Window Scan (${newRunId}) for ${this.scanName} (${this.windows.length} windows, scan concurrency=${this.concurrency}, global pool max=${this.maxTotalPoolSlots}, uploadGate=${uploadGateLimit}, lowMemFlags=${Boolean(cfg.studioLowMemoryChromeFlags)}, disableDevShm=${cfg.studioDisableDevShmUsage !== false}, attachDrive=${Boolean(cfg.studioAttachMovieFromDrive)}, minutes="${this.minuteInput}")`,
+          message: `Started Parallel Window Scan (${newRunId}) for ${this.scanName} (${this.windows.length} windows, scan concurrency=${this.concurrency}, global pool max=${this.maxTotalPoolSlots}, uploadGate=${uploadGateLimit}, lowMemFlags=${Boolean(cfg.studioLowMemoryChromeFlags)}, disableDevShm=${cfg.studioDisableDevShmUsage !== false}, attachDrive=${Boolean(!this.usingOriginalMovieClips && cfg.studioAttachMovieFromDrive)}, clipMode=${this.usingOriginalMovieClips}, minutes="${this.minuteInput}")`,
         })
 
         this.runWorkerPoolLoop().catch((err) => {
@@ -1945,77 +2043,82 @@ export class StudioParallelManager {
         })
       }
 
-      if (initialMovieCheck.valid) {
-        // movie_360p.mp4 is already valid on persistent disk -> launch workers immediately without re-compressing
+      if (hasOriginalMovie) {
+        this.usingOriginalMovieClips = true
         this.compressing360p = null
+        const rawStat = fs.statSync(rawMoviePath)
+        const rawDurationSec = await probeDuration(rawMoviePath)
+        if (!Number.isFinite(rawDurationSec) || rawDurationSec <= 0) {
+          throw new Error(`Could not probe duration of original movie at ${rawMoviePath}`)
+        }
+        this.movieDurationSec = rawDurationSec
+        if (!canResume) {
+          const { windows } = buildParallelWindowsFromMinuteInput(
+            this.minuteInput,
+            rawDurationSec,
+          )
+          this.windows = windows.map((w) => ({
+            ...w,
+            status: 'QUEUED',
+            workerId: null,
+            modelName: cfg.studioModelName || 'Gemini 3.8 Flash',
+            stage: 'Extracting clip...',
+            tokens: null,
+            attempt: 0,
+            maxAttempts: 5,
+            permRetry: 0,
+            startedAt: null,
+            finishedAt: null,
+            elapsedSec: 0,
+            matchCount: 0,
+            summaryText: 'Extracting window clip...',
+            error: null,
+          }))
+        }
         finalizeMediaAndLaunchWorkers({
           scanId: this.scanId,
           shortPath: shortReady.localPath,
           shortSizeBytes: shortReady.sizeBytes,
           shortDurationSec: shortReady.durationSec,
-          movie360Path: initialMovieCheck.filePath,
-          movie360SizeBytes: initialMovieCheck.sizeBytes,
-          movie360DurationSec: initialMovieCheck.durationSec,
+          movie360Path: rawMoviePath,
+          movie360SizeBytes: rawStat.size,
+          movie360DurationSec: rawDurationSec,
           verifiedAt: Date.now(),
         })
       } else {
-        // Ensure source movie.mp4 exists before starting background 360p compression
-        const rawMoviePath = path.join(this.getScanMediaDir(), 'movie.mp4')
-        if (!fs.existsSync(rawMoviePath) || fs.statSync(rawMoviePath).size <= 0) {
+        this.usingOriginalMovieClips = false
+        this.appendCombinedLog({
+          workerId: 'SYS',
+          level: 'INFO',
+          step: 'original movie missing',
+          message: `WARN: Original movie.mp4 missing at ${rawMoviePath} -> falling back to movie_360p.mp4 flow`,
+        })
+        this.onLogCallback?.(
+          'warn',
+          `Original movie.mp4 missing at ${rawMoviePath} -> falling back to movie_360p.mp4 flow`,
+        )
+        const initialMovieCheck = await verifyStudioMovie360pFile(
+          this.scanId,
+          expectedMovieDuration,
+        )
+        if (initialMovieCheck.valid) {
+          // movie_360p.mp4 is already valid on persistent disk -> launch workers immediately without re-compressing
+          this.compressing360p = null
+          finalizeMediaAndLaunchWorkers({
+            scanId: this.scanId,
+            shortPath: shortReady.localPath,
+            shortSizeBytes: shortReady.sizeBytes,
+            shortDurationSec: shortReady.durationSec,
+            movie360Path: initialMovieCheck.filePath,
+            movie360SizeBytes: initialMovieCheck.sizeBytes,
+            movie360DurationSec: initialMovieCheck.durationSec,
+            verifiedAt: Date.now(),
+          })
+        } else {
           throw new Error(
-            `Source movie file missing at ${rawMoviePath} (cannot build movie_360p.mp4)`,
+            `Source movie file missing at ${rawMoviePath} and no valid movie_360p.mp4 found`,
           )
         }
-
-        this.compressing360p = {
-          active: true,
-          progress: 0,
-          statusText: 'Compressing movie 360p... 0%',
-          sizeBytes: null,
-          error: null,
-        }
-        for (const w of this.windows) {
-          if (w.status === 'QUEUED') {
-            w.stage = 'Compressing movie 360p...'
-            w.summaryText = 'Waiting for movie_360p.mp4 compression...'
-          }
-        }
-        this.startResourceSnapshotTimer()
-        this.persistStateToDisk()
-
-        // Run compression in background while holding workers (this.starting = true)
-        void (async () => {
-          try {
-            const verifiedMedia = await this.verifyAndEnsureScanMediaReadyBeforeStart()
-            if (this.stoppingAll) {
-              this.starting = false
-              this.active = false
-              this.stopResourceSnapshotTimer()
-              return
-            }
-            finalizeMediaAndLaunchWorkers(verifiedMedia)
-          } catch (bgErr) {
-            const msg = bgErr instanceof Error ? bgErr.message : String(bgErr)
-            this.starting = false
-            this.active = false
-            this.stopResourceSnapshotTimer()
-            this.resourceWarning = `ERROR: ${msg}`
-            this.compressing360p = {
-              active: false,
-              progress: 0,
-              statusText: `Compression error: ${msg}`,
-              error: msg,
-            }
-            this.appendCombinedLog({
-              workerId: 'SYS',
-              level: 'ERROR',
-              step: 'parallel start failed',
-              message: `Parallel Scan start aborted for ${this.scanName}: ${msg}`,
-            })
-            this.onLogCallback?.('error', `Parallel Scan start aborted: ${msg}`)
-            this.persistStateToDisk()
-          }
-        })()
       }
 
       return {
@@ -2384,8 +2487,81 @@ export class StudioParallelManager {
     const cfg = await loadStudioUserConfig(this.username || 'admin')
     const jobLabel = `[${this.scanName}] Window #${win.windowNumber} (${windowRangeStr})`
 
+    let windowClip: WindowClipResult | null = null
+    if (this.usingOriginalMovieClips) {
+      win.stage = 'Extracting clip...'
+      win.summaryText = `Extracting clip on ${workerId}...`
+      this.persistStateToDisk()
+      try {
+        const clipPromise =
+          this.windowClipPromises.get(win.id) ||
+          (this.startWindowClipTask
+            ? this.startWindowClipTask(win)
+            : ensureWindowClip(
+                this.scanId,
+                {
+                  windowNumber: win.windowNumber,
+                  startSec: win.startSec,
+                  endSec: win.endSec,
+                },
+                { token: this.clipCancelToken ?? undefined },
+              ))
+        const clipWaitStart = Date.now()
+        windowClip = await clipPromise
+        const sizeBytes = (() => {
+          try {
+            return fs.statSync(windowClip.clipPath).size
+          } catch {
+            return 0
+          }
+        })()
+        const sizeMb = (sizeBytes / (1024 * 1024)).toFixed(1)
+        const extractSec = ((Date.now() - clipWaitStart) / 1000).toFixed(1)
+        win.stage = windowClip.cached
+          ? 'Clip ready (cached)'
+          : `Clip ready (extracted, ${sizeMb} MB, ${extractSec} s)`
+        this.persistStateToDisk()
+      } catch (clipErr) {
+        if (
+          clipErr instanceof FfmpegCancelled ||
+          this.stoppingAll ||
+          this.stoppedWindowIds.has(win.id)
+        ) {
+          win.status = 'STOPPED'
+          win.workerId = null
+          win.stage = 'stopped'
+          win.summaryText = 'STOPPED BY USER'
+          this.persistStateToDisk()
+          return
+        }
+        const errMsg = clipErr instanceof Error ? clipErr.message : String(clipErr)
+        win.status = 'FAILED'
+        win.workerId = null
+        win.finishedAt = Date.now()
+        win.elapsedSec = win.startedAt ? Math.round((win.finishedAt - win.startedAt) / 1000) : 0
+        win.stage = 'clip extract failed'
+        win.error = errMsg
+        win.summaryText = `FAILED — Clip extraction failed: ${errMsg.slice(0, 120)}`
+        this.appendCombinedLog({
+          workerId,
+          windowId: win.id,
+          windowNumber: win.windowNumber,
+          windowRange: windowRangeStr,
+          level: 'ERROR',
+          step: 'clip extract failed',
+          message: `Window #${win.windowNumber} (${windowRangeStr}) clip extraction failed: ${errMsg}`,
+        })
+        this.onLogCallback?.(
+          'error',
+          `[${workerId}]${shortScanTag} Window #${win.windowNumber} clip extraction failed: ${errMsg}`,
+        )
+        this.persistStateToDisk()
+        return
+      }
+    }
+
     let effectiveMovieDriveFileName: string | null = null
-    if (cfg.studioAttachMovieFromDrive) {
+    if (!windowClip && cfg.studioAttachMovieFromDrive) {
       effectiveMovieDriveFileName =
         this.movieDriveFileName || getScan(this.scanId)?.movie360p?.driveFileName || null
       if (!effectiveMovieDriveFileName) {
@@ -2442,9 +2618,18 @@ export class StudioParallelManager {
         shortStartSec: 0,
         shortEndSec: this.shortDurationSec,
         movieDriveFileName: effectiveMovieDriveFileName,
-        movieLocalPath: this.movieLocalPath,
+        movieLocalPath: windowClip ? windowClip.clipPath : this.movieLocalPath,
         movieStartSec: win.startSec,
         movieEndSec: win.endSec,
+        windowClip: windowClip
+          ? {
+              clipPath: windowClip.clipPath,
+              clipStartFrame: windowClip.clipStartFrame,
+              clipStartSec: windowClip.clipStartSec,
+              frameCount: windowClip.frameCount,
+              durationSec: windowClip.durationSec,
+            }
+          : null,
         parallelMode: true,
         maxAttempts: 5,
         measuredTokenRate: this.measuredTokenRate ?? cfg.studioMeasuredTokenRate ?? null,
@@ -2474,11 +2659,17 @@ export class StudioParallelManager {
           error: null,
         })
 
+        const stateHalf1 = makeState(half1)
+        const stateHalf2 = makeState(half2)
         const idx = this.windows.findIndex((w) => w.id === win.id)
         if (idx !== -1) {
-          this.windows.splice(idx, 1, makeState(half1), makeState(half2))
+          this.windows.splice(idx, 1, stateHalf1, stateHalf2)
         } else {
-          this.windows.push(makeState(half1), makeState(half2))
+          this.windows.push(stateHalf1, stateHalf2)
+        }
+        if (this.usingOriginalMovieClips && this.startWindowClipTask) {
+          this.startWindowClipTask(stateHalf1)
+          this.startWindowClipTask(stateHalf2)
         }
         this.appendCombinedLog({
           workerId,
@@ -2628,6 +2819,7 @@ export class StudioParallelManager {
     this.paused = false
     this.waitingForWorkerSlots = false
     this.compressing360p = null
+    this.clipCancelToken?.cancel()
     this.stopResourceSnapshotTimer()
 
     // Only stop slots leased by THIS scan! Unpause first ("Pause se stop") and kill worker Chrome processes.

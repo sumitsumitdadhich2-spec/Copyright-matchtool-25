@@ -428,6 +428,186 @@ export async function extractClipPrecise(sourceFile: string, start: number, end:
   await verifyDuration(outFile, dur, SCAN_FPS)
 }
 
+export interface ExtractedWindowClipInfo {
+  clipStartFrame: number
+  clipStartSec: number
+  frameCount: number
+  durationSec: number
+}
+
+/**
+ * Verify a window clip with ffprobe:
+ * - video frame count == expectedFrameCount (exact)
+ * - video fps == 24
+ * - duration ≈ expectedFrameCount / 24
+ */
+export async function verifyWindowClipFile(
+  file: string,
+  expectedFrameCount: number,
+): Promise<{ frames: number; fps: number; duration: number }> {
+  const output = await runFfprobe([
+    '-v',
+    'error',
+    '-select_streams',
+    'v:0',
+    '-show_entries',
+    'stream=nb_frames,avg_frame_rate,r_frame_rate,duration:format=duration',
+    '-of',
+    'json',
+    file,
+  ])
+  const parsed = JSON.parse(output) as {
+    streams?: Array<Record<string, unknown>>
+    format?: Record<string, unknown>
+  }
+  const vStream = parsed.streams?.[0]
+  if (!vStream) {
+    throw new Error(`Window clip ${path.basename(file)} has no video stream`)
+  }
+  const frames = Number.parseInt(String(vStream.nb_frames ?? ''), 10)
+  if (!Number.isFinite(frames) || frames !== expectedFrameCount) {
+    throw new Error(
+      `Window clip ${path.basename(file)} frame count mismatch: got ${vStream.nb_frames ?? 'unknown'}, expected ${expectedFrameCount}`,
+    )
+  }
+  const fps = rationalNumber(vStream.avg_frame_rate) ?? rationalNumber(vStream.r_frame_rate)
+  if (fps === null || Math.abs(fps - SCAN_FPS) > 0.05) {
+    throw new Error(
+      `Window clip ${path.basename(file)} fps mismatch: got ${fps ?? 'unknown'}, expected ${SCAN_FPS}`,
+    )
+  }
+  const expectedDur = expectedFrameCount / SCAN_FPS
+  const streamDur = Number(vStream.duration)
+  const formatDur = Number(parsed.format?.duration)
+  const actualDur = Number.isFinite(streamDur) && streamDur > 0 ? streamDur : formatDur
+  const tol = Math.max(2 / SCAN_FPS, 0.085)
+  if (!Number.isFinite(actualDur) || Math.abs(actualDur - expectedDur) > tol) {
+    throw new Error(
+      `Window clip ${path.basename(file)} duration mismatch: got ${actualDur}, expected ${expectedDur.toFixed(3)}s (±${tol.toFixed(3)}s)`,
+    )
+  }
+  return { frames, fps, duration: actualDur }
+}
+
+const sourceProbePromiseCache = new Map<
+  string,
+  { size: number; mtimeMs: number; promise: Promise<{ movieDur: number; hasAudio: boolean }> }
+>()
+
+async function getSourceMovieProbeCached(
+  sourceFile: string,
+): Promise<{ movieDur: number; hasAudio: boolean }> {
+  let size = 0
+  let mtimeMs = 0
+  try {
+    const st = fs.statSync(sourceFile)
+    size = st.size
+    mtimeMs = Math.round(st.mtimeMs)
+  } catch {
+    /* fall through */
+  }
+  const existing = sourceProbePromiseCache.get(sourceFile)
+  if (existing && existing.size === size && existing.mtimeMs === mtimeMs) {
+    return existing.promise
+  }
+  const promise = Promise.all([probeDuration(sourceFile), probeHasAudio(sourceFile)]).then(
+    ([movieDur, hasAudio]) => ({ movieDur, hasAudio }),
+  )
+  promise.catch(() => {
+    if (sourceProbePromiseCache.get(sourceFile)?.promise === promise) {
+      sourceProbePromiseCache.delete(sourceFile)
+    }
+  })
+  sourceProbePromiseCache.set(sourceFile, { size, mtimeMs, promise })
+  return promise
+}
+
+/**
+ * Frame-exact 24 fps window clip extraction from the original movie.mp4:
+ * - startFrame = round(startSec * 24); clipStartSec = startFrame / 24
+ * - endFrame = round(endSec * 24) clamped to the movie's last frame
+ * - preRollSec = min(floor(clipStartSec), 2) (whole seconds to keep the 24 fps grid anchored)
+ * - Writes to outFile + '.partial', verifies with ffprobe, then atomically renames to outFile.
+ */
+export async function extractWindowClip(
+  sourceFile: string,
+  startSec: number,
+  endSec: number,
+  outFile: string,
+  token?: CancelToken,
+): Promise<ExtractedWindowClipInfo> {
+  const { movieDur, hasAudio } = await getSourceMovieProbeCached(sourceFile)
+  const movieLastFrame = Math.max(1, Math.round(movieDur * SCAN_FPS))
+  const startFrame = Math.max(0, Math.round(startSec * SCAN_FPS))
+  const clipStartSec = startFrame / SCAN_FPS
+  const endFrame = Math.min(movieLastFrame, Math.round(endSec * SCAN_FPS))
+  const frameCount = endFrame - startFrame
+  if (frameCount <= 0) {
+    throw new Error(
+      `Invalid window clip range [${startSec}s..${endSec}s]: startFrame=${startFrame}, endFrame=${endFrame}, movieLastFrame=${movieLastFrame}`,
+    )
+  }
+  const durationSec = frameCount / SCAN_FPS
+  const preRollSec = Math.min(Math.floor(clipStartSec), 2)
+  const seekSec = Math.max(0, clipStartSec - preRollSec)
+  const trimStartFrame = preRollSec * SCAN_FPS
+  const trimEndFrame = trimStartFrame + frameCount
+  const atrimStart = preRollSec
+  const atrimEnd = preRollSec + durationSec
+
+  const partialFile = `${outFile}.partial`
+  fs.mkdirSync(path.dirname(outFile), { recursive: true })
+  try {
+    try {
+      fs.rmSync(partialFile, { force: true })
+    } catch {
+      /* ignore */
+    }
+    const vf = `${SCAN_VF},trim=start_frame=${trimStartFrame}:end_frame=${trimEndFrame},setpts=PTS-STARTPTS`
+    const af = `atrim=start=${atrimStart}:end=${atrimEnd},asetpts=PTS-STARTPTS`
+    const args: string[] = [
+      '-y',
+      ...IN_FLAGS,
+      '-ss',
+      seekSec.toFixed(3),
+      '-i',
+      sourceFile,
+      '-vf',
+      vf,
+      ...(hasAudio ? ['-af', af] : ['-an']),
+      '-r',
+      SCAN_FPS_STR,
+      ...SCAN_VIDEO,
+      ...(hasAudio ? SCAN_AUDIO : []),
+      ...OUT_FLAGS,
+      '-movflags',
+      '+faststart',
+      '-f',
+      'mp4',
+      partialFile,
+    ]
+    await runFfmpeg(args, {
+      label: `window-clip ${clipStartSec.toFixed(1)}s+${durationSec.toFixed(1)}s`,
+      token,
+    })
+    await verifyWindowClipFile(partialFile, frameCount)
+    fs.renameSync(partialFile, outFile)
+    return {
+      clipStartFrame: startFrame,
+      clipStartSec,
+      frameCount,
+      durationSec,
+    }
+  } catch (err) {
+    try {
+      fs.rmSync(partialFile, { force: true })
+    } catch {
+      /* ignore */
+    }
+    throw err
+  }
+}
+
 /**
  * Create a sanitized, silent (-an) copy of a video segment or chunk.
  * Strips all audio tracks and applies normalized contrast to bypass audio-based and false-positive policy blocks.
