@@ -6,7 +6,7 @@ import {
   studioController,
   type StudioTestClipLine,
 } from '@/lib/studio-automation'
-import { studioParallelManager } from '@/lib/studio-parallel-manager'
+import { getStudioParallelManager } from '@/lib/studio-parallel-manager'
 import { prepareStudioMovie360pAndDrive, ensureStudioShortReady } from '@/lib/media'
 import { getScan, saveScan } from '@/lib/store'
 import { MEDIA_DIR } from '@/lib/paths'
@@ -480,25 +480,44 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: true })
       }
       case 'save_parallel_config': {
-        const nextCfg = await saveStudioUserConfig(username, {
-          ...(body.minuteInput !== undefined ? { studioMinuteInput: body.minuteInput } : {}),
-          ...(body.concurrency !== undefined ? { studioConcurrency: Number(body.concurrency) } : {}),
-        })
-        const planned = studioParallelManager.previewPlan(nextCfg.studioMinuteInput)
+        const targetScanId = (body.scanId || '').trim()
+        if (!targetScanId) {
+          return NextResponse.json({ ok: false, error: 'Select or create a scan first (missing scanId)' }, { status: 400 })
+        }
+        const scanObj = getScan(targetScanId)
+        if (scanObj && session.role !== 'admin' && scanObj.ownerUsername && scanObj.ownerUsername !== username) {
+          return NextResponse.json({ ok: false, error: 'Forbidden: scan belongs to another user' }, { status: 403 })
+        }
+        // Global concurrency default stays in user config; studioMinuteInput is per-scan
+        if (body.concurrency !== undefined) {
+          await saveStudioUserConfig(username, {
+            studioConcurrency: Number(body.concurrency),
+          })
+        }
+        const parallelMgr = getStudioParallelManager(targetScanId)
+        const planned = parallelMgr.previewPlan(
+          body.minuteInput,
+          body.concurrency !== undefined ? Number(body.concurrency) : undefined,
+          scanObj?.movieDuration || undefined,
+        )
+        const liveSnap = await parallelMgr.getLiveSnapshot(false)
         return NextResponse.json({
           ok: true,
-          minuteInput: nextCfg.studioMinuteInput,
-          concurrency: nextCfg.studioConcurrency,
+          scanId: targetScanId,
+          minuteInput: liveSnap.minuteInput,
+          concurrency: liveSnap.concurrency,
           plannedWindows: planned,
-          parallelSnapshot: await studioParallelManager.getLiveSnapshot(false),
+          parallelSnapshot: liveSnap,
         })
       }
       case 'start_parallel_scan': {
-        if (body.minuteInput !== undefined || body.concurrency !== undefined) {
-          await saveStudioUserConfig(username, {
-            ...(body.minuteInput !== undefined ? { studioMinuteInput: body.minuteInput } : {}),
-            ...(body.concurrency !== undefined ? { studioConcurrency: Number(body.concurrency) } : {}),
-          })
+        const targetScanId = (body.scanId || '').trim()
+        if (!targetScanId) {
+          return NextResponse.json({ ok: false, error: 'Select or create a scan first (missing scanId)' }, { status: 400 })
+        }
+        const targetScan: Scan | null = getScan(targetScanId) || null
+        if (targetScan && session.role !== 'admin' && targetScan.ownerUsername && targetScan.ownerUsername !== username) {
+          return NextResponse.json({ ok: false, error: 'Forbidden: scan belongs to another user' }, { status: 403 })
         }
 
         let shortLocalPath: string | null = null
@@ -506,9 +525,16 @@ export async function POST(req: NextRequest) {
         let shortDurationSec = 150
         let movieLocalPath: string | null = null
         let movieDurationSec = 6600
-        let targetScan: Scan | null = body.scanId ? getScan(body.scanId) || null : null
 
         if (targetScan) {
+          if (body.minuteInput !== undefined && body.minuteInput.trim()) {
+            targetScan.studioMinuteInput = body.minuteInput.trim()
+          }
+          if (body.concurrency !== undefined && Number.isFinite(Number(body.concurrency))) {
+            targetScan.studioParallelConcurrency = Number(body.concurrency)
+          }
+          saveScan(targetScan)
+
           const mediaDir = path.join(MEDIA_DIR, targetScan.id)
           const movie360Path = path.join(mediaDir, 'movie_360p.mp4')
           if (!fs.existsSync(movie360Path)) {
@@ -532,11 +558,12 @@ export async function POST(req: NextRequest) {
           movieDurationSec = targetScan.movieDuration || 6600
         }
 
-        const started = await studioParallelManager.startParallelScan({
+        const parallelMgr = getStudioParallelManager(targetScanId)
+        const started = await parallelMgr.startParallelScan({
           username,
-          scanId: targetScan?.id ?? body.scanId ?? null,
-          minuteInput: body.minuteInput,
-          concurrency: body.concurrency,
+          scanId: targetScanId,
+          minuteInput: body.minuteInput ?? targetScan?.studioMinuteInput ?? undefined,
+          concurrency: body.concurrency ?? targetScan?.studioParallelConcurrency ?? undefined,
           shortLocalPath,
           shortYoutubeUrl,
           shortDurationSec,
@@ -579,52 +606,77 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({
           ok: true,
           ...started,
-          parallelSnapshot: await studioParallelManager.getLiveSnapshot(false),
+          parallelSnapshot: await parallelMgr.getLiveSnapshot(false),
         })
       }
       case 'pause_parallel': {
-        studioParallelManager.pauseAll()
+        const targetScanId = (body.scanId || '').trim()
+        if (!targetScanId) {
+          return NextResponse.json({ ok: false, error: 'Missing scanId' }, { status: 400 })
+        }
+        const parallelMgr = getStudioParallelManager(targetScanId)
+        parallelMgr.pauseAll()
         return NextResponse.json({
           ok: true,
-          parallelSnapshot: await studioParallelManager.getLiveSnapshot(false),
+          parallelSnapshot: await parallelMgr.getLiveSnapshot(false),
         })
       }
       case 'resume_parallel': {
-        studioParallelManager.resumeAll()
+        const targetScanId = (body.scanId || '').trim()
+        if (!targetScanId) {
+          return NextResponse.json({ ok: false, error: 'Missing scanId' }, { status: 400 })
+        }
+        const parallelMgr = getStudioParallelManager(targetScanId)
+        parallelMgr.resumeAll()
         return NextResponse.json({
           ok: true,
-          parallelSnapshot: await studioParallelManager.getLiveSnapshot(false),
+          parallelSnapshot: await parallelMgr.getLiveSnapshot(false),
         })
       }
       case 'stop_parallel': {
-        studioParallelManager.stopAll()
+        const targetScanId = (body.scanId || '').trim()
+        if (!targetScanId) {
+          return NextResponse.json({ ok: false, error: 'Missing scanId' }, { status: 400 })
+        }
+        const parallelMgr = getStudioParallelManager(targetScanId)
+        parallelMgr.stopAll()
         return NextResponse.json({
           ok: true,
-          parallelSnapshot: await studioParallelManager.getLiveSnapshot(false),
+          parallelSnapshot: await parallelMgr.getLiveSnapshot(false),
         })
       }
       case 'retry_failed_parallel': {
-        const retriedCount = await studioParallelManager.retryFailedWindows(username)
+        const targetScanId = (body.scanId || '').trim()
+        if (!targetScanId) {
+          return NextResponse.json({ ok: false, error: 'Missing scanId' }, { status: 400 })
+        }
+        const parallelMgr = getStudioParallelManager(targetScanId)
+        const retriedCount = await parallelMgr.retryFailedWindows(username)
         return NextResponse.json({
           ok: true,
           retriedCount,
-          parallelSnapshot: await studioParallelManager.getLiveSnapshot(false),
+          parallelSnapshot: await parallelMgr.getLiveSnapshot(false),
         })
       }
       case 'parallel_window_action': {
+        const targetScanId = (body.scanId || '').trim()
+        if (!targetScanId) {
+          return NextResponse.json({ ok: false, error: 'Missing scanId' }, { status: 400 })
+        }
         if (!body.windowId || !body.subAction) {
           return NextResponse.json({ ok: false, error: 'Missing windowId or subAction' }, { status: 400 })
         }
+        const parallelMgr = getStudioParallelManager(targetScanId)
         if (body.subAction === 'stop') {
-          studioParallelManager.stopWindow(body.windowId)
+          parallelMgr.stopWindow(body.windowId)
         } else if (body.subAction === 'skip') {
-          studioParallelManager.skipWindow(body.windowId)
+          parallelMgr.skipWindow(body.windowId)
         } else if (body.subAction === 'retry') {
-          await studioParallelManager.retryWindow(body.windowId, username)
+          await parallelMgr.retryWindow(body.windowId, username)
         }
         return NextResponse.json({
           ok: true,
-          parallelSnapshot: await studioParallelManager.getLiveSnapshot(false),
+          parallelSnapshot: await parallelMgr.getLiveSnapshot(false),
         })
       }
       default:

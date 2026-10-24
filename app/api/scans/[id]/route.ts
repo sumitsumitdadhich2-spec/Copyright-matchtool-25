@@ -51,11 +51,13 @@ export async function DELETE(_req: Request, ctx: { params: Promise<{ id: string 
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
   }
 
-  // Stop queued/running scan work, minute finder, and renders before removing files.
+  // Stop queued/running scan work, minute finder, parallel studio workers, and renders before removing files.
   await stopBackgroundScan(id)
   if (scheduler.isRunning(id)) scheduler.stop(id)
   if (isMinuteFinderRunning(id)) stopGeminiMinuteFinder(id)
   cancelRender(id)
+  const { stopAndDeleteStudioParallelManager } = await import('@/lib/studio-parallel-manager')
+  stopAndDeleteStudioParallelManager(id)
 
   deleteScan(id)
   invalidateUsageCache()

@@ -115,16 +115,22 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
     }
   }
 
+  const activeScanId = scan?.id || ''
+
   useEffect(() => {
     if (!expanded) return
 
     let es: EventSource | null = null
     let fallbackTimer: ReturnType<typeof setInterval> | null = null
     let mounted = true
+    const qs = activeScanId ? `?scanId=${encodeURIComponent(activeScanId)}` : ''
+    const pollQs = activeScanId
+      ? `?once=1&scanId=${encodeURIComponent(activeScanId)}`
+      : '?once=1'
 
     const pollOnce = async () => {
       try {
-        const res = await fetch('/api/studio/stream?once=1', { cache: 'no-store' })
+        const res = await fetch(`/api/studio/stream${pollQs}`, { cache: 'no-store' })
         if (!res.ok || !mounted) return
         const data = (await res.json()) as StudioLiveSnapshot
         if (mounted) setSnap(data)
@@ -132,7 +138,7 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
     }
 
     try {
-      es = new EventSource('/api/studio/stream')
+      es = new EventSource(`/api/studio/stream${qs}`)
       es.onopen = () => {
         if (mounted) setStreamConnected(true)
       }
@@ -156,7 +162,7 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
       if (es) es.close()
       if (fallbackTimer) clearInterval(fallbackTimer)
     }
-  }, [expanded])
+  }, [expanded, activeScanId])
 
   const sendControl = async (payload: Record<string, unknown>, label?: string) => {
     if (label) setBusyAction(label)
@@ -748,8 +754,12 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
       {expanded && (
         <div className="px-4 pb-4">
           <StudioParallelGrid
+            key={scan?.id || 'no-scan'}
             parallelSnapshot={snap?.parallelSnapshot ?? null}
             scanId={scan?.id ?? null}
+            scanTitle={scan?.customName || scan?.movieName || scan?.shortName || null}
+            scanMinuteInput={scan?.studioMinuteInput ?? null}
+            scanConcurrency={scan?.studioParallelConcurrency ?? null}
             onActionCompleted={(nextParallel) =>
               setSnap((prev) => (prev ? { ...prev, parallelSnapshot: nextParallel } : prev))
             }

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { studioController } from '@/lib/studio-automation'
-import { studioParallelManager } from '@/lib/studio-parallel-manager'
+import { getStudioParallelManager } from '@/lib/studio-parallel-manager'
 import { getSession } from '@/lib/users'
 
 export const runtime = 'nodejs'
@@ -18,13 +18,20 @@ export async function GET(req: NextRequest) {
     )
   }
 
+  const scanId = (req.nextUrl.searchParams.get('scanId') || '').trim()
   const once = req.nextUrl.searchParams.get('once') === '1'
-  if (once) {
+
+  const getSnapshotsForRequest = async () => {
     const [snap, parallelSnapshot] = await Promise.all([
       studioController.getSnapshot(true),
-      studioParallelManager.getLiveSnapshot(true),
+      scanId ? getStudioParallelManager(scanId).getLiveSnapshot(true) : Promise.resolve(null),
     ])
-    return NextResponse.json({ ...snap, parallelSnapshot })
+    return { ...snap, parallelSnapshot }
+  }
+
+  if (once) {
+    const data = await getSnapshotsForRequest()
+    return NextResponse.json(data)
   }
 
   const encoder = new TextEncoder()
@@ -35,11 +42,8 @@ export async function GET(req: NextRequest) {
       const send = async () => {
         if (closed) return
         try {
-          const [snap, parallelSnapshot] = await Promise.all([
-            studioController.getSnapshot(true),
-            studioParallelManager.getLiveSnapshot(true),
-          ])
-          const payload = `data: ${JSON.stringify({ ...snap, parallelSnapshot })}\n\n`
+          const data = await getSnapshotsForRequest()
+          const payload = `data: ${JSON.stringify(data)}\n\n`
           controller.enqueue(encoder.encode(payload))
         } catch {
           /* ignore */

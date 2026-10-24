@@ -1,15 +1,13 @@
 'use client'
 
-import React, { useState } from 'react'
+import React, { useState, useEffect, useRef, useMemo } from 'react'
 import {
   Play,
   Pause,
   Square,
   RotateCcw,
   SkipForward,
-  CheckCircle2,
   AlertTriangle,
-  XCircle,
   Layers,
   Copy,
   Download,
@@ -20,17 +18,28 @@ import {
   FileText,
   FileCode,
   Sparkles,
+  Terminal,
+  Filter,
+  FileDown,
 } from 'lucide-react'
 import type {
+  ParallelCombinedLogEntry,
+  ParallelLogLevel,
   ParallelScanLiveSnapshot,
   ParallelWindowState,
   ParallelWindowStatus,
   ParallelWorkerCardSnapshot,
 } from '@/lib/studio-parallel-manager'
 
+const DEFAULT_MINUTES_STR =
+  '7,8,9,10,14,15,16,17,19,20,21,25-41,48-54,56,57,58,63-67,71-100'
+
 interface StudioParallelGridProps {
   parallelSnapshot: ParallelScanLiveSnapshot | null
   scanId?: string | null
+  scanTitle?: string | null
+  scanMinuteInput?: string | null
+  scanConcurrency?: number | null
   onActionCompleted?: (nextParallel: ParallelScanLiveSnapshot) => void
 }
 
@@ -39,6 +48,22 @@ function formatMmSs(sec: number): string {
   const mm = String(Math.floor(s / 60)).padStart(2, '0')
   const ss = String(s % 60).padStart(2, '0')
   return `${mm}:${ss}`
+}
+
+function formatPlusMmSs(sec: number): string {
+  const s = Math.max(0, Math.floor(sec || 0))
+  const mm = String(Math.floor(s / 60)).padStart(2, '0')
+  const ss = String(s % 60).padStart(2, '0')
+  return `+${mm}:${ss}`
+}
+
+function formatHhMmSsMmm(epochMs: number): string {
+  const d = new Date(epochMs)
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  const ss = String(d.getSeconds()).padStart(2, '0')
+  const mmm = String(d.getMilliseconds()).padStart(3, '0')
+  return `${hh}:${mm}:${ss}.${mmm}`
 }
 
 function statusBadgeStyle(status: ParallelWindowStatus | 'IDLE'): string {
@@ -53,6 +78,8 @@ function statusBadgeStyle(status: ParallelWindowStatus | 'IDLE'): string {
     case '403_WAIT':
     case 'RETRYING':
       return 'border-amber-500/40 bg-amber-500/15 text-amber-300'
+    case 'WAITING_FOR_WORKER':
+      return 'border-purple-500/40 bg-purple-500/15 text-purple-300'
     case 'NEEDS_ATTENTION':
       return 'border-rose-500/60 bg-rose-500/20 text-rose-200 animate-pulse'
     case 'FAILED':
@@ -67,6 +94,24 @@ function statusBadgeStyle(status: ParallelWindowStatus | 'IDLE'): string {
   }
 }
 
+function logLevelBadgeStyle(level: ParallelLogLevel): string {
+  switch (level) {
+    case 'SUCCESS':
+      return 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+    case '403':
+      return 'border-orange-500/50 bg-orange-500/20 text-orange-300'
+    case 'RETRY':
+      return 'border-amber-500/40 bg-amber-500/15 text-amber-300'
+    case 'ERROR':
+      return 'border-red-500/50 bg-red-500/20 text-red-300'
+    case 'STOPPED':
+      return 'border-zinc-500/40 bg-zinc-700/40 text-zinc-300'
+    case 'INFO':
+    default:
+      return 'border-sky-500/30 bg-sky-500/10 text-sky-300'
+  }
+}
+
 function shortModelBadge(modelName: string): string {
   if (/3\.8/i.test(modelName)) return '3.8 Flash'
   if (/3\.7/i.test(modelName)) return '3.7 Flash'
@@ -77,30 +122,55 @@ function shortModelBadge(modelName: string): string {
 export function StudioParallelGrid({
   parallelSnapshot,
   scanId,
+  scanTitle,
+  scanMinuteInput,
+  scanConcurrency,
   onActionCompleted,
 }: StudioParallelGridProps) {
   const [minuteInput, setMinuteInput] = useState<string>(
-    parallelSnapshot?.minuteInput ||
-      '7,8,9,10,14,15,16,17,19,20,21,25-41,48-54,56,57,58,63-67,71-100',
+    parallelSnapshot?.minuteInput || scanMinuteInput || DEFAULT_MINUTES_STR,
   )
-  const [concurrency, setConcurrency] = useState<number>(parallelSnapshot?.concurrency || 10)
+  const [concurrency, setConcurrency] = useState<number>(
+    parallelSnapshot?.concurrency || scanConcurrency || 10,
+  )
   const [busyAction, setBusyAction] = useState<string | null>(null)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null)
   const [reportTab, setReportTab] = useState<'txt' | 'json'>('txt')
   const [copiedReport, setCopiedReport] = useState(false)
 
-  // Keep local inputs synced when parallelSnapshot initializes for the first time
-  const initializedRef = React.useRef(false)
-  React.useEffect(() => {
-    if (parallelSnapshot && !initializedRef.current) {
-      initializedRef.current = true
-      if (parallelSnapshot.minuteInput) setMinuteInput(parallelSnapshot.minuteInput)
-      if (parallelSnapshot.concurrency) setConcurrency(parallelSnapshot.concurrency)
+  // Combined Log panel filters & auto-scroll state
+  const [workerFilter, setWorkerFilter] = useState<string>('ALL')
+  const [levelFilter, setLevelFilter] = useState<string>('ALL')
+  const [onlyErrorsRetries403, setOnlyErrorsRetries403] = useState<boolean>(false)
+  const [autoScrollLogs, setAutoScrollLogs] = useState<boolean>(true)
+  const [downloadingPdfMode, setDownloadingPdfMode] = useState<'full' | 'errors' | null>(null)
+  const logContainerRef = useRef<HTMLDivElement | null>(null)
+
+  const syncedScanIdRef = useRef<string | null>(null)
+
+  // Sync per-scan minuteInput & concurrency when scanId changes or snapshot arrives for this scan
+  useEffect(() => {
+    const currentId = scanId || null
+    if (syncedScanIdRef.current !== currentId) {
+      syncedScanIdRef.current = currentId
+      setMinuteInput(parallelSnapshot?.minuteInput || scanMinuteInput || DEFAULT_MINUTES_STR)
+      setConcurrency(parallelSnapshot?.concurrency || scanConcurrency || 10)
+      setSelectedWorkerId(null)
+      setErrorMsg(null)
+    } else if (parallelSnapshot && parallelSnapshot.scanId === currentId) {
+      // If user hasn't typed a different value before snapshot loaded, sync once
+      if (minuteInput === DEFAULT_MINUTES_STR && parallelSnapshot.minuteInput) {
+        setMinuteInput(parallelSnapshot.minuteInput)
+      }
     }
-  }, [parallelSnapshot])
+  }, [scanId, scanMinuteInput, scanConcurrency, parallelSnapshot, minuteInput])
 
   const postParallelControl = async (payload: Record<string, unknown>, label: string) => {
+    if (!scanId) {
+      setErrorMsg('Please select or create a scan first to run Parallel Window Scan.')
+      return
+    }
     setBusyAction(label)
     setErrorMsg(null)
     try {
@@ -108,7 +178,7 @@ export function StudioParallelGrid({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          scanId: scanId || parallelSnapshot?.scanId || undefined,
+          scanId,
           ...payload,
         }),
       })
@@ -136,9 +206,34 @@ export function StudioParallelGrid({
   const workers = parallelSnapshot?.workers ?? []
   const windows = parallelSnapshot?.windows ?? []
   const mergedReport = parallelSnapshot?.mergedReport ?? null
+  const slotPool = parallelSnapshot?.slotPool ?? null
+  const combinedLogs = parallelSnapshot?.combinedLogs ?? []
+  const totalLogLinesOnDisk = parallelSnapshot?.totalLogLinesOnDisk ?? combinedLogs.length
 
   const selectedWorker: ParallelWorkerCardSnapshot | null =
     selectedWorkerId ? workers.find((w) => w.workerId === selectedWorkerId) || null : null
+
+  const filteredCombinedLogs = useMemo(() => {
+    return combinedLogs
+      .filter((entry: ParallelCombinedLogEntry) => {
+        if (workerFilter !== 'ALL' && entry.workerId !== workerFilter) return false
+        if (onlyErrorsRetries403) {
+          if (entry.level !== 'ERROR' && entry.level !== 'RETRY' && entry.level !== '403') {
+            return false
+          }
+        } else if (levelFilter !== 'ALL' && entry.level !== levelFilter) {
+          return false
+        }
+        return true
+      })
+      .slice(-2000)
+  }, [combinedLogs, workerFilter, levelFilter, onlyErrorsRetries403])
+
+  useEffect(() => {
+    if (!autoScrollLogs || !logContainerRef.current) return
+    const el = logContainerRef.current
+    el.scrollTop = el.scrollHeight
+  }, [filteredCombinedLogs.length, autoScrollLogs])
 
   const handleCopyReport = async () => {
     if (!mergedReport) return
@@ -163,23 +258,78 @@ export function StudioParallelGrid({
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `parallel-window-scan-report.${ext}`
+    a.download = `parallel-window-scan-${scanId || 'scan'}.${ext}`
     document.body.appendChild(a)
     a.click()
     a.remove()
     URL.revokeObjectURL(url)
   }
 
+  const handleDownloadPdf = async (mode: 'full' | 'errors') => {
+    if (!scanId) {
+      setErrorMsg('Select a scan first to download its parallel log PDF.')
+      return
+    }
+    setDownloadingPdfMode(mode)
+    setErrorMsg(null)
+    try {
+      const url = `/api/studio/parallel/log-pdf?scanId=${encodeURIComponent(scanId)}&mode=${mode}`
+      const res = await fetch(url)
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}))
+        throw new Error(errData.error || `PDF download failed (HTTP ${res.status})`)
+      }
+      const blob = await res.blob()
+      const dlUrl = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = dlUrl
+      const disp = res.headers.get('Content-Disposition') || ''
+      const match = disp.match(/filename="([^"]+)"/)
+      a.download = match ? match[1] : `parallel-log-${scanId}-${mode}.pdf`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(dlUrl)
+    } catch (err) {
+      setErrorMsg((err as Error).message)
+    } finally {
+      setDownloadingPdfMode(null)
+    }
+  }
+
+  const workerFilterOptions = useMemo(() => {
+    const set = new Set<string>(['SYS'])
+    for (let i = 1; i <= 10; i++) {
+      set.add(`W${String(i).padStart(2, '0')}`)
+    }
+    for (const w of workers) {
+      set.add(w.workerId)
+    }
+    for (const l of combinedLogs) {
+      if (l.workerId) set.add(l.workerId)
+    }
+    return Array.from(set)
+  }, [workers, combinedLogs])
+
   return (
     <div className="mt-4 rounded-xl border border-zinc-800 bg-zinc-950/95 overflow-hidden">
       {/* Top Summary Header Bar */}
       <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b border-zinc-800 bg-zinc-900/80">
-        <div className="flex flex-wrap items-center gap-2.5">
+        <div className="flex flex-wrap items-center gap-2">
           <div className="flex items-center gap-1.5">
             <Layers className="w-4 h-4 text-cyan-400" />
             <span className="text-xs font-semibold tracking-wide text-zinc-100 uppercase">
               Parallel Window Scan
             </span>
+            {scanId ? (
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-cyan-500/15 border border-cyan-500/30 text-cyan-300">
+                {scanTitle ? `${scanTitle} (#${scanId.slice(0, 6)})` : `Scan #${scanId.slice(0, 8)}`}
+              </span>
+            ) : (
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300">
+                No scan selected
+              </span>
+            )}
           </div>
 
           <span className="text-[11px] font-mono px-2.5 py-0.5 rounded bg-zinc-950 border border-zinc-800 text-zinc-200">
@@ -198,6 +348,22 @@ export function StudioParallelGrid({
             · Elapsed: <strong className="text-zinc-200">{formatMmSs(elapsedSec)}</strong>
           </span>
 
+          {/* Global Profile Slot Pool Telemetry Badge */}
+          {slotPool && (
+            <span
+              className="text-[10px] font-mono px-2 py-0.5 rounded bg-purple-950/50 border border-purple-500/30 text-purple-200"
+              title="Global Chrome profile slot pool shared safely across all scans"
+            >
+              {slotPool.summaryText}
+            </span>
+          )}
+
+          {parallelSnapshot?.waitingForWorkerSlots && (
+            <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded bg-purple-500/20 text-purple-200 border border-purple-500/40 animate-pulse">
+              WAITING FOR WORKER
+            </span>
+          )}
+
           {needsAttentionCount > 0 && (
             <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/40 animate-pulse">
               <AlertTriangle className="w-3 h-3" />
@@ -206,7 +372,7 @@ export function StudioParallelGrid({
           )}
 
           {parallelSnapshot && (
-            <div className="flex items-center gap-2 text-[10px] font-mono text-zinc-400">
+            <div className="flex items-center gap-1.5 text-[10px] font-mono text-zinc-400">
               <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-950 border border-zinc-800">
                 <Cpu className="w-3 h-3 text-zinc-500" />
                 RAM {parallelSnapshot.ramUsedPercent}%
@@ -225,13 +391,13 @@ export function StudioParallelGrid({
           )}
         </div>
 
-        {/* Global Action Buttons */}
+        {/* Scan-scoped Global Action Buttons */}
         <div className="flex flex-wrap items-center gap-1.5">
           {!parallelSnapshot?.active ? (
             <>
               <button
                 type="button"
-                disabled={busyAction !== null}
+                disabled={busyAction !== null || !scanId}
                 onClick={() =>
                   postParallelControl(
                     {
@@ -252,7 +418,7 @@ export function StudioParallelGrid({
               {totalWindows > 0 && doneCount < totalWindows && (
                 <button
                   type="button"
-                  disabled={busyAction !== null}
+                  disabled={busyAction !== null || !scanId}
                   onClick={() =>
                     postParallelControl(
                       {
@@ -311,7 +477,7 @@ export function StudioParallelGrid({
           {(failedCount > 0 || needsAttentionCount > 0) && (
             <button
               type="button"
-              disabled={busyAction !== null}
+              disabled={busyAction !== null || !scanId}
               onClick={() =>
                 postParallelControl({ action: 'retry_failed_parallel' }, 'retry_failed')
               }
@@ -324,17 +490,17 @@ export function StudioParallelGrid({
         </div>
       </div>
 
-      {/* Config Bar: Movie Minutes Input + Concurrency */}
+      {/* Per-Scan Config Bar: Movie Minutes Input + Concurrency */}
       <div className="px-4 py-2.5 border-b border-zinc-800/80 bg-zinc-900/40 flex flex-wrap items-center gap-3">
         <div className="flex-1 min-w-[260px] flex items-center gap-2">
           <label className="text-[11px] font-medium text-zinc-400 shrink-0">
-            Movie Minutes:
+            Scan Movie Minutes:
           </label>
           <input
             type="text"
             value={minuteInput}
             onChange={(e) => setMinuteInput(e.target.value)}
-            placeholder="7,8,9,10,14,15,16,17,19,20,21,25-41,48-54,56,57,58,63-67,71-100"
+            placeholder={DEFAULT_MINUTES_STR}
             className="flex-1 rounded bg-zinc-950 border border-zinc-800 px-2.5 py-1 text-xs font-mono text-zinc-200 focus:outline-none focus:border-cyan-500/50"
           />
         </div>
@@ -351,14 +517,14 @@ export function StudioParallelGrid({
           />
           <button
             type="button"
-            disabled={busyAction !== null}
+            disabled={busyAction !== null || !scanId}
             onClick={() =>
               postParallelControl(
                 { action: 'save_parallel_config', minuteInput, concurrency },
                 'save_config',
               )
             }
-            className="text-[11px] px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700"
+            className="text-[11px] px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 disabled:opacity-50"
           >
             {busyAction === 'save_config' ? 'Saving...' : 'Build / Preview Windows'}
           </button>
@@ -385,10 +551,17 @@ export function StudioParallelGrid({
         </div>
       )}
 
-      {/* Worker Cards Grid (10 isolated Chrome workers W01..W10) */}
+      {/* Worker Cards Grid (Global Profile Slot Pool W01..W10) */}
       <div className="p-4">
-        <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400 mb-2.5 flex items-center justify-between">
-          <span>Worker Browser Pool ({workers.length || maxConcurrency} Chrome Profiles)</span>
+        <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400 mb-2.5 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span>Worker Browser Pool ({workers.length || maxConcurrency} Chrome Profiles)</span>
+            {slotPool && (
+              <span className="text-[10px] font-mono font-normal px-2 py-0.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-300">
+                {slotPool.summaryText}
+              </span>
+            )}
+          </div>
           <span className="text-[10px] font-normal text-zinc-500">
             Click any worker card to view large screenshot &amp; [Wxx] step logs (200 lines)
           </span>
@@ -404,7 +577,9 @@ export function StudioParallelGrid({
                 className={`group relative rounded-lg border transition cursor-pointer overflow-hidden flex flex-col ${
                   w.active
                     ? 'border-cyan-500/40 bg-zinc-900/70 hover:border-cyan-400/70'
-                    : 'border-zinc-800/80 bg-zinc-900/30 hover:border-zinc-700'
+                    : w.leasedByOtherScan
+                      ? 'border-purple-500/30 bg-purple-950/15 hover:border-purple-400/50'
+                      : 'border-zinc-800/80 bg-zinc-900/30 hover:border-zinc-700'
                 }`}
               >
                 {/* Live Thumbnail Header */}
@@ -416,8 +591,15 @@ export function StudioParallelGrid({
                       className="w-full h-full object-cover"
                     />
                   ) : (
-                    <div className="text-[10px] text-zinc-600 font-mono">
-                      {w.workerId} · {w.profileDirName}
+                    <div className="text-[10px] text-zinc-600 font-mono text-center px-2">
+                      <div>
+                        {w.workerId} · {w.profileDirName}
+                      </div>
+                      {w.leasedByOtherScan && w.leasedByScanLabel && (
+                        <div className="text-[9px] text-purple-300 mt-0.5">
+                          Leased by {w.leasedByScanLabel}
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -440,7 +622,7 @@ export function StudioParallelGrid({
                         w.status,
                       )}`}
                     >
-                      {w.status}
+                      {w.leasedByOtherScan ? 'OTHER SCAN' : w.status}
                     </span>
                   </div>
 
@@ -482,8 +664,8 @@ export function StudioParallelGrid({
                     )}
                   </div>
 
-                  {/* Per-card controls when a window is assigned */}
-                  {w.windowId && (
+                  {/* Per-card controls when a window of THIS scan is assigned */}
+                  {w.windowId && !w.leasedByOtherScan && (
                     <div
                       className="pt-1.5 border-t border-zinc-800/80 flex items-center justify-end gap-1"
                       onClick={(e) => e.stopPropagation()}
@@ -548,7 +730,7 @@ export function StudioParallelGrid({
         </div>
       </div>
 
-      {/* All 18 Planned Windows Status Table / Cards */}
+      {/* Planned Windows Status Table / Cards */}
       {windows.length > 0 && (
         <div className="px-4 pb-4">
           <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400 mb-2 flex items-center justify-between">
@@ -556,7 +738,7 @@ export function StudioParallelGrid({
               Planned Movie Windows ({windows.length} Windows · Max 5:00 each · 5s seam overlap)
             </span>
             <span className="text-[10px] font-mono text-zinc-500">
-              Queue Priority: Largest contiguous runs (71–101, 25–42) pulled first
+              Queue Priority: Largest contiguous runs pulled first
             </span>
           </div>
 
@@ -587,7 +769,7 @@ export function StudioParallelGrid({
                         win.status,
                       )}`}
                     >
-                      {win.status}
+                      {win.status === 'WAITING_FOR_WORKER' ? 'WAITING FOR WORKER' : win.status}
                     </span>
                   </div>
 
@@ -614,6 +796,7 @@ export function StudioParallelGrid({
                     win.status === 'VALIDATING' ||
                     win.status === 'RETRYING' ||
                     win.status === '403_WAIT' ||
+                    win.status === 'WAITING_FOR_WORKER' ||
                     win.status === 'QUEUED') && (
                     <button
                       type="button"
@@ -759,6 +942,174 @@ export function StudioParallelGrid({
         </div>
       )}
 
+      {/* =====================================================================
+          KAAM 2: COMBINED LOG (ALL WORKERS) PANEL + SERVER-SIDE PDF DOWNLOAD
+          ===================================================================== */}
+      <div className="border-t border-zinc-800 bg-zinc-950 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Terminal className="w-4 h-4 text-cyan-400" />
+            <span className="text-xs font-semibold uppercase tracking-wider text-zinc-100">
+              Combined Log (all workers)
+            </span>
+            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-400">
+              Showing {filteredCombinedLogs.length} / {totalLogLinesOnDisk} persisted lines (JSONL)
+            </span>
+          </div>
+
+          {/* PDF Download Buttons */}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <button
+              type="button"
+              disabled={!scanId || downloadingPdfMode !== null}
+              onClick={() => void handleDownloadPdf('full')}
+              className="inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 border border-cyan-500/40 disabled:opacity-50"
+              title="Download full server-side PDF report (all workers, window summary, events, resources, full JSONL log, HISSA map)"
+            >
+              <FileDown className="w-3.5 h-3.5" />
+              {downloadingPdfMode === 'full' ? 'Generating PDF...' : 'Download PDF (full)'}
+            </button>
+
+            <button
+              type="button"
+              disabled={!scanId || downloadingPdfMode !== null}
+              onClick={() => void handleDownloadPdf('errors')}
+              className="inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 disabled:opacity-50"
+              title="Download server-side PDF report with only errors, retries, 403s, state changes & ±2 surrounding context lines"
+            >
+              <FileDown className="w-3.5 h-3.5" />
+              {downloadingPdfMode === 'errors' ? 'Generating PDF...' : 'Download PDF (errors only)'}
+            </button>
+          </div>
+        </div>
+
+        {/* Filters & Auto-scroll Bar */}
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-2.5 px-3 py-2 rounded-lg bg-zinc-900/70 border border-zinc-800/90 text-[11px]">
+          <div className="flex flex-wrap items-center gap-2.5">
+            <div className="flex items-center gap-1.5 text-zinc-400">
+              <Filter className="w-3.5 h-3.5 text-zinc-500" />
+              <span>Worker:</span>
+              <select
+                value={workerFilter}
+                onChange={(e) => setWorkerFilter(e.target.value)}
+                className="rounded bg-zinc-950 border border-zinc-800 px-2 py-0.5 font-mono text-[11px] text-zinc-200 focus:outline-none focus:border-cyan-500/50"
+              >
+                <option value="ALL">All Workers</option>
+                {workerFilterOptions.map((wId) => (
+                  <option key={wId} value={wId}>
+                    {wId}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex items-center gap-1.5 text-zinc-400">
+              <span>Level:</span>
+              <select
+                value={levelFilter}
+                disabled={onlyErrorsRetries403}
+                onChange={(e) => setLevelFilter(e.target.value)}
+                className="rounded bg-zinc-950 border border-zinc-800 px-2 py-0.5 font-mono text-[11px] text-zinc-200 disabled:opacity-40 focus:outline-none focus:border-cyan-500/50"
+              >
+                <option value="ALL">All Levels</option>
+                <option value="INFO">INFO</option>
+                <option value="SUCCESS">SUCCESS</option>
+                <option value="RETRY">RETRY</option>
+                <option value="403">403</option>
+                <option value="ERROR">ERROR</option>
+                <option value="STOPPED">STOPPED</option>
+              </select>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setOnlyErrorsRetries403((v) => !v)}
+              className={`px-2.5 py-0.5 rounded border font-mono text-[11px] transition ${
+                onlyErrorsRetries403
+                  ? 'border-amber-500/50 bg-amber-500/20 text-amber-200 font-semibold'
+                  : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              Sirf errors+retries+403 {onlyErrorsRetries403 ? '✓' : ''}
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setAutoScrollLogs((v) => !v)}
+              className={`px-2.5 py-0.5 rounded border font-mono text-[11px] transition ${
+                autoScrollLogs
+                  ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                  : 'border-zinc-800 bg-zinc-950 text-zinc-400'
+              }`}
+            >
+              Auto-scroll: {autoScrollLogs ? 'ON' : 'OFF'}
+            </button>
+          </div>
+        </div>
+
+        {/* Chronological Combined Log Stream (last ~2000 lines) */}
+        <div
+          ref={logContainerRef}
+          className="h-72 overflow-y-auto rounded-lg bg-black/80 border border-zinc-800 p-2.5 font-mono text-[11px] space-y-1"
+        >
+          {filteredCombinedLogs.length === 0 ? (
+            <div className="text-zinc-500 py-12 text-center">
+              {scanId
+                ? 'No combined worker logs recorded yet for this scan.'
+                : 'Select a scan to view its combined parallel worker logs.'}
+            </div>
+          ) : (
+            filteredCombinedLogs.map((entry: ParallelCombinedLogEntry) => (
+              <div
+                key={`${entry.seq}-${entry.t}`}
+                className="flex items-start gap-1.5 leading-snug hover:bg-zinc-900/50 px-1.5 py-0.5 rounded"
+              >
+                <span className="text-zinc-500 shrink-0">{formatHhMmSsMmm(entry.t)}</span>
+                <span className="text-zinc-400 shrink-0">{formatPlusMmSs(entry.elapsedSec)}</span>
+                <span className="px-1 rounded bg-cyan-950/60 border border-cyan-500/30 text-cyan-300 text-[10px] shrink-0">
+                  [{entry.workerId}]
+                </span>
+                {entry.windowNumber !== null ? (
+                  <span className="px-1 rounded bg-zinc-900 border border-zinc-700 text-zinc-300 text-[10px] shrink-0">
+                    #{entry.windowNumber} ({entry.windowRange})
+                  </span>
+                ) : (
+                  <span className="px-1 rounded bg-zinc-900/50 border border-zinc-800 text-zinc-500 text-[10px] shrink-0">
+                    [scan]
+                  </span>
+                )}
+                <span
+                  className={`px-1 rounded border text-[9px] font-bold shrink-0 ${logLevelBadgeStyle(
+                    entry.level,
+                  )}`}
+                >
+                  {entry.level}
+                </span>
+                <span
+                  className={`break-all ${
+                    entry.level === 'ERROR'
+                      ? 'text-red-300'
+                      : entry.level === '403'
+                        ? 'text-orange-300'
+                        : entry.level === 'RETRY'
+                          ? 'text-amber-200'
+                          : entry.level === 'SUCCESS'
+                            ? 'text-emerald-300'
+                            : entry.level === 'STOPPED'
+                              ? 'text-zinc-400'
+                              : 'text-zinc-200'
+                  }`}
+                >
+                  {entry.message}
+                </span>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
       {/* Modal for Worker Large Screenshot + [Wxx] Step Log (200 lines) */}
       {selectedWorker && (
         <div
@@ -770,7 +1121,7 @@ export function StudioParallelGrid({
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-4 py-3 border-b border-zinc-800 bg-zinc-900 flex items-center justify-between">
-              <div className="flex items-center gap-2.5">
+              <div className="flex items-center gap-2.5 flex-wrap">
                 <span className="px-2 py-0.5 rounded bg-cyan-500/20 border border-cyan-500/40 text-xs font-mono font-bold text-cyan-300">
                   {selectedWorker.workerId}
                 </span>

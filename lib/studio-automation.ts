@@ -115,6 +115,8 @@ export class StudioBrowserController {
   private activeAttempt = 0
   private activeMaxAttempts = 3
   private activePermRetry = 0
+  private scanContextTag = ''
+  private stepLogListener?: (entry: StudioStepLog) => void
   private jobLockBusy = false
   private jobLockQueue: Array<{
     scanId: string
@@ -125,6 +127,14 @@ export class StudioBrowserController {
   constructor(options?: StudioBrowserControllerOptions) {
     this.profileDirName = options?.profileDirName || STUDIO_CHROME_PROFILE_NAME
     this.workerTag = options?.workerTag || ''
+  }
+
+  public setScanContextTag(tag: string) {
+    this.scanContextTag = tag
+  }
+
+  public setStepLogListener(listener?: (entry: StudioStepLog) => void) {
+    this.stepLogListener = listener
   }
 
   public getActiveRunMeta() {
@@ -163,17 +173,24 @@ export class StudioBrowserController {
     detail?: string,
     level: 'info' | 'success' | 'warn' | 'error' = 'info',
   ) {
+    const fullTag = `${this.workerTag}${this.scanContextTag}`.trim()
     const prefixedStep =
-      this.workerTag && !step.startsWith(this.workerTag) ? `${this.workerTag} ${step}` : step
+      fullTag && !step.startsWith(this.workerTag || fullTag) ? `${fullTag} ${step}` : step
     this.currentStep = detail ? `${prefixedStep}: ${detail}` : prefixedStep
-    this.logs.push({
+    const entry: StudioStepLog = {
       t: Date.now(),
       step: prefixedStep,
       detail,
       level,
-    })
+    }
+    this.logs.push(entry)
     if (this.logs.length > 200) {
       this.logs.splice(0, this.logs.length - 200)
+    }
+    try {
+      this.stepLogListener?.(entry)
+    } catch {
+      /* ignore listener errors */
     }
   }
 

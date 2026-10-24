@@ -898,6 +898,10 @@ export interface Scan {
   /** Optional Google Drive file ID & name if the short was uploaded to Drive instead of YouTube */
   shortDriveFileId?: string | null
   shortDriveFileName?: string | null
+  /** Per-scan movie minute input list/ranges for Parallel Window Scan */
+  studioMinuteInput?: string | null
+  /** Per-scan parallel worker concurrency */
+  studioParallelConcurrency?: number | null
   /** Durable queue state; persisted so queued work can recover after restart. */
   background?: {
     state: 'queued' | 'running' | 'done' | 'stopped' | 'error'
