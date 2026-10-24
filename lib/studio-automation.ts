@@ -3920,7 +3920,7 @@ export class StudioBrowserController {
             const elapsedTag = elapsedSec !== undefined ? ` t=+${elapsedSec}s` : ''
             this.logStep(
               `attach_movie mem [${phaseLabel}]`,
-              `${jobLabel}${elapsedTag} · RAM=${ramPct}% · workerChromeRSS=${wStats.rssMb}MB (peak=${this.peakWorkerRssMb}MB, procs=${wStats.procs}) · /dev/shm=${shmMb}MB · movie=${movieSizeMbForAttach}MB`,
+              `${jobLabel}${elapsedTag} · RAM=${ramPct}% · workerChromeRSS=${wStats.rssMb}MB (peak=${this.peakWorkerRssMb}MB, procs=${wStats.procCount}) · /dev/shm=${shmMb}MB · movie=${movieSizeMbForAttach}MB`,
               ramPct >= 85 ? 'warn' : 'info',
             )
           }
@@ -4569,16 +4569,17 @@ export class StudioBrowserController {
           try {
             fs.appendFileSync(
               logFilePath,
-              `[${new Date().toISOString()}] [TARGET_CRASHED] stage=${currentStage} attempt=${attempt}/${MAX_ATTEMPTS} RAM=${ramAtCrashPct}% workerChromeRSS=${workerRssMb}MB(peak=${peakRssMb}MB,procs=${liveWStats.procs}) /dev/shm=${devShmMb}MB movieSize=${movieFileSizeMb}MB err=${msg}\n`,
+              `[${new Date().toISOString()}] [TARGET_CRASHED] stage=${currentStage} attempt=${attempt}/${MAX_ATTEMPTS} RAM=${ramAtCrashPct}% workerChromeRSS=${workerRssMb}MB(peak=${peakRssMb}MB,procs=${liveWStats.procCount}) /dev/shm=${devShmMb}MB movieSize=${movieFileSizeMb}MB err=${msg}\n`,
               'utf8',
             )
           } catch {
             /* ignore */
           }
           const last30Lines = readLastLinesFromFile(logFilePath, 30)
-          const tailFormatted =
-            last30Lines.length > 0 ? last30Lines.join(' ⏎ ') : '(no stderr lines captured)'
-          const crashDetail = `stage=${currentStage} · attempt=${attempt}/${MAX_ATTEMPTS} · RAM=${ramAtCrashPct}% · workerChromeRSS=${workerRssMb}MB (peak=${peakRssMb}MB, procs=${liveWStats.procs}) · /dev/shm=${devShmMb}MB · movieFile=${movieFileSizeMb}MB · log=${logFilePath} · err=${msg.slice(0, 120)} · ChromeLogLast30=[${tailFormatted}]`
+          const tailFormatted = last30Lines.trim().length > 0
+            ? last30Lines.split('\n').join(' ⏎ ')
+            : '(no stderr lines captured)'
+          const crashDetail = `stage=${currentStage} · attempt=${attempt}/${MAX_ATTEMPTS} · RAM=${ramAtCrashPct}% · workerChromeRSS=${workerRssMb}MB (peak=${peakRssMb}MB, procs=${liveWStats.procCount}) · /dev/shm=${devShmMb}MB · movieFile=${movieFileSizeMb}MB · log=${logFilePath} · err=${msg.slice(0, 120)} · ChromeLogLast30=[${tailFormatted}]`
 
           this.logStep(crashStep, crashDetail, 'error')
           onLog?.(
