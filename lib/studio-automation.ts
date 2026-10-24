@@ -90,6 +90,393 @@ export function readAutomationRamPercent(): number {
   return Math.round(((total - free) / total) * 100)
 }
 
+export function readDevShmUsedMb(): number {
+  try {
+    if (fs.existsSync('/dev/shm')) {
+      const st = fs.statfsSync('/dev/shm')
+      const usedBlocks = Math.max(0, Number(st.blocks) - Number(st.bfree))
+      const usedBytes = usedBlocks * Number(st.bsize)
+      return Math.round((usedBytes / (1024 * 1024)) * 10) / 10
+    }
+  } catch {
+    /* ignore */
+  }
+  return 0
+}
+
+export interface ChromeProcessInspection {
+  totalCount: number
+  perWorkerCount: Record<string, number>
+  perWorkerRssMb: Record<string, number>
+  pidsByProfileDir: Record<string, number[]>
+  allChromePids: number[]
+}
+
+export function inspectChromeProcesses(): ChromeProcessInspection {
+  const perWorkerCount: Record<string, number> = {}
+  const perWorkerRssMb: Record<string, number> = {}
+  const pidsByProfileDir: Record<string, number[]> = {}
+  const allChromePids: number[] = []
+  let totalCount = 0
+
+  try {
+    if (fs.existsSync('/proc')) {
+      const pids = fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d))
+      for (const pidStr of pids) {
+        const pid = Number(pidStr)
+        if (!Number.isFinite(pid) || pid <= 1 || pid === process.pid) continue
+        try {
+          const rawCmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8')
+          if (!rawCmd) continue
+          const cmd = rawCmd.replace(/\0/g, ' ')
+          // Match google-chrome / chromium processes (exclude pgrep/pkill/node)
+          if (!/google-chrome|chromium|chrome-linux|chrome\b/i.test(cmd)) continue
+          if (/^\s*(node|sh\s+-c|pkill|pgrep)\b/i.test(cmd)) continue
+
+          totalCount += 1
+          allChromePids.push(pid)
+
+          let rssKb = 0
+          try {
+            const statusTxt = fs.readFileSync(`/proc/${pid}/status`, 'utf8')
+            const m = statusTxt.match(/VmRSS:\s+(\d+)\s+kB/i)
+            if (m) rssKb = Number(m[1]) || 0
+          } catch {
+            /* ignore */
+          }
+          const rssMb = rssKb / 1024
+
+          const profMatch = cmd.match(/studio-chrome-profile(?:-w(\d+))?/i)
+          if (profMatch) {
+            const profName = profMatch[0]
+            if (!pidsByProfileDir[profName]) pidsByProfileDir[profName] = []
+            pidsByProfileDir[profName].push(pid)
+            const workerKey = profMatch[1]
+              ? `W${String(Number(profMatch[1])).padStart(2, '0')}`
+              : 'MAIN'
+            perWorkerCount[workerKey] = (perWorkerCount[workerKey] || 0) + 1
+            perWorkerRssMb[workerKey] = Math.round(((perWorkerRssMb[workerKey] || 0) + rssMb) * 10) / 10
+          }
+        } catch {
+          /* process exited */
+        }
+      }
+      return {
+        totalCount,
+        perWorkerCount,
+        perWorkerRssMb,
+        pidsByProfileDir,
+        allChromePids,
+      }
+    }
+  } catch {
+    /* fallback to ps below */
+  }
+
+  try {
+    const out = execFileSync('ps', ['-eo', 'pid,rss,args'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 1500,
+    })
+    for (const line of out.split('\n').slice(1)) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/)
+      if (!m) continue
+      const pid = Number(m[1])
+      const rssKb = Number(m[2]) || 0
+      const cmd = m[3] || ''
+      if (pid === process.pid) continue
+      if (!/google-chrome|chromium|chrome-linux|chrome\b/i.test(cmd)) continue
+      if (/^\s*(node|sh\s+-c|pkill|pgrep|ps)\b/i.test(cmd)) continue
+
+      totalCount += 1
+      allChromePids.push(pid)
+      const rssMb = rssKb / 1024
+      const profMatch = cmd.match(/studio-chrome-profile(?:-w(\d+))?/i)
+      if (profMatch) {
+        const profName = profMatch[0]
+        if (!pidsByProfileDir[profName]) pidsByProfileDir[profName] = []
+        pidsByProfileDir[profName].push(pid)
+        const workerKey = profMatch[1]
+          ? `W${String(Number(profMatch[1])).padStart(2, '0')}`
+          : 'MAIN'
+        perWorkerCount[workerKey] = (perWorkerCount[workerKey] || 0) + 1
+        perWorkerRssMb[workerKey] = Math.round(((perWorkerRssMb[workerKey] || 0) + rssMb) * 10) / 10
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  return {
+    totalCount,
+    perWorkerCount,
+    perWorkerRssMb,
+    pidsByProfileDir,
+    allChromePids,
+  }
+}
+
+export function getWorkerChromeStats(profileDirName: string): {
+  procCount: number
+  rssMb: number
+  pids: number[]
+} {
+  const snap = inspectChromeProcesses()
+  const profMatch = profileDirName.match(/studio-chrome-profile(?:-w(\d+))?/i)
+  const workerKey = profMatch
+    ? profMatch[1]
+      ? `W${String(Number(profMatch[1])).padStart(2, '0')}`
+      : 'MAIN'
+    : 'MAIN'
+  const pids = snap.pidsByProfileDir[profileDirName] || []
+  const procCount = snap.perWorkerCount[workerKey] ?? pids.length
+  const rssMb = snap.perWorkerRssMb[workerKey] ?? 0
+  return { procCount, rssMb, pids }
+}
+
+/**
+ * Cleanly terminate all Chrome processes matching `profileDirName` (--user-data-dir):
+ * Sends SIGTERM first, waits up to 3 seconds for processes to exit, then sends SIGKILL
+ * to any survivors and removes SingletonLock/SingletonCookie/SingletonSocket.
+ */
+export async function killWorkerChromeProcessesByProfileDir(
+  profileDirName: string,
+): Promise<{ sigtermCount: number; sigkillCount: number }> {
+  const profileDir = path.join(DATA_DIR, profileDirName)
+  const getMatchingPids = (): number[] => {
+    const snap = inspectChromeProcesses()
+    return snap.pidsByProfileDir[profileDirName] || []
+  }
+
+  let pids = getMatchingPids()
+  const sigtermCount = pids.length
+
+  if (pids.length > 0) {
+    for (const pid of pids) {
+      try {
+        process.kill(pid, 'SIGTERM')
+      } catch {
+        /* already exited */
+      }
+    }
+    try {
+      execFileSync('pkill', ['-TERM', '-f', profileDirName], { stdio: 'ignore' })
+    } catch {
+      /* ignore */
+    }
+
+    const waitDeadline = Date.now() + 3000
+    while (Date.now() < waitDeadline) {
+      pids = getMatchingPids()
+      if (pids.length === 0) break
+      await new Promise((r) => setTimeout(r, 200))
+    }
+  }
+
+  pids = getMatchingPids()
+  const sigkillCount = pids.length
+  if (pids.length > 0) {
+    for (const pid of pids) {
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {
+        /* already exited */
+      }
+    }
+    try {
+      execFileSync('pkill', ['-KILL', '-f', profileDirName], { stdio: 'ignore' })
+    } catch {
+      /* ignore */
+    }
+    await new Promise((r) => setTimeout(r, 200))
+  }
+
+  for (const lockName of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+    try {
+      fs.rmSync(path.join(profileDir, lockName), { force: true })
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return { sigtermCount, sigkillCount }
+}
+
+const globalForStartupChromeCleanup = globalThis as unknown as {
+  __cmtStartupChromeCleanedUp?: boolean
+}
+
+/**
+ * Requirement 1: On app start, kill all leftover google-chrome / chromium processes once.
+ */
+export function killAllLeftoverChromeProcessesOnceOnStartup(): void {
+  if (globalForStartupChromeCleanup.__cmtStartupChromeCleanedUp) return
+  globalForStartupChromeCleanup.__cmtStartupChromeCleanedUp = true
+
+  try {
+    const snap = inspectChromeProcesses()
+    if (snap.allChromePids.length > 0) {
+      for (const pid of snap.allChromePids) {
+        try {
+          process.kill(pid, 'SIGTERM')
+        } catch {
+          /* ignore */
+        }
+      }
+      try {
+        execFileSync('pkill', ['-TERM', '-f', 'google-chrome|chromium'], { stdio: 'ignore' })
+      } catch {
+        /* ignore */
+      }
+      // Brief synchronous wait up to 1.5s then SIGKILL any remaining orphan processes
+      const deadline = Date.now() + 1500
+      while (Date.now() < deadline) {
+        const check = inspectChromeProcesses()
+        if (check.allChromePids.length === 0) break
+        try {
+          execFileSync('sleep', ['0.2'], { stdio: 'ignore' })
+        } catch {
+          break
+        }
+      }
+      const survivors = inspectChromeProcesses().allChromePids
+      for (const pid of survivors) {
+        try {
+          process.kill(pid, 'SIGKILL')
+        } catch {
+          /* ignore */
+        }
+      }
+      try {
+        execFileSync('pkill', ['-KILL', '-f', 'google-chrome|chromium'], { stdio: 'ignore' })
+      } catch {
+        /* ignore */
+      }
+    }
+
+    // Clean stale SingletonLocks across all studio-chrome-profile* dirs
+    if (fs.existsSync(DATA_DIR)) {
+      for (const entry of fs.readdirSync(DATA_DIR)) {
+        if (entry.startsWith('studio-chrome-profile')) {
+          const dirPath = path.join(DATA_DIR, entry)
+          for (const lockName of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+            try {
+              fs.rmSync(path.join(dirPath, lockName), { force: true })
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    /* ignore startup cleanup errors */
+  }
+}
+
+// Run startup cleanup once when module is loaded
+killAllLeftoverChromeProcessesOnceOnStartup()
+
+function resolveChromeLogsRootDir(): string {
+  // Requirement 2: write to /data/chrome-logs/<scanId>/wNN-attemptN.log
+  const primary = path.join(DATA_DIR, 'chrome-logs')
+  try {
+    fs.mkdirSync(primary, { recursive: true })
+  } catch {
+    /* ignore */
+  }
+  if (path.resolve(DATA_DIR) !== '/data') {
+    try {
+      if (fs.existsSync('/data') || fs.existsSync('/')) {
+        if (!fs.existsSync('/data')) {
+          fs.mkdirSync('/data', { recursive: true })
+        }
+        if (!fs.existsSync('/data/chrome-logs')) {
+          try {
+            fs.symlinkSync(primary, '/data/chrome-logs', 'dir')
+          } catch {
+            fs.mkdirSync('/data/chrome-logs', { recursive: true })
+          }
+        }
+        if (fs.existsSync('/data/chrome-logs')) {
+          return '/data/chrome-logs'
+        }
+      }
+    } catch {
+      /* fallback to DATA_DIR/chrome-logs */
+    }
+  }
+  return primary
+}
+
+export function extractCleanScanIdForChromeLog(rawScanId: string | null | undefined): string {
+  const s = (rawScanId || '').trim()
+  if (!s) return 'default'
+  // parallel-<scanId>-win-<N> -> <scanId>
+  const m = s.match(/^parallel-([a-zA-Z0-9_-]+?)-win-\d+$/i)
+  if (m && m[1]) return m[1]
+  return s.replace(/[^a-zA-Z0-9._-]/g, '_')
+}
+
+export function resolveWorkerChromeLogFilePath(
+  rawScanId: string | null | undefined,
+  profileDirName: string,
+  attempt: number,
+): string {
+  const cleanScanId = extractCleanScanIdForChromeLog(rawScanId)
+  const profMatch = profileDirName.match(/studio-chrome-profile-w(\d+)/i)
+  const workerSlug = profMatch ? `w${String(Number(profMatch[1])).padStart(2, '0')}` : 'w00'
+  const safeAttempt = Math.max(1, Math.floor(attempt || 1))
+  const rootDir = resolveChromeLogsRootDir()
+  const scanLogDir = path.join(rootDir, cleanScanId)
+  try {
+    fs.mkdirSync(scanLogDir, { recursive: true })
+  } catch {
+    /* ignore */
+  }
+  return path.join(scanLogDir, `${workerSlug}-attempt${safeAttempt}.log`)
+}
+
+export function readLastLinesFromFile(filePath: string | null | undefined, maxLines = 30): string {
+  if (!filePath) return '(no chrome log path)'
+  try {
+    if (!fs.existsSync(filePath)) {
+      return `(chrome log file not found at ${filePath})`
+    }
+    const content = fs.readFileSync(filePath, 'utf8')
+    const lines = content
+      .split('\n')
+      .map((l) => l.trimEnd())
+      .filter((l) => l.trim().length > 0)
+    if (lines.length === 0) return '(chrome log file is empty)'
+    return lines.slice(-maxLines).join('\n')
+  } catch (err) {
+    return `(failed to read chrome log: ${(err as Error)?.message || String(err)})`
+  }
+}
+
+function ensureChromeStderrWrapperScript(): string | null {
+  const wrapperPath = path.join(os.tmpdir(), 'cmt-chrome-stderr-wrapper.sh')
+  try {
+    const script = [
+      '#!/bin/sh',
+      'if [ -n "$CMT_CHROME_LOG_FILE" ]; then',
+      '  mkdir -p "$(dirname "$CMT_CHROME_LOG_FILE")" 2>/dev/null || true',
+      '  exec "$CMT_REAL_CHROME_BIN" "$@" 2>>"$CMT_CHROME_LOG_FILE"',
+      'else',
+      '  exec "$CMT_REAL_CHROME_BIN" "$@"',
+      'fi',
+      '',
+    ].join('\n')
+    fs.writeFileSync(wrapperPath, script, { encoding: 'utf8', mode: 0o755 })
+    fs.chmodSync(wrapperPath, 0o755)
+    return wrapperPath
+  } catch {
+    return null
+  }
+}
+
 /**
  * Global Upload Gate across all workers/scans:
  * Ensures at most N workers (default 2) attach/upload video files to AI Studio concurrently
@@ -245,6 +632,9 @@ export class StudioBrowserController {
   private activeAttempt = 0
   private activeMaxAttempts = 3
   private activePermRetry = 0
+  private activeChromeLogPath: string | null = null
+  private lastSampledWorkerRssMb = 0
+  private peakWorkerRssMb = 0
   private scanContextTag = ''
   private stepLogListener?: (entry: StudioStepLog) => void
   private jobLockBusy = false
@@ -295,8 +685,8 @@ export class StudioBrowserController {
 
   /**
    * Immediately close a dead/crashed Playwright context, kill any zombie Chrome processes
-   * bound to this worker's profile directory, and clean SingletonLock files so the next
-   * `ensurePage` launches a fresh Chrome browser from the same worker profile.
+   * bound to this worker's profile directory (SIGTERM -> wait 3s -> SIGKILL), and clean
+   * SingletonLock files so the next `ensurePage` launches a fresh Chrome browser.
    */
   public async forceRestartDeadBrowser(): Promise<void> {
     this.pageCrashed = false
@@ -316,31 +706,27 @@ export class StudioBrowserController {
       }
     }
 
-    const profileDir = path.join(DATA_DIR, this.profileDirName)
-    try {
-      execFileSync('pkill', ['-9', '-f', profileDir], { stdio: 'ignore' })
-    } catch {
-      /* ignore if no lingering processes */
-    }
-    for (const lockName of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
-      try {
-        fs.rmSync(path.join(profileDir, lockName), { force: true })
-      } catch {
-        /* ignore */
-      }
-    }
+    await killWorkerChromeProcessesByProfileDir(this.profileDirName)
   }
 
+  /**
+   * Requirement 1: Close context AND ensure all processes for this worker's --user-data-dir
+   * are terminated via SIGTERM -> 3s -> SIGKILL.
+   */
   public async closeContext(): Promise<void> {
-    this.pageCrashed = false
-    if (this.context) {
-      try {
-        await this.context.close()
-      } catch {
-        /* ignore */
-      }
-      this.context = null
-      this.page = null
+    await this.forceRestartDeadBrowser()
+  }
+
+  public appendToWorkerChromeLog(line: string) {
+    const targetPath =
+      this.activeChromeLogPath ||
+      resolveWorkerChromeLogFilePath(this.scanId, this.profileDirName, this.activeAttempt || 1)
+    this.activeChromeLogPath = targetPath
+    try {
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true })
+      fs.appendFileSync(targetPath, `${line}\n`, 'utf8')
+    } catch {
+      /* ignore log write error */
     }
   }
 
@@ -546,6 +932,16 @@ export class StudioBrowserController {
   private attachPageLifecycleListeners(p: Page) {
     p.on('crash', () => {
       this.pageCrashed = true
+      const ramPct = readAutomationRamPercent()
+      const shmMb = readDevShmUsedMb()
+      const wStats = getWorkerChromeStats(this.profileDirName)
+      const effectiveRss = wStats.rssMb > 0 ? wStats.rssMb : this.lastSampledWorkerRssMb
+      if (wStats.rssMb > 0) {
+        this.lastSampledWorkerRssMb = wStats.rssMb
+        this.peakWorkerRssMb = Math.max(this.peakWorkerRssMb, wStats.rssMb)
+      }
+      const crashEvtLine = `[${new Date().toISOString()}] [page.on('crash')] profile=${this.profileDirName} step="${this.currentStep}" url="${p.url()}" RAM=${ramPct}% workerChromeRSS=${effectiveRss.toFixed(1)}MB (peak=${this.peakWorkerRssMb.toFixed(1)}MB, procs=${wStats.procCount}) /dev/shm=${shmMb.toFixed(1)}MB`
+      this.appendToWorkerChromeLog(crashEvtLine)
     })
     p.on('close', () => {
       if (this.page === p) {
@@ -582,28 +978,43 @@ export class StudioBrowserController {
 
     this.launching = (async () => {
       try {
+        // Ensure no lingering zombie Chrome processes exist for this profile before launching
+        await killWorkerChromeProcessesByProfileDir(this.profileDirName)
+
         const profileDir = path.join(DATA_DIR, this.profileDirName)
         if (!fs.existsSync(profileDir)) fs.mkdirSync(profileDir, { recursive: true })
 
-        // Clean up any stale SingletonLock/SingletonSocket broken symlinks from an unclean restart
-        for (const lockName of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
-          const lockFile = path.join(profileDir, lockName)
-          try {
-            fs.rmSync(lockFile, { force: true })
-          } catch {
-            /* ignore */
-          }
-        }
-
         const displayEnv = await this.ensureXvfbDisplay()
+        const userCfg = await loadStudioUserConfig(username)
+        const lowMemFlags = Boolean(userCfg.studioLowMemoryChromeFlags ?? false)
+        const disableDevShm =
+          userCfg.studioDisableDevShmUsage !== undefined
+            ? Boolean(userCfg.studioDisableDevShmUsage)
+            : true
+
+        const chromeLogPath = resolveWorkerChromeLogFilePath(
+          this.scanId,
+          this.profileDirName,
+          this.activeAttempt || 1,
+        )
+        this.activeChromeLogPath = chromeLogPath
+        this.appendToWorkerChromeLog(
+          `=== [${new Date().toISOString()}] Launching Chrome for ${this.profileDirName} (scan=${this.scanId || 'default'}, attempt=${this.activeAttempt || 1}, lowMemFlags=${lowMemFlags ? 'ON' : 'OFF'}, disableDevShm=${disableDevShm ? 'ON' : 'OFF'}) ===`,
+        )
 
         const baseArgs = [
           '--no-sandbox',
           '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-gpu',
-          '--disable-extensions',
-          '--disable-background-networking',
+          ...(disableDevShm ? ['--disable-dev-shm-usage'] : []),
+          ...(lowMemFlags
+            ? [
+                '--disable-gpu',
+                '--disable-extensions',
+                '--disable-background-networking',
+              ]
+            : []),
+          '--enable-logging=stderr',
+          '--v=0',
           '--disable-blink-features=AutomationControlled',
           '--disable-background-timer-throttling',
           '--disable-renderer-backgrounding',
@@ -619,40 +1030,71 @@ export class StudioBrowserController {
           '/usr/bin/chromium-browser',
         ].find((p) => fs.existsSync(p))
         const pwExecPath = chromium.executablePath()
+        const wrapperPath = ensureChromeStderrWrapperScript()
+
+        const flagsSummary = `lowMemFlags=${lowMemFlags ? 'ON' : 'OFF'} · devShm=${disableDevShm ? 'disabled' : 'enabled'} · log=${chromeLogPath}`
 
         this.logStep(
           'browser launching',
-          `Checking Chrome/Chromium (systemChrome=${sysChromePath || 'none'}, playwrightChromium=${pwExecPath}, DISPLAY=${displayEnv || 'none'}, profile=${this.profileDirName})`,
+          `Checking Chrome/Chromium (systemChrome=${sysChromePath || 'none'}, DISPLAY=${displayEnv || 'none'}, profile=${this.profileDirName}, ${flagsSummary})`,
         )
 
+        const launchEnvForBin = (realBin: string): Record<string, string> => {
+          const envCopy: Record<string, string> = {}
+          for (const [k, v] of Object.entries(process.env)) {
+            if (typeof v === 'string') envCopy[k] = v
+          }
+          envCopy.CMT_REAL_CHROME_BIN = realBin
+          envCopy.CMT_CHROME_LOG_FILE = chromeLogPath
+          envCopy.CHROME_LOG_FILE = chromeLogPath
+          return envCopy
+        }
+
         try {
-          this.context = await chromium.launchPersistentContext(profileDir, {
-            headless: false,
-            channel: 'chrome',
-            viewport: VIEWPORT,
-            args: baseArgs,
-          })
-          this.browserLaunchInfo = `channel=chrome · mode=headed · profile=${this.profileDirName} · path=${sysChromePath || 'system-chrome'} · display=${displayEnv}`
+          if (sysChromePath && wrapperPath) {
+            this.context = await chromium.launchPersistentContext(profileDir, {
+              headless: false,
+              executablePath: wrapperPath,
+              env: launchEnvForBin(sysChromePath),
+              viewport: VIEWPORT,
+              args: baseArgs,
+            })
+          } else {
+            this.context = await chromium.launchPersistentContext(profileDir, {
+              headless: false,
+              channel: 'chrome',
+              env: launchEnvForBin(sysChromePath || pwExecPath),
+              viewport: VIEWPORT,
+              args: baseArgs,
+            })
+          }
+          this.browserLaunchInfo = `channel=chrome · mode=headed · profile=${this.profileDirName} · path=${sysChromePath || 'system-chrome'} · display=${displayEnv} · ${flagsSummary}`
           this.logStep('browser launched', this.browserLaunchInfo, 'success')
         } catch (chromeErr) {
           const chromeErrMsg = chromeErr instanceof Error ? chromeErr.message.split('\n')[0].slice(0, 140) : String(chromeErr)
           try {
             this.context = await chromium.launchPersistentContext(profileDir, {
               headless: false,
+              ...(wrapperPath && pwExecPath
+                ? { executablePath: wrapperPath, env: launchEnvForBin(pwExecPath) }
+                : {}),
               viewport: VIEWPORT,
               args: baseArgs,
             })
-            this.browserLaunchInfo = `WARN: channel=chrome failed (${chromeErrMsg}); fallback=chromium · mode=headed · profile=${this.profileDirName} · path=${pwExecPath}`
+            this.browserLaunchInfo = `WARN: channel=chrome failed (${chromeErrMsg}); fallback=chromium · mode=headed · profile=${this.profileDirName} · path=${pwExecPath} · ${flagsSummary}`
             this.logStep('browser launched (fallback)', this.browserLaunchInfo, 'warn')
           } catch (headedErr) {
             const headedErrMsg =
               headedErr instanceof Error ? headedErr.message.split('\n')[0].slice(0, 140) : String(headedErr)
             this.context = await chromium.launchPersistentContext(profileDir, {
               headless: true,
+              ...(wrapperPath && pwExecPath
+                ? { executablePath: wrapperPath, env: launchEnvForBin(pwExecPath) }
+                : {}),
               viewport: VIEWPORT,
               args: baseArgs,
             })
-            this.browserLaunchInfo = `WARN: Headed launch failed [chrome: ${chromeErrMsg} | headed-chromium: ${headedErrMsg} | DISPLAY=${displayEnv || 'none'}]; fallback=chromium · mode=headless · profile=${this.profileDirName} · path=${pwExecPath}`
+            this.browserLaunchInfo = `WARN: Headed launch failed [chrome: ${chromeErrMsg} | headed-chromium: ${headedErrMsg} | DISPLAY=${displayEnv || 'none'}]; fallback=chromium · mode=headless · profile=${this.profileDirName} · path=${pwExecPath} · ${flagsSummary}`
             this.logStep('WARN [headless fallback]', this.browserLaunchInfo, 'warn')
           }
         }
@@ -3219,6 +3661,23 @@ export class StudioBrowserController {
       this.activeModelName = activeModelName
       this.activePermRetry = permissionDeniedRetries
       this.suppressDiagDumps = Boolean(parallelMode && attempt < MAX_ATTEMPTS)
+      this.activeChromeLogPath = resolveWorkerChromeLogFilePath(
+        scanId,
+        this.profileDirName,
+        attempt,
+      )
+      this.lastSampledWorkerRssMb = 0
+      this.peakWorkerRssMb = 0
+      try {
+        fs.mkdirSync(path.dirname(this.activeChromeLogPath), { recursive: true })
+        fs.appendFileSync(
+          this.activeChromeLogPath,
+          `\n=== [${new Date().toISOString()}] Worker=${this.workerTag || this.profileDirName} profile=${this.profileDirName} job=${jobLabel} attempt=${attempt}/${MAX_ATTEMPTS} ===\n`,
+          'utf8',
+        )
+      } catch {
+        /* ignore log header error */
+      }
       let currentStage = 'setup/ensure_page'
       await this.waitIfPausedOrThrowIfStopped(scope)
 
@@ -3438,15 +3897,58 @@ export class StudioBrowserController {
 
           await waitUntilRamSafeForAttach('attach_movie')
           currentStage = 'setup/attach_movie'
-          await this.attachVideoAndConfigureRange(page, {
-            label: 'movie',
-            driveFileName: movieDriveFileName,
-            localFilePath: movieLocalPath,
-            startSec: movieStartSec,
-            endSec: movieEndSec,
-            fps: 24,
-            scope,
-          })
+          const movieSizeMbForAttach = (() => {
+            try {
+              if (movieLocalPath && fs.existsSync(movieLocalPath)) {
+                return Number((fs.statSync(movieLocalPath).size / (1024 * 1024)).toFixed(1))
+              }
+            } catch {
+              /* ignore */
+            }
+            return 0
+          })()
+          const sampleAndLogAttachMovieMem = (phaseLabel: string, elapsedSec?: number) => {
+            const ramPct = readAutomationRamPercent()
+            const wStats = getWorkerChromeStats(this.profileDirName)
+            const shmMb = readDevShmUsedMb()
+            if (wStats.rssMb > 0) {
+              this.lastSampledWorkerRssMb = wStats.rssMb
+              if (wStats.rssMb > this.peakWorkerRssMb) {
+                this.peakWorkerRssMb = wStats.rssMb
+              }
+            }
+            const elapsedTag = elapsedSec !== undefined ? ` t=+${elapsedSec}s` : ''
+            this.logStep(
+              `attach_movie mem [${phaseLabel}]`,
+              `${jobLabel}${elapsedTag} · RAM=${ramPct}% · workerChromeRSS=${wStats.rssMb}MB (peak=${this.peakWorkerRssMb}MB, procs=${wStats.procs}) · /dev/shm=${shmMb}MB · movie=${movieSizeMbForAttach}MB`,
+              ramPct >= 85 ? 'warn' : 'info',
+            )
+          }
+          sampleAndLogAttachMovieMem('before')
+          const attachStartMs = Date.now()
+          const attachMemTimer = setInterval(() => {
+            try {
+              const elapsedSec = Math.round((Date.now() - attachStartMs) / 1000)
+              sampleAndLogAttachMovieMem('3s-tick', elapsedSec)
+            } catch {
+              /* ignore timer error */
+            }
+          }, 3000)
+          try {
+            await this.attachVideoAndConfigureRange(page, {
+              label: 'movie',
+              driveFileName: movieDriveFileName,
+              localFilePath: movieLocalPath,
+              startSec: movieStartSec,
+              endSec: movieEndSec,
+              fps: 24,
+              scope,
+            })
+          } finally {
+            clearInterval(attachMemTimer)
+            const totalElapsedSec = Math.round((Date.now() - attachStartMs) / 1000)
+            sampleAndLogAttachMovieMem('after', totalElapsedSec)
+          }
         } finally {
           if (releaseUploadGate) {
             releaseUploadGate()
@@ -4042,22 +4544,52 @@ export class StudioBrowserController {
         const backoffSec = 15
 
         if (isCrash) {
+          await new Promise((r) => setTimeout(r, 150))
           const workerLabel = this.workerTag.replace(/^\[|\]$/g, '') || 'W00'
           const crashStep = `ERROR [crash] ${workerLabel} Target crashed -> browser restart`
-          this.logStep(
-            crashStep,
-            `stage=${currentStage} · attempt=${attempt}/${MAX_ATTEMPTS} · ${msg.slice(0, 140)}`,
-            'error',
-          )
+          const ramAtCrashPct = readAutomationRamPercent()
+          const liveWStats = getWorkerChromeStats(this.profileDirName)
+          const workerRssMb =
+            liveWStats.rssMb > 0 ? liveWStats.rssMb : this.lastSampledWorkerRssMb
+          const peakRssMb = Math.max(workerRssMb, this.peakWorkerRssMb)
+          const devShmMb = readDevShmUsedMb()
+          let movieFileSizeMb = 0
+          try {
+            if (movieLocalPath && fs.existsSync(movieLocalPath)) {
+              movieFileSizeMb = Number(
+                (fs.statSync(movieLocalPath).size / (1024 * 1024)).toFixed(1),
+              )
+            }
+          } catch {
+            /* ignore */
+          }
+          const logFilePath =
+            this.activeChromeLogPath ||
+            resolveWorkerChromeLogFilePath(scanId, this.profileDirName, attempt)
+          try {
+            fs.appendFileSync(
+              logFilePath,
+              `[${new Date().toISOString()}] [TARGET_CRASHED] stage=${currentStage} attempt=${attempt}/${MAX_ATTEMPTS} RAM=${ramAtCrashPct}% workerChromeRSS=${workerRssMb}MB(peak=${peakRssMb}MB,procs=${liveWStats.procs}) /dev/shm=${devShmMb}MB movieSize=${movieFileSizeMb}MB err=${msg}\n`,
+              'utf8',
+            )
+          } catch {
+            /* ignore */
+          }
+          const last30Lines = readLastLinesFromFile(logFilePath, 30)
+          const tailFormatted =
+            last30Lines.length > 0 ? last30Lines.join(' ⏎ ') : '(no stderr lines captured)'
+          const crashDetail = `stage=${currentStage} · attempt=${attempt}/${MAX_ATTEMPTS} · RAM=${ramAtCrashPct}% · workerChromeRSS=${workerRssMb}MB (peak=${peakRssMb}MB, procs=${liveWStats.procs}) · /dev/shm=${devShmMb}MB · movieFile=${movieFileSizeMb}MB · log=${logFilePath} · err=${msg.slice(0, 120)} · ChromeLogLast30=[${tailFormatted}]`
+
+          this.logStep(crashStep, crashDetail, 'error')
           onLog?.(
             'error',
-            `${crashStep} (stage=${currentStage}, attempt=${attempt}/${MAX_ATTEMPTS}: ${msg.slice(0, 140)}) — restarting worker Chrome profile ${this.profileDirName} and retrying in ${backoffSec}s`,
+            `${crashStep} (${crashDetail}) — restarting worker Chrome profile ${this.profileDirName} and retrying in ${backoffSec}s`,
           )
           // Immediately close dead context and clean up crashed Chrome processes for this worker profile
           await this.forceRestartDeadBrowser()
 
           if (attempt >= MAX_ATTEMPTS) {
-            throw new Error(`${crashStep}: ${msg}`)
+            throw new Error(`${crashStep}: ${crashDetail}`)
           }
           this.logStep(
             `RETRY [runWindowJob] (${attempt}/${MAX_ATTEMPTS})`,

@@ -1031,7 +1031,11 @@ export function prepareStudioMovie360pAndDrive(
         }
       }
 
-      if (STUDIO_DIRECT_UPLOAD) {
+      const userCfgForDrive = await loadStudioUserConfig(owner).catch(() => null)
+      const directUploadOnly =
+        STUDIO_DIRECT_UPLOAD && !userCfgForDrive?.studioAttachMovieFromDrive
+
+      if (directUploadOnly) {
         const sReady = getScan(scanId)
         if (sReady) {
           sReady.movie360p = {
@@ -1051,7 +1055,7 @@ export function prepareStudioMovie360pAndDrive(
         return
       }
 
-      // Auto-upload movie_360p.mp4 to Google Drive folder "CMT" (only when STUDIO_DIRECT_UPLOAD is false)
+      // Auto-upload movie_360p.mp4 to Google Drive folder "CMT" (when STUDIO_DIRECT_UPLOAD is false or studioAttachMovieFromDrive is enabled)
       const driveTokens = await loadUserDriveTokens(owner)
       const safeMovieBase = (initialScan?.movieName || 'movie')
         .replace(/\.[^.]+$/, '')
@@ -1156,6 +1160,74 @@ export function prepareStudioMovie360pAndDrive(
   })()
 
   activeStudioMovieJobs.set(scanId, job)
+  return job
+}
+
+const activeDriveMovieUploadJobs = new Map<string, Promise<string | null>>()
+
+/**
+ * When "Attach movie from Google Drive" is enabled, ensure `movie_360p.mp4` is uploaded
+ * to the Google Drive "CMT" folder once per scan and return its `driveFileName`.
+ */
+export async function ensureStudioMovieUploadedToDriveIfNeeded(
+  scanId: string,
+  username = 'admin',
+): Promise<string | null> {
+  const existingScan = getScan(scanId)
+  if (existingScan?.movie360p?.driveFileName) {
+    return existingScan.movie360p.driveFileName
+  }
+  const inflightJob = activeDriveMovieUploadJobs.get(scanId)
+  if (inflightJob) return inflightJob
+
+  const job = (async (): Promise<string | null> => {
+    try {
+      const scan = getScan(scanId)
+      const out360pPath = path.join(scanMediaDir(scanId), 'movie_360p.mp4')
+      if (!fs.existsSync(out360pPath) || fs.statSync(out360pPath).size <= 0) {
+        return null
+      }
+      const owner = username || scan?.owner || 'admin'
+      const driveTokens = await loadUserDriveTokens(owner)
+      if (!driveTokens?.refresh_token) {
+        return null
+      }
+      const resolution = scan?.movie360p?.resolution || '360p'
+      const safeMovieBase = (scan?.movieName || 'movie')
+        .replace(/\.[^.]+$/, '')
+        .replace(/[^a-zA-Z0-9._-]+/g, '_')
+        .slice(0, 48)
+      const driveFileName = `cmt-${scanId}-${safeMovieBase}_${resolution}.mp4`
+      const uploaded = await uploadFileToDriveResumable({
+        username: owner,
+        localFilePath: out360pPath,
+        driveFileName,
+      })
+      const sDone = getScan(scanId)
+      if (sDone) {
+        sDone.movie360p = {
+          ...(sDone.movie360p || { status: 'ready', progress: 100 }),
+          driveFileId: uploaded.fileId,
+          driveFileName: uploaded.fileName,
+          driveUploadProgress: 100,
+          updatedAt: Date.now(),
+        }
+        addLog(
+          sDone,
+          'success',
+          `Uploaded ${uploaded.fileName} to Google Drive folder "CMT" for Drive attach (fileId: ${uploaded.fileId})`,
+        )
+        saveScan(sDone, { immediate: true })
+      }
+      return uploaded.fileName
+    } catch {
+      return null
+    } finally {
+      activeDriveMovieUploadJobs.delete(scanId)
+    }
+  })()
+
+  activeDriveMovieUploadJobs.set(scanId, job)
   return job
 }
 

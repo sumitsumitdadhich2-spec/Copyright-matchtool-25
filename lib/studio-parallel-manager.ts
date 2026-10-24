@@ -7,9 +7,14 @@ import { getScan, saveScan } from './store'
 import {
   StudioBrowserController,
   globalStudioUploadGate,
+  inspectChromeProcesses,
+  killAllLeftoverChromeProcessesOnceOnStartup,
+  killWorkerChromeProcessesByProfileDir,
+  readDevShmUsedMb,
   type StudioStepLog,
 } from './studio-automation'
 import {
+  ensureStudioMovieUploadedToDriveIfNeeded,
   ensureStudioShortReady,
   prepareStudioMovie360pAndDrive,
   verifyStudioMovie360pFile,
@@ -52,6 +57,7 @@ export interface ParallelCombinedLogEntry {
   seq: number
   t: number
   elapsedSec: number
+  runId?: string | null
   scanId: string
   scanName: string
   workerId: string // "W01".."W10" or "SYS"
@@ -66,13 +72,23 @@ export interface ParallelCombinedLogEntry {
 export interface ParallelResourceSnapshot {
   t: number
   elapsedSec: number
+  runId?: string | null
   ramUsedPercent: number
   freeDiskGb: number
+  devShmUsedMb?: number
   activeWorkers: number
   slotsInUse: number
   totalSlots: number
   chromeProcessCount: number
+  chromeProcsPerWorker?: Record<string, number>
+  chromeRssMbPerWorker?: Record<string, number>
   note?: string
+}
+
+export interface ParallelRunInfo {
+  runId: string
+  startedAt: number
+  finishedAt: number | null
 }
 
 export interface ParallelMediaVerificationInfo {
@@ -148,6 +164,8 @@ export interface ParallelWorkerCardSnapshot {
   summaryText: string | null
   screenshotBase64: string | null
   screenshotAt: number | null
+  chromeProcessCount?: number
+  chromeRssMb?: number
   logs: StudioStepLog[]
 }
 
@@ -162,6 +180,8 @@ export interface ParallelScanLiveSnapshot {
   scanId: string
   scanName: string
   username: string | null
+  currentRunId?: string | null
+  runHistory?: ParallelRunInfo[]
   minuteInput: string
   minuteInputSource: 'auto' | 'manual'
   foundMinutesInput: string
@@ -179,7 +199,10 @@ export interface ParallelScanLiveSnapshot {
   totalWindows: number
   ramUsedPercent: number
   freeDiskGb: number
+  devShmUsedMb?: number
   chromeProcessCount: number
+  chromeProcsPerWorker: Record<string, number>
+  chromeRssMbPerWorker?: Record<string, number>
   resourceWarning: string | null
   slotPool: ParallelSlotPoolSummary
   workers: ParallelWorkerCardSnapshot[]
@@ -195,6 +218,8 @@ interface PersistedParallelState {
   scanId: string
   scanName: string
   username: string
+  currentRunId?: string | null
+  runHistory?: ParallelRunInfo[]
   minuteInput: string
   minuteInputSource?: 'auto' | 'manual'
   concurrency: number
@@ -254,34 +279,33 @@ export function readFreeDiskGb(): number {
 }
 
 export function readChromeProcessCount(): number {
-  try {
-    if (fs.existsSync('/proc')) {
-      const pids = fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d))
-      let count = 0
-      for (const pid of pids) {
-        try {
-          const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8')
-          if (/chrome|chromium/i.test(cmdline)) {
-            count++
-          }
-        } catch {
-          /* process exited */
-        }
-      }
-      return count
-    }
-  } catch {
-    /* fallback to pgrep */
+  return inspectChromeProcesses().totalProcs
+}
+
+export function readChromeProcsPerWorker(maxWorkers = 10): {
+  totalProcs: number
+  perWorkerProcs: Record<string, number>
+  perWorkerRssMb: Record<string, number>
+} {
+  const info = inspectChromeProcesses()
+  const perWorkerProcs: Record<string, number> = {}
+  const perWorkerRssMb: Record<string, number> = {}
+  const count = Math.max(1, Math.min(20, maxWorkers))
+  for (let i = 1; i <= count; i++) {
+    const wId = `W${String(i).padStart(2, '0')}`
+    perWorkerProcs[wId] = info.perWorkerProcs[wId] || 0
+    perWorkerRssMb[wId] = info.perWorkerRssMb[wId] || 0
   }
-  try {
-    const out = execFileSync('pgrep', ['-c', '-f', 'chrome|chromium'], {
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 1500,
-    }).toString('utf8')
-    const n = parseInt(out.trim(), 10)
-    return Number.isFinite(n) ? n : 0
-  } catch {
-    return 0
+  for (const [wId, c] of Object.entries(info.perWorkerProcs)) {
+    if (c > 0 && !(wId in perWorkerProcs)) {
+      perWorkerProcs[wId] = c
+      perWorkerRssMb[wId] = info.perWorkerRssMb[wId] || 0
+    }
+  }
+  return {
+    totalProcs: info.totalProcs,
+    perWorkerProcs,
+    perWorkerRssMb,
   }
 }
 
@@ -676,6 +700,7 @@ class GlobalProfileSlotPool {
     if (scanId && slot.leasedByScanId && slot.leasedByScanId !== scanId) {
       return
     }
+    slot.controller.setPaused(false)
     slot.controller.setStepLogListener(undefined)
     slot.controller.setScanContextTag('')
     slot.leasedByScanId = null
@@ -686,12 +711,53 @@ class GlobalProfileSlotPool {
     slot.leasedAt = null
   }
 
+  public async closeAndReleaseSlot(slotIndex: number, scanId?: string): Promise<void> {
+    const slot = this.slots.get(slotIndex)
+    if (!slot) return
+    if (scanId && slot.leasedByScanId && slot.leasedByScanId !== scanId) {
+      return
+    }
+    slot.controller.setPaused(false)
+    slot.controller.setStepLogListener(undefined)
+    slot.controller.setScanContextTag('')
+    try {
+      await slot.controller.closeContext()
+    } catch {
+      await killWorkerChromeProcessesByProfileDir(slot.profileDirName).catch(() => {})
+    }
+    if (!scanId || !slot.leasedByScanId || slot.leasedByScanId === scanId) {
+      slot.leasedByScanId = null
+      slot.leasedByScanLabel = null
+      slot.leasedWindowId = null
+      slot.leasedWindowNumber = null
+      slot.leasedWindowRange = null
+      slot.leasedAt = null
+    }
+  }
+
   public releaseAllSlotsForScan(scanId: string) {
     for (const slot of this.slots.values()) {
       if (slot.leasedByScanId === scanId) {
         this.releaseSlot(slot.slotIndex, scanId)
       }
     }
+  }
+
+  public async closeAndReleaseAllSlotsForScan(scanId: string): Promise<void> {
+    const closePromises: Promise<void>[] = []
+    for (const slot of this.slots.values()) {
+      if (slot.leasedByScanId === scanId) {
+        closePromises.push(this.closeAndReleaseSlot(slot.slotIndex, scanId))
+      } else if (slot.leasedByScanId === null) {
+        // Also ensure any unleased slot has 0 leftover zombie Chrome processes
+        closePromises.push(
+          slot.controller.closeContext().catch(() => {
+            return killWorkerChromeProcessesByProfileDir(slot.profileDirName).then(() => {})
+          }),
+        )
+      }
+    }
+    await Promise.allSettled(closePromises)
   }
 
   public getLeasedSlotsForScan(scanId: string): ProfileSlotEntry[] {
@@ -772,6 +838,8 @@ export class StudioParallelManager {
   private mediaInfo: ParallelMediaVerificationInfo | null = null
   private stoppedWindowIds = new Set<string>()
   private username: string | null = null
+  private currentRunId: string | null = null
+  private runHistory: ParallelRunInfo[] = []
   private minuteInput: string = ''
   private minuteInputSource: 'auto' | 'manual' = 'auto'
   private foundMinutesInput: string = ''
@@ -798,11 +866,20 @@ export class StudioParallelManager {
   private onLogCallback?: (level: 'info' | 'warn' | 'error' | 'success', msg: string) => void
 
   constructor(scanId: string) {
+    killAllLeftoverChromeProcessesOnceOnStartup()
     this.scanId = scanId || 'default'
     this.scanName = resolveScanDisplayLabel(this.scanId)
     this.migrateStaleScanStateOnce()
     this.tryRestorePersistedState()
     this.tryLoadCombinedLogsFromDisk()
+  }
+
+  public getCurrentRunId(): string | null {
+    return this.currentRunId
+  }
+
+  public getRunHistory(): ParallelRunInfo[] {
+    return this.runHistory
   }
 
   public getScanDir(): string {
@@ -1019,6 +1096,8 @@ export class StudioParallelManager {
       if (raw && Array.isArray(raw.windows) && raw.windows.length > 0) {
         this.username = raw.username || 'admin'
         this.scanName = raw.scanName || resolveScanDisplayLabel(this.scanId)
+        this.currentRunId = raw.currentRunId ?? null
+        this.runHistory = Array.isArray(raw.runHistory) ? raw.runHistory : []
         this.minuteInputSource = raw.minuteInputSource === 'manual' ? 'manual' : 'auto'
         this.minuteInput =
           raw.minuteInput && raw.minuteInput.trim() !== DEFAULT_STUDIO_MINUTE_INPUT
@@ -1209,6 +1288,7 @@ export class StudioParallelManager {
       seq: this.nextLogSeq++,
       t: now,
       elapsedSec,
+      runId: this.currentRunId ?? null,
       scanId: this.scanId,
       scanName: this.scanName,
       workerId: params.workerId || 'SYS',
@@ -1256,15 +1336,20 @@ export class StudioParallelManager {
 
     const slotSummary = globalProfileSlotPool.getSummary(this.maxTotalPoolSlots)
     const activeForThisScan = globalProfileSlotPool.getLeasedSlotsForScan(this.scanId).length
+    const chromeStats = readChromeProcsPerWorker(Math.max(this.concurrency, slotSummary.totalSlots))
     const snap: ParallelResourceSnapshot = {
       t: now,
       elapsedSec: this.startedAt ? Math.max(0, Math.round((now - this.startedAt) / 1000)) : 0,
+      runId: this.currentRunId ?? null,
       ramUsedPercent: readSystemRamUsedPercent(),
       freeDiskGb: readFreeDiskGb(),
+      devShmUsedMb: readDevShmUsedMb(),
       activeWorkers: activeForThisScan,
       slotsInUse: slotSummary.inUseSlots,
       totalSlots: slotSummary.totalSlots,
-      chromeProcessCount: readChromeProcessCount(),
+      chromeProcessCount: chromeStats.totalProcs,
+      chromeProcsPerWorker: chromeStats.perWorkerProcs,
+      chromeRssMbPerWorker: chromeStats.perWorkerRssMb,
       ...(note ? { note } : {}),
     }
     this.resourceSnapshots.push(snap)
@@ -1298,6 +1383,8 @@ export class StudioParallelManager {
         scanId: this.scanId,
         scanName: this.scanName,
         username: this.username || 'admin',
+        currentRunId: this.currentRunId,
+        runHistory: this.runHistory,
         minuteInput: this.minuteInput,
         minuteInputSource: this.minuteInputSource,
         concurrency: this.concurrency,
@@ -1749,8 +1836,20 @@ export class StudioParallelManager {
             w.error = null
           }
         }
-        if (!this.startedAt) this.startedAt = Date.now()
+        this.startedAt = Date.now()
         this.finishedAt = null
+      }
+
+      // Generate a fresh runId on every Start so PDF exports default to the latest run only
+      const newRunId = `run-${Date.now()}`
+      this.currentRunId = newRunId
+      this.runHistory.push({
+        runId: newRunId,
+        startedAt: this.startedAt || Date.now(),
+        finishedAt: null,
+      })
+      if (this.runHistory.length > 50) {
+        this.runHistory.splice(0, this.runHistory.length - 50)
       }
 
       // 1. Pre-check short media & check whether movie_360p.mp4 is already verified
@@ -1787,7 +1886,10 @@ export class StudioParallelManager {
           this.shortDurationSec = verifiedMedia.shortDurationSec
         }
         this.movieLocalPath = verifiedMedia.movie360Path
-        this.movieDriveFileName = null
+        const latestScanForDrive = getScan(this.scanId)
+        this.movieDriveFileName = cfg.studioAttachMovieFromDrive
+          ? (latestScanForDrive?.movie360p?.driveFileName ?? null)
+          : null
         if (verifiedMedia.movie360DurationSec && verifiedMedia.movie360DurationSec > 0) {
           this.movieDurationSec = verifiedMedia.movie360DurationSec
         }
@@ -1813,7 +1915,7 @@ export class StudioParallelManager {
         this.stoppingAll = false
         this.waitingForWorkerSlots = false
         this.stoppedWindowIds.clear()
-        this.recordResourceSnapshotIfNeeded(true, 'Parallel scan started')
+        this.recordResourceSnapshotIfNeeded(true, `Parallel scan started (${newRunId})`)
         this.startResourceSnapshotTimer()
         this.persistStateToDisk()
 
@@ -1821,14 +1923,14 @@ export class StudioParallelManager {
           workerId: 'SYS',
           level: 'INFO',
           step: 'media verified',
-          message: `scanId=${this.scanId} | short=${verifiedMedia.shortPath} (${shortSizeMb} MB, ${(verifiedMedia.shortDurationSec || 0).toFixed(1)}s) | movie_360p=${verifiedMedia.movie360Path} (${movieSizeMb} MB, ${(verifiedMedia.movie360DurationSec || 0).toFixed(1)}s)`,
+          message: `runId=${newRunId} | scanId=${this.scanId} | short=${verifiedMedia.shortPath} (${shortSizeMb} MB, ${(verifiedMedia.shortDurationSec || 0).toFixed(1)}s) | movie_360p=${verifiedMedia.movie360Path} (${movieSizeMb} MB, ${(verifiedMedia.movie360DurationSec || 0).toFixed(1)}s)`,
         })
 
         this.appendCombinedLog({
           workerId: 'SYS',
           level: 'INFO',
           step: 'parallel scan start',
-          message: `Started Parallel Window Scan for ${this.scanName} (${this.windows.length} windows, scan concurrency=${this.concurrency}, global pool max=${this.maxTotalPoolSlots}, uploadGate=${uploadGateLimit}, minutes="${this.minuteInput}")`,
+          message: `Started Parallel Window Scan (${newRunId}) for ${this.scanName} (${this.windows.length} windows, scan concurrency=${this.concurrency}, global pool max=${this.maxTotalPoolSlots}, uploadGate=${uploadGateLimit}, lowMemFlags=${Boolean(cfg.studioLowMemoryChromeFlags)}, disableDevShm=${cfg.studioDisableDevShmUsage !== false}, attachDrive=${Boolean(cfg.studioAttachMovieFromDrive)}, minutes="${this.minuteInput}")`,
         })
 
         this.runWorkerPoolLoop().catch((err) => {
@@ -1994,21 +2096,42 @@ export class StudioParallelManager {
 
     await Promise.allSettled(workerPromises)
     this.stopResourceSnapshotTimer()
-    globalProfileSlotPool.releaseAllSlotsForScan(this.scanId)
+    await globalProfileSlotPool.closeAndReleaseAllSlotsForScan(this.scanId)
+    // If no other scan is actively leasing slots, ensure all w01..w20 profiles have 0 leftover Chrome processes
+    if (globalProfileSlotPool.getSummary(this.maxTotalPoolSlots).inUseSlots === 0) {
+      const info = inspectChromeProcesses()
+      if (info.totalProcs > 0) {
+        const cleanupPromises: Promise<unknown>[] = []
+        for (const wKey of Object.keys(info.perWorkerProcs)) {
+          if ((info.perWorkerProcs[wKey] || 0) > 0) {
+            const num = wKey.replace(/^W/i, '').padStart(2, '0')
+            cleanupPromises.push(
+              killWorkerChromeProcessesByProfileDir(`${BASE_PROFILE_NAME}-w${num}`),
+            )
+          }
+        }
+        await Promise.allSettled(cleanupPromises)
+      }
+    }
     this.active = false
     this.starting = false
     this.waitingForWorkerSlots = false
     this.finishedAt = Date.now()
+    if (this.currentRunId) {
+      const rEntry = this.runHistory.find((r) => r.runId === this.currentRunId)
+      if (rEntry) rEntry.finishedAt = this.finishedAt
+    }
     this.recordResourceSnapshotIfNeeded(true, 'Parallel scan finished')
     this.persistStateToDisk()
 
     const doneCount = this.windows.filter((w) => w.status === 'DONE').length
     const failedCount = this.windows.filter((w) => w.status === 'FAILED').length
+    const finalChromeStats = readChromeProcsPerWorker(this.concurrency)
     this.appendCombinedLog({
       workerId: 'SYS',
       level: failedCount > 0 ? 'ERROR' : 'SUCCESS',
       step: 'parallel scan finished',
-      message: `Parallel Window Scan finished for ${this.scanName}: ${doneCount}/${this.windows.length} DONE, ${failedCount} FAILED`,
+      message: `Parallel Window Scan finished for ${this.scanName} (runId=${this.currentRunId || 'n/a'}): ${doneCount}/${this.windows.length} DONE, ${failedCount} FAILED, chromeProcs=${finalChromeStats.totalProcs}`,
     })
   }
 
@@ -2210,7 +2333,7 @@ export class StudioParallelManager {
           break
         }
       } finally {
-        globalProfileSlotPool.releaseSlot(leasedSlot.slotIndex, this.scanId)
+        await globalProfileSlotPool.closeAndReleaseSlot(leasedSlot.slotIndex, this.scanId)
       }
     }
   }
@@ -2261,6 +2384,49 @@ export class StudioParallelManager {
     const cfg = await loadStudioUserConfig(this.username || 'admin')
     const jobLabel = `[${this.scanName}] Window #${win.windowNumber} (${windowRangeStr})`
 
+    let effectiveMovieDriveFileName: string | null = null
+    if (cfg.studioAttachMovieFromDrive) {
+      effectiveMovieDriveFileName =
+        this.movieDriveFileName || getScan(this.scanId)?.movie360p?.driveFileName || null
+      if (!effectiveMovieDriveFileName) {
+        this.appendCombinedLog({
+          workerId,
+          windowId: win.id,
+          windowNumber: win.windowNumber,
+          windowRange: windowRangeStr,
+          level: 'INFO',
+          step: 'uploading movie to Drive',
+          message: `Attach movie from Google Drive is ON -> ensuring movie_360p.mp4 is uploaded to Drive folder "CMT"...`,
+        })
+        effectiveMovieDriveFileName = await ensureStudioMovieUploadedToDriveIfNeeded(
+          this.scanId,
+          this.username || 'admin',
+        )
+        if (effectiveMovieDriveFileName) {
+          this.movieDriveFileName = effectiveMovieDriveFileName
+          this.appendCombinedLog({
+            workerId,
+            windowId: win.id,
+            windowNumber: win.windowNumber,
+            windowRange: windowRangeStr,
+            level: 'INFO',
+            step: 'drive movie ready',
+            message: `Using Google Drive movie file "${effectiveMovieDriveFileName}" for AI Studio attachment`,
+          })
+        } else {
+          this.appendCombinedLog({
+            workerId,
+            windowId: win.id,
+            windowNumber: win.windowNumber,
+            windowRange: windowRangeStr,
+            level: 'INFO',
+            step: 'drive movie fallback',
+            message: `Google Drive movie unavailable (not connected or upload failed) -> falling back to local movie_360p.mp4`,
+          })
+        }
+      }
+    }
+
     try {
       const result = await ctrl.runWindowJob({
         username: this.username || 'admin',
@@ -2275,7 +2441,7 @@ export class StudioParallelManager {
         shortLocalPath: this.shortLocalPath,
         shortStartSec: 0,
         shortEndSec: this.shortDurationSec,
-        movieDriveFileName: null,
+        movieDriveFileName: effectiveMovieDriveFileName,
         movieLocalPath: this.movieLocalPath,
         movieStartSec: win.startSec,
         movieEndSec: win.endSec,
@@ -2423,6 +2589,9 @@ export class StudioParallelManager {
     } finally {
       ctrl.setStepLogListener(undefined)
       ctrl.setScanContextTag('')
+      // Ensure this worker's Chrome is completely closed and any leftover processes are killed on DONE/FAILED/STOPPED
+      await ctrl.closeContext().catch(() => {})
+      this.recordResourceSnapshotIfNeeded(true, `Worker ${workerId} Chrome closed (${win.status})`)
     }
   }
 
@@ -2461,17 +2630,21 @@ export class StudioParallelManager {
     this.compressing360p = null
     this.stopResourceSnapshotTimer()
 
-    // Only stop slots leased by THIS scan! Never touch slots leased by other scans.
+    // Only stop slots leased by THIS scan! Unpause first ("Pause se stop") and kill worker Chrome processes.
     const leased = globalProfileSlotPool.getLeasedSlotsForScan(this.scanId)
     for (const slot of leased) {
+      slot.controller.setPaused(false)
       if (slot.leasedWindowId) {
         const jobScanScope = `parallel-${this.scanId}-${slot.leasedWindowId}`
         slot.controller.requestStop({ scanId: jobScanScope })
-      }
-      if (!slot.controller.getActiveScanId()) {
-        globalProfileSlotPool.releaseSlot(slot.slotIndex, this.scanId)
+      } else {
+        slot.controller.requestStop()
       }
     }
+    void globalProfileSlotPool.closeAndReleaseAllSlotsForScan(this.scanId).then(() => {
+      this.recordResourceSnapshotIfNeeded(true, 'Stopped by user (worker Chrome processes closed)')
+      this.persistStateToDisk()
+    })
 
     for (const w of this.windows) {
       if (
@@ -2490,6 +2663,10 @@ export class StudioParallelManager {
     this.active = false
     this.starting = false
     this.finishedAt = Date.now()
+    if (this.currentRunId) {
+      const rEntry = this.runHistory.find((r) => r.runId === this.currentRunId)
+      if (rEntry) rEntry.finishedAt = this.finishedAt
+    }
     this.persistStateToDisk()
 
     this.appendCombinedLog({
@@ -2532,7 +2709,9 @@ export class StudioParallelManager {
     const leased = globalProfileSlotPool.getLeasedSlotsForScan(this.scanId)
     for (const slot of leased) {
       if (slot.leasedWindowId === windowId) {
+        slot.controller.setPaused(false)
         slot.controller.requestStop({ scanId: jobScanScope })
+        void slot.controller.closeContext().catch(() => {})
       }
     }
   }
@@ -2571,7 +2750,9 @@ export class StudioParallelManager {
       const leased = globalProfileSlotPool.getLeasedSlotsForScan(this.scanId)
       for (const slot of leased) {
         if (slot.leasedWindowId === windowId) {
+          slot.controller.setPaused(false)
           slot.controller.requestStop({ scanId: jobScanScope })
+          void slot.controller.closeContext().catch(() => {})
         }
       }
     }
@@ -2673,6 +2854,7 @@ export class StudioParallelManager {
 
     const workerCards: ParallelWorkerCardSnapshot[] = []
     const totalCards = Math.max(this.concurrency, slotPool.totalSlots || DEFAULT_STUDIO_CONCURRENCY)
+    const chromeStats = readChromeProcsPerWorker(totalCards)
 
     for (let i = 1; i <= totalCards; i++) {
       const slot = globalProfileSlotPool.getOrCreateSlot(i)
@@ -2683,6 +2865,8 @@ export class StudioParallelManager {
         isLeasedByThisScan && slot.leasedWindowId
           ? this.windows.find((w) => w.id === slot.leasedWindowId) || null
           : null
+      const wProcs = chromeStats.perWorkerProcs[slot.workerId] || 0
+      const wRssMb = chromeStats.perWorkerRssMb[slot.workerId] || 0
 
       if (isLeasedByThisScan) {
         const snap = await slot.controller.getSnapshot(
@@ -2719,6 +2903,8 @@ export class StudioParallelManager {
           summaryText: activeWin?.summaryText ?? null,
           screenshotBase64: snap.screenshotBase64,
           screenshotAt: snap.screenshotAt,
+          chromeProcessCount: wProcs,
+          chromeRssMb: wRssMb,
           logs: slot.controller.getLogs(200),
         })
       } else if (isLeasedByOtherScan) {
@@ -2746,6 +2932,8 @@ export class StudioParallelManager {
           summaryText: `Busy (${slot.leasedByScanLabel || slot.leasedByScanId})`,
           screenshotBase64: null,
           screenshotAt: null,
+          chromeProcessCount: wProcs,
+          chromeRssMb: wRssMb,
           logs: [],
         })
       } else {
@@ -2772,6 +2960,8 @@ export class StudioParallelManager {
           summaryText: null,
           screenshotBase64: null,
           screenshotAt: null,
+          chromeProcessCount: wProcs,
+          chromeRssMb: wRssMb,
           logs: [],
         })
       }
@@ -2829,6 +3019,8 @@ export class StudioParallelManager {
       scanId: this.scanId,
       scanName: this.scanName,
       username: this.username,
+      currentRunId: this.currentRunId,
+      runHistory: this.runHistory,
       minuteInput: this.minuteInput,
       minuteInputSource: this.minuteInputSource,
       foundMinutesInput: this.foundMinutesInput,
@@ -2846,7 +3038,10 @@ export class StudioParallelManager {
       totalWindows: this.windows.length,
       ramUsedPercent: readSystemRamUsedPercent(),
       freeDiskGb: readFreeDiskGb(),
-      chromeProcessCount: readChromeProcessCount(),
+      devShmUsedMb: readDevShmUsedMb(),
+      chromeProcessCount: chromeStats.totalProcs,
+      chromeProcsPerWorker: chromeStats.perWorkerProcs,
+      chromeRssMbPerWorker: chromeStats.perWorkerRssMb,
       resourceWarning: this.resourceWarning,
       slotPool,
       workers: workerCards,

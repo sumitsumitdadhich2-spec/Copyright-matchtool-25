@@ -37,6 +37,12 @@ export interface StudioUserConfig {
   studioMinuteInput?: string
   /** Measured token rate (tokens/sec at 24 FPS) from Test Clip */
   studioMeasuredTokenRate?: number | null
+  /** A/B Toggle: Low-memory Chrome flags (--disable-gpu, --disable-extensions, --disable-background-networking) (default false / OFF) */
+  studioLowMemoryChromeFlags?: boolean
+  /** A/B Toggle: --disable-dev-shm-usage flag for Chrome (default true / ON) */
+  studioDisableDevShmUsage?: boolean
+  /** Attach movie_360p from Google Drive Picker instead of uploading 378 MB locally in browser (default false / OFF) */
+  studioAttachMovieFromDrive?: boolean
   updatedAt: number
 }
 
@@ -55,6 +61,9 @@ export interface PublicStudioSettings {
   studioUploadGateConcurrency: number
   studioMinuteInput: string
   studioMeasuredTokenRate: number | null
+  studioLowMemoryChromeFlags: boolean
+  studioDisableDevShmUsage: boolean
+  studioAttachMovieFromDrive: boolean
   hasCookies: boolean
   cookieCount: number
   lastLoginEmail: string | null
@@ -126,6 +135,9 @@ const DEFAULT_STUDIO_CONFIG: StudioUserConfig = {
   studioUploadGateConcurrency: DEFAULT_STUDIO_UPLOAD_GATE,
   studioMinuteInput: DEFAULT_STUDIO_MINUTE_INPUT,
   studioMeasuredTokenRate: null,
+  studioLowMemoryChromeFlags: false,
+  studioDisableDevShmUsage: true,
+  studioAttachMovieFromDrive: false,
   lastLoginStatus: 'untested',
   updatedAt: 0,
 }
@@ -219,6 +231,10 @@ export async function loadStudioUserConfig(username: string): Promise<StudioUser
       raw.studioMeasuredTokenRate < 5000
         ? Math.round(raw.studioMeasuredTokenRate * 10) / 10
         : null,
+    studioLowMemoryChromeFlags: Boolean(raw?.studioLowMemoryChromeFlags ?? false),
+    studioDisableDevShmUsage:
+      raw?.studioDisableDevShmUsage !== undefined ? Boolean(raw.studioDisableDevShmUsage) : true,
+    studioAttachMovieFromDrive: Boolean(raw?.studioAttachMovieFromDrive ?? false),
   }
 }
 
@@ -402,6 +418,10 @@ export async function getPublicStudioSettings(username: string): Promise<PublicS
     studioUploadGateConcurrency: cfg.studioUploadGateConcurrency ?? DEFAULT_STUDIO_UPLOAD_GATE,
     studioMinuteInput: cfg.studioMinuteInput || DEFAULT_STUDIO_MINUTE_INPUT,
     studioMeasuredTokenRate: cfg.studioMeasuredTokenRate ?? null,
+    studioLowMemoryChromeFlags: Boolean(cfg.studioLowMemoryChromeFlags ?? false),
+    studioDisableDevShmUsage:
+      cfg.studioDisableDevShmUsage !== undefined ? Boolean(cfg.studioDisableDevShmUsage) : true,
+    studioAttachMovieFromDrive: Boolean(cfg.studioAttachMovieFromDrive ?? false),
     hasCookies: cookieCount > 0,
     cookieCount,
     lastLoginEmail: cfg.lastLoginEmail ?? null,

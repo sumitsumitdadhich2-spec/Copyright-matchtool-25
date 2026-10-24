@@ -36,6 +36,15 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
   const [offsetMode, setOffsetMode] = useState<'auto' | 'relative' | 'absolute'>(
     studio?.studioOffsetMode ?? 'auto',
   )
+  const [lowMemoryChromeFlags, setLowMemoryChromeFlags] = useState<boolean>(
+    studio?.studioLowMemoryChromeFlags ?? false,
+  )
+  const [disableDevShmUsage, setDisableDevShmUsage] = useState<boolean>(
+    studio?.studioDisableDevShmUsage ?? true,
+  )
+  const [attachMovieFromDrive, setAttachMovieFromDrive] = useState<boolean>(
+    studio?.studioAttachMovieFromDrive ?? false,
+  )
 
   const [cookieText, setCookieText] = useState('')
   const [savingCookies, setSavingCookies] = useState(false)
@@ -62,6 +71,11 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
     setShortPartMinutes(studio.studioShortPartMinutes)
     setWindowOverlapSec(studio.studioWindowOverlapSec)
     setOffsetMode(studio.studioOffsetMode)
+    setLowMemoryChromeFlags(Boolean(studio.studioLowMemoryChromeFlags ?? false))
+    setDisableDevShmUsage(
+      studio.studioDisableDevShmUsage !== undefined ? Boolean(studio.studioDisableDevShmUsage) : true,
+    )
+    setAttachMovieFromDrive(Boolean(studio.studioAttachMovieFromDrive ?? false))
   }, [
     studio?.chunkScanEngine,
     studio?.studioModelName,
@@ -72,6 +86,9 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
     studio?.studioShortPartMinutes,
     studio?.studioWindowOverlapSec,
     studio?.studioOffsetMode,
+    studio?.studioLowMemoryChromeFlags,
+    studio?.studioDisableDevShmUsage,
+    studio?.studioAttachMovieFromDrive,
   ])
 
   useEffect(() => {
@@ -125,6 +142,9 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
           studioShortPartMinutes: Number(shortPartMinutes),
           studioWindowOverlapSec: Number(windowOverlapSec),
           studioOffsetMode: offsetMode,
+          studioLowMemoryChromeFlags: lowMemoryChromeFlags,
+          studioDisableDevShmUsage: disableDevShmUsage,
+          studioAttachMovieFromDrive: attachMovieFromDrive,
         },
       }),
     })
@@ -136,6 +156,31 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
     }
     setConfigSaved(true)
     setTimeout(() => setConfigSaved(false), 2500)
+    onRefresh()
+  }
+
+  async function toggleBooleanSetting(
+    field: 'studioLowMemoryChromeFlags' | 'studioDisableDevShmUsage' | 'studioAttachMovieFromDrive',
+    nextVal: boolean,
+  ) {
+    if (field === 'studioLowMemoryChromeFlags') setLowMemoryChromeFlags(nextVal)
+    if (field === 'studioDisableDevShmUsage') setDisableDevShmUsage(nextVal)
+    if (field === 'studioAttachMovieFromDrive') setAttachMovieFromDrive(nextVal)
+    setError(null)
+    const res = await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        studio: {
+          [field]: nextVal,
+        },
+      }),
+    })
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}))
+      setError(j.error || 'Failed to update Studio toggle')
+      return
+    }
     onRefresh()
   }
 
@@ -543,6 +588,58 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
                 value={pageRecycleInterval}
                 onChange={(e) => setPageRecycleInterval(Number(e.target.value))}
                 className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring"
+              />
+            </label>
+          </div>
+
+          {/* Chrome A/B Flags & Google Drive Movie Attach Toggles */}
+          <div className="rounded-md border border-border/70 bg-background/60 p-2.5 space-y-2">
+            <div className="text-[11px] font-semibold text-foreground">
+              Chrome Launch Flags (A/B) &amp; Movie Attachment Mode
+            </div>
+
+            <label className="flex items-start justify-between gap-2 text-xs cursor-pointer">
+              <div className="space-y-0.5">
+                <span className="font-medium text-foreground">Low-memory Chrome flags (default OFF)</span>
+                <p className="text-[10px] font-mono text-muted-foreground">
+                  --disable-gpu · --disable-extensions · --disable-background-networking
+                </p>
+              </div>
+              <input
+                type="checkbox"
+                checked={lowMemoryChromeFlags}
+                onChange={(e) => void toggleBooleanSetting('studioLowMemoryChromeFlags', e.target.checked)}
+                className="mt-0.5 h-4 w-4 accent-primary cursor-pointer"
+              />
+            </label>
+
+            <label className="flex items-start justify-between gap-2 text-xs cursor-pointer">
+              <div className="space-y-0.5">
+                <span className="font-medium text-foreground">--disable-dev-shm-usage (default ON)</span>
+                <p className="text-[10px] font-mono text-muted-foreground">
+                  Uses /tmp instead of /dev/shm for shared memory buffers
+                </p>
+              </div>
+              <input
+                type="checkbox"
+                checked={disableDevShmUsage}
+                onChange={(e) => void toggleBooleanSetting('studioDisableDevShmUsage', e.target.checked)}
+                className="mt-0.5 h-4 w-4 accent-primary cursor-pointer"
+              />
+            </label>
+
+            <label className="flex items-start justify-between gap-2 text-xs cursor-pointer">
+              <div className="space-y-0.5">
+                <span className="font-medium text-foreground">Attach movie from Google Drive (default OFF)</span>
+                <p className="text-[10px] text-muted-foreground">
+                  Uploads <code className="font-mono">movie_360p.mp4</code> once to Drive folder &ldquo;CMT&rdquo; and attaches via Drive Picker so browser workers don&apos;t upload 378 MB locally
+                </p>
+              </div>
+              <input
+                type="checkbox"
+                checked={attachMovieFromDrive}
+                onChange={(e) => void toggleBooleanSetting('studioAttachMovieFromDrive', e.target.checked)}
+                className="mt-0.5 h-4 w-4 accent-primary cursor-pointer"
               />
             </label>
           </div>

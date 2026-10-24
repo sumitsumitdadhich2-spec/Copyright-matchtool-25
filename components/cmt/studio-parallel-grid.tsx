@@ -255,6 +255,7 @@ export function StudioParallelGrid({
   const [levelFilter, setLevelFilter] = useState<string>('ALL')
   const [onlyErrorsRetries403, setOnlyErrorsRetries403] = useState<boolean>(false)
   const [autoScrollLogs, setAutoScrollLogs] = useState<boolean>(true)
+  const [pdfRunScope, setPdfRunScope] = useState<'latest' | 'all'>('latest')
   const [downloadingPdfMode, setDownloadingPdfMode] = useState<'full' | 'errors' | null>(null)
   const logContainerRef = useRef<HTMLDivElement | null>(null)
 
@@ -509,7 +510,7 @@ export function StudioParallelGrid({
     setDownloadingPdfMode(mode)
     setErrorMsg(null)
     try {
-      const url = `/api/studio/parallel/log-pdf?scanId=${encodeURIComponent(scanId)}&mode=${mode}`
+      const url = `/api/studio/parallel/log-pdf?scanId=${encodeURIComponent(scanId)}&mode=${mode}&runScope=${pdfRunScope}`
       const res = await fetch(url)
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}))
@@ -608,18 +609,34 @@ export function StudioParallelGrid({
           )}
 
           {snap && (
-            <div className="flex items-center gap-1.5 text-[10px] font-mono text-zinc-400">
+            <div className="flex flex-wrap items-center gap-1.5 text-[10px] font-mono text-zinc-400">
               <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-950 border border-zinc-800">
                 <Cpu className="w-3 h-3 text-zinc-500" />
                 RAM {snap.ramUsedPercent}%
               </span>
+              {typeof snap.devShmUsedMb === 'number' && (
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-950 border border-zinc-800">
+                  /dev/shm {snap.devShmUsedMb} MB
+                </span>
+              )}
               <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-950 border border-zinc-800">
                 <HardDrive className="w-3 h-3 text-zinc-500" />
                 Disk {snap.freeDiskGb} GB
               </span>
               {typeof snap.chromeProcessCount === 'number' && (
-                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-950 border border-zinc-800">
-                  Chrome: {snap.chromeProcessCount}
+                <span
+                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-950 border border-zinc-800 text-zinc-200"
+                  title="Chrome processes per worker profile and total across the system (0 when scan finishes)"
+                >
+                  Chrome procs per worker:{' '}
+                  {snap.chromeProcsPerWorker
+                    ? Object.keys(snap.chromeProcsPerWorker)
+                        .sort()
+                        .slice(0, Math.max(maxConcurrency, 6))
+                        .map((k) => `${k}:${snap.chromeProcsPerWorker[k] ?? 0}`)
+                        .join(' ')
+                    : '—'}{' '}
+                  | Total: <strong className="text-cyan-300">{snap.chromeProcessCount}</strong>
                 </span>
               )}
               {snap.measuredTokenRate && (
@@ -1034,16 +1051,18 @@ export function StudioParallelGrid({
                       {w.stage || 'idle'}
                     </div>
 
-                    {!isIdle && (
-                      <div className="mt-1 flex items-center justify-between text-[10px] font-mono text-zinc-400">
+                    <div className="mt-1 flex items-center justify-between text-[10px] font-mono text-zinc-400">
+                      <span>
+                        Chrome procs: <strong className="text-zinc-200">{w.chromeProcessCount ?? 0}</strong>
+                        {w.chromeRssMb ? ` (${w.chromeRssMb} MB)` : ''}
+                      </span>
+                      {!isIdle && (
                         <span>
-                          attempt {w.attempt || 1}/{w.maxAttempts || 5}
+                          try {w.attempt || 1}/{w.maxAttempts || 5}
+                          {w.permRetry > 0 ? ` · 403:${w.permRetry}` : ''}
                         </span>
-                        {w.permRetry > 0 && (
-                          <span className="text-amber-300">403 retry {w.permRetry}/10</span>
-                        )}
-                      </div>
-                    )}
+                      )}
+                    </div>
                   </div>
 
                   {/* Per-card controls when a window of THIS scan is assigned */}
@@ -1405,8 +1424,20 @@ export function StudioParallelGrid({
             </span>
           </div>
 
-          {/* PDF Download Buttons */}
+          {/* PDF Scope Selector + Download Buttons */}
           <div className="flex flex-wrap items-center gap-1.5">
+            <select
+              value={pdfRunScope}
+              onChange={(e) => setPdfRunScope(e.target.value === 'all' ? 'all' : 'latest')}
+              className="rounded bg-zinc-900 border border-zinc-700 px-2 py-1 font-mono text-[11px] text-zinc-200 focus:outline-none focus:border-cyan-500/50"
+              title="Choose whether PDF includes only the latest Start run (default) or all historical runs"
+            >
+              <option value="latest">
+                Latest run only{snap?.currentRunId ? ` (${snap.currentRunId})` : ''}
+              </option>
+              <option value="all">All runs</option>
+            </select>
+
             <button
               type="button"
               disabled={!scanId || downloadingPdfMode !== null}

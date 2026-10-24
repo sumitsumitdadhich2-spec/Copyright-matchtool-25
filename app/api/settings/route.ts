@@ -153,6 +153,15 @@ export async function PUT(req: Request) {
       ...(st.studioOffsetMode === 'auto' || st.studioOffsetMode === 'relative' || st.studioOffsetMode === 'absolute'
         ? { studioOffsetMode: st.studioOffsetMode }
         : {}),
+      ...(st.studioLowMemoryChromeFlags !== undefined
+        ? { studioLowMemoryChromeFlags: Boolean(st.studioLowMemoryChromeFlags) }
+        : {}),
+      ...(st.studioDisableDevShmUsage !== undefined
+        ? { studioDisableDevShmUsage: Boolean(st.studioDisableDevShmUsage) }
+        : {}),
+      ...(st.studioAttachMovieFromDrive !== undefined
+        ? { studioAttachMovieFromDrive: Boolean(st.studioAttachMovieFromDrive) }
+        : {}),
     })
     return NextResponse.json({ ok: true, studio: await getPublicStudioSettings(session.username) })
   }
@@ -231,6 +240,15 @@ export async function POST(req: Request) {
       ...(st.studioWindowOverlapSec !== undefined ? { studioWindowOverlapSec: Number(st.studioWindowOverlapSec) } : {}),
       ...(st.studioOffsetMode === 'auto' || st.studioOffsetMode === 'relative' || st.studioOffsetMode === 'absolute'
         ? { studioOffsetMode: st.studioOffsetMode }
+        : {}),
+      ...(st.studioLowMemoryChromeFlags !== undefined
+        ? { studioLowMemoryChromeFlags: Boolean(st.studioLowMemoryChromeFlags) }
+        : {}),
+      ...(st.studioDisableDevShmUsage !== undefined
+        ? { studioDisableDevShmUsage: Boolean(st.studioDisableDevShmUsage) }
+        : {}),
+      ...(st.studioAttachMovieFromDrive !== undefined
+        ? { studioAttachMovieFromDrive: Boolean(st.studioAttachMovieFromDrive) }
         : {}),
     })
     return NextResponse.json({ ok: true, studio: await getPublicStudioSettings(username) })

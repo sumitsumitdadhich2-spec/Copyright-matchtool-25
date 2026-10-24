@@ -9,6 +9,7 @@ import {
 import { getScan } from './store'
 
 export type ParallelPdfMode = 'full' | 'errors'
+export type ParallelPdfRunScope = 'latest' | 'all'
 
 let cachedChromeVersion: string | null = null
 
@@ -102,6 +103,7 @@ export function sanitizePdfText(input: string | null | undefined): string {
     .replace(/\u2026/g, '...')
     .replace(/[\u00B7\u2022\u2219]/g, '|') // middle dot / bullet -> |
     .replace(/[\u2192\u27F6\u2794]/g, '->') // arrows -> ->
+    .replace(/\u23CE/g, '\n  ') // return symbol ⏎ -> newline indent for ChromeLogLast30
     .replace(/\u00D7/g, 'x') // multiplication sign -> x
     .replace(/\u00B1/g, '+/-') // plus-minus -> +/-
     .replace(/\u2713|\u2714/g, '[OK]')
@@ -168,6 +170,7 @@ function isErrorRetry403OrStateChange(entry: ParallelCombinedLogEntry): boolean 
     s.includes('waiting for worker') ||
     s.includes('waiting for upload gate') ||
     s.includes('waiting for ram') ||
+    s.includes('attach_movie mem') ||
     s.includes('target crashed') ||
     s.includes('error [crash]')
   )
@@ -196,15 +199,85 @@ export function filterLogsWithContextForErrorsMode(
   return sortedIdx.map((idx) => allLogs[idx])
 }
 
+function formatChromeProcsPerWorkerSummary(
+  perWorker: Record<string, number> | undefined,
+  total: number,
+): string {
+  if (!perWorker || Object.keys(perWorker).length === 0) {
+    return `Total: ${total}`
+  }
+  const keys = Object.keys(perWorker).sort()
+  const parts = keys.map((k) => `${k}:${perWorker[k] ?? 0}`)
+  return `${parts.join(' ')} | Total: ${total}`
+}
+
 export async function buildParallelScanPdfBuffer(params: {
   scanId: string
   mode: ParallelPdfMode
+  runScope?: ParallelPdfRunScope
 }): Promise<{ buffer: Buffer; filename: string }> {
-  const { scanId, mode } = params
+  const { scanId, mode, runScope = 'latest' } = params
   const mgr = getStudioParallelManager(scanId)
   const snap = await mgr.getLiveSnapshot(false)
   const scan = scanId && scanId !== 'default' ? getScan(scanId) : null
-  const allDiskLogs = mgr.readAllCombinedLogsFromDisk()
+  const rawAllDiskLogs = mgr.readAllCombinedLogsFromDisk()
+
+  // Filter logs & resource snapshots to the latest run by default (unless runScope === 'all')
+  let activeRunIdLabel = snap.currentRunId || 'latest'
+  let allDiskLogs = rawAllDiskLogs
+  let filteredResourceSnapshots = snap.resourceSnapshots || []
+
+  if (runScope === 'latest' && rawAllDiskLogs.length > 0) {
+    // Find latest runId present in logs or fallback to last 'parallel scan start' boundary
+    let targetRunId: string | null = snap.currentRunId || null
+    if (!targetRunId) {
+      for (let i = rawAllDiskLogs.length - 1; i >= 0; i--) {
+        if (rawAllDiskLogs[i].runId) {
+          targetRunId = rawAllDiskLogs[i].runId || null
+          break
+        }
+      }
+    }
+
+    if (targetRunId && rawAllDiskLogs.some((e) => e.runId === targetRunId)) {
+      activeRunIdLabel = targetRunId
+      allDiskLogs = rawAllDiskLogs.filter((e) => e.runId === targetRunId)
+      if (filteredResourceSnapshots.some((r) => r.runId === targetRunId)) {
+        filteredResourceSnapshots = filteredResourceSnapshots.filter(
+          (r) => r.runId === targetRunId,
+        )
+      } else if (allDiskLogs.length > 0) {
+        const minT = allDiskLogs[0].t - 5000
+        filteredResourceSnapshots = filteredResourceSnapshots.filter((r) => r.t >= minT)
+      }
+    } else {
+      // Legacy fallback: slice from the last 'parallel scan start' (including 'media verified' immediately before it)
+      let lastStartIdx = -1
+      for (let i = rawAllDiskLogs.length - 1; i >= 0; i--) {
+        const st = (rawAllDiskLogs[i].step || '').toLowerCase()
+        if (st === 'parallel scan start') {
+          lastStartIdx = i
+          break
+        }
+      }
+      if (lastStartIdx > 0) {
+        const startT = rawAllDiskLogs[lastStartIdx].t
+        while (
+          lastStartIdx > 0 &&
+          startT - rawAllDiskLogs[lastStartIdx - 1].t <= 30_000 &&
+          /media verified|compress 360p/i.test(rawAllDiskLogs[lastStartIdx - 1].step || '')
+        ) {
+          lastStartIdx -= 1
+        }
+        allDiskLogs = rawAllDiskLogs.slice(lastStartIdx)
+        activeRunIdLabel = `run@${formatTimeHhMmSs(rawAllDiskLogs[lastStartIdx].t)}`
+        const minT = rawAllDiskLogs[lastStartIdx].t - 5000
+        filteredResourceSnapshots = filteredResourceSnapshots.filter((r) => r.t >= minT)
+      }
+    }
+  } else if (runScope === 'all') {
+    activeRunIdLabel = `ALL RUNS (${rawAllDiskLogs.length} lines)`
+  }
 
   const doc = new jsPDF({
     orientation: 'portrait',
@@ -257,16 +330,18 @@ export async function buildParallelScanPdfBuffer(params: {
   // ==========================================================================
   // SECTION (a): HEADER
   // Scan ID/Name, generate time, concurrency, total windows, app/Chrome version,
-  // elapsed duration, AND exact verified media paths + sizes + durations
+  // elapsed duration, Chrome procs per worker + total, AND exact verified media paths + sizes + durations
   // ==========================================================================
   doc.setFillColor(15, 23, 42)
-  doc.roundedRect(marginLeft, y, contentWidth, 38, 2, 2, 'F')
+  doc.roundedRect(marginLeft, y, contentWidth, 43, 2, 2, 'F')
 
   doc.setFont('helvetica', 'bold')
   doc.setFontSize(12)
   doc.setTextColor(248, 250, 252)
   doc.text(
-    sanitizePdfText(`PARALLEL WINDOW SCAN REPORT - ${mode === 'errors' ? 'ERRORS / RETRIES / 403 ONLY' : 'FULL COMBINED LOG'}`),
+    sanitizePdfText(
+      `PARALLEL WINDOW SCAN REPORT - ${mode === 'errors' ? 'ERRORS / RETRIES / 403 ONLY' : 'FULL COMBINED LOG'} (${runScope === 'all' ? 'ALL RUNS' : 'LATEST RUN'})`,
+    ),
     marginLeft + 4,
     y + 7,
   )
@@ -276,7 +351,9 @@ export async function buildParallelScanPdfBuffer(params: {
   doc.setTextColor(186, 230, 253)
   const scanDisplay = scan?.customName || scan?.movieName || snap.scanName || scanId
   doc.text(
-    sanitizePdfText(`Scan ID: ${scanId}  |  Name: ${scanDisplay}`),
+    sanitizePdfText(
+      `Scan ID: ${scanId}  |  Name: ${scanDisplay}  |  Run Scope: ${runScope.toUpperCase()} (${activeRunIdLabel})`,
+    ),
     marginLeft + 4,
     y + 12.5,
   )
@@ -298,6 +375,20 @@ export async function buildParallelScanPdfBuffer(params: {
     y + 22.5,
   )
 
+  const chromePerWorkerHeader = formatChromeProcsPerWorkerSummary(
+    snap.chromeProcsPerWorker,
+    snap.chromeProcessCount ?? 0,
+  )
+  doc.setTextColor(253, 230, 138)
+  doc.setFontSize(7.0)
+  doc.text(
+    sanitizePdfText(
+      `Chrome Procs per Worker: ${chromePerWorkerHeader}  |  RAM: ${snap.ramUsedPercent}%  |  /dev/shm: ${snap.devShmUsedMb ?? 0} MB`,
+    ),
+    marginLeft + 4,
+    y + 27.5,
+  )
+
   const mi = snap.mediaInfo
   const shortLine = mi?.shortPath
     ? `Short: ${mi.shortPath}  (${mi.shortSizeBytes ? (mi.shortSizeBytes / (1024 * 1024)).toFixed(2) : '0'} MB, ${(mi.shortDurationSec || 0).toFixed(1)}s)`
@@ -308,10 +399,10 @@ export async function buildParallelScanPdfBuffer(params: {
 
   doc.setTextColor(167, 243, 208)
   doc.setFontSize(7.0)
-  doc.text(sanitizePdfText(shortLine), marginLeft + 4, y + 28)
-  doc.text(sanitizePdfText(movieLine), marginLeft + 4, y + 33)
+  doc.text(sanitizePdfText(shortLine), marginLeft + 4, y + 33)
+  doc.text(sanitizePdfText(movieLine), marginLeft + 4, y + 38)
 
-  y += 43
+  y += 48
 
   // ==========================================================================
   // SECTION (b): SUMMARY TABLE OF EVERY WINDOW
@@ -492,21 +583,31 @@ export async function buildParallelScanPdfBuffer(params: {
   }
 
   // ==========================================================================
-  // SECTION (d): RESOURCE SNAPSHOTS (RAM %, Free Disk GB, Chrome Procs, Active Workers, Global Slots)
+  // SECTION (d): RESOURCE SNAPSHOTS (RAM %, Free Disk GB, Chrome Procs per Worker & Total, /dev/shm)
   // ==========================================================================
-  const resSnaps = snap.resourceSnapshots || []
-  ensureSpace(16, '3. System Resource Snapshots (RAM, Disk & Chrome Processes)')
+  const resSnaps = filteredResourceSnapshots
+  ensureSpace(18, '3. System Resource Snapshots (RAM, Disk & Chrome Processes)')
   doc.setFont('helvetica', 'bold')
   doc.setFontSize(9.5)
   doc.setTextColor(15, 23, 42)
   doc.text(
     sanitizePdfText(
-      `3. Resource Snapshots (${resSnaps.length} samples @ 10s | Current RAM: ${snap.ramUsedPercent}%, Chrome Procs: ${snap.chromeProcessCount ?? 0}, Free Disk: ${snap.freeDiskGb} GB)`,
+      `3. Resource Snapshots (${resSnaps.length} samples @ 10s | Current RAM: ${snap.ramUsedPercent}%, /dev/shm: ${snap.devShmUsedMb ?? 0}MB, Chrome Procs Total: ${snap.chromeProcessCount ?? 0}, Free Disk: ${snap.freeDiskGb} GB)`,
     ),
     marginLeft,
     y,
   )
   y += 3.5
+
+  doc.setFont(monoFontName, 'bold')
+  doc.setFontSize(6.5)
+  doc.setTextColor(30, 41, 59)
+  doc.text(
+    sanitizePdfText(`Current Chrome Procs per Worker: ${chromePerWorkerHeader}`),
+    marginLeft + 1.5,
+    y + 2.5,
+  )
+  y += 4.5
 
   if (resSnaps.length === 0) {
     doc.setFont(monoFontName, 'normal')
@@ -514,7 +615,7 @@ export async function buildParallelScanPdfBuffer(params: {
     doc.setTextColor(100, 116, 139)
     doc.text(
       sanitizePdfText(
-        `Live snapshot: RAM ${snap.ramUsedPercent}% used | Chrome Procs: ${snap.chromeProcessCount ?? 0} | Free Disk ${snap.freeDiskGb} GB | ${snap.slotPool.summaryText}`,
+        `Live snapshot: RAM ${snap.ramUsedPercent}% used | Chrome Procs: ${chromePerWorkerHeader} | Free Disk ${snap.freeDiskGb} GB | ${snap.slotPool.summaryText}`,
       ),
       marginLeft + 2,
       y + 3,
@@ -524,10 +625,12 @@ export async function buildParallelScanPdfBuffer(params: {
     doc.setFillColor(241, 245, 249)
     doc.rect(marginLeft, y, contentWidth, 5, 'F')
     doc.setFont(monoFontName, 'bold')
-    doc.setFontSize(6.5)
+    doc.setFontSize(6.3)
     doc.setTextColor(51, 65, 85)
     doc.text(
-      sanitizePdfText('Time          Elapsed   RAM Used   Free Disk   Chrome Procs   Scan Workers   Global Slots   Note'),
+      sanitizePdfText(
+        'Time       Elapsed  RAM   /dev/shm  Disk     ChromeTotal  Chrome Procs per Worker              Wrk  Slots  Note',
+      ),
       marginLeft + 1.5,
       y + 3.5,
     )
@@ -538,10 +641,18 @@ export async function buildParallelScanPdfBuffer(params: {
       const rs = displaySnaps[i]
       ensureSpace(4.5, '3. System Resource Snapshots')
       doc.setFont(monoFontName, 'normal')
-      doc.setFontSize(6.3)
+      doc.setFontSize(6.1)
       doc.setTextColor(30, 41, 59)
       const chromeCnt = typeof rs.chromeProcessCount === 'number' ? String(rs.chromeProcessCount) : '--'
-      const rowStr = `${formatTimeHhMmSs(rs.t).padEnd(14, ' ')}${formatElapsedPlusMmSs(rs.elapsedSec).padEnd(10, ' ')}${`${rs.ramUsedPercent}%`.padEnd(11, ' ')}${`${rs.freeDiskGb} GB`.padEnd(12, ' ')}${chromeCnt.padEnd(15, ' ')}${String(rs.activeWorkers).padEnd(15, ' ')}${`${rs.slotsInUse}/${rs.totalSlots}`.padEnd(15, ' ')}${rs.note || ''}`
+      const perWrkCompact = rs.chromeProcsPerWorker
+        ? Object.keys(rs.chromeProcsPerWorker)
+            .sort()
+            .slice(0, 6)
+            .map((k) => `${k}:${rs.chromeProcsPerWorker![k] ?? 0}`)
+            .join(' ')
+        : '--'
+      const shmStr = typeof rs.devShmUsedMb === 'number' ? `${rs.devShmUsedMb}M` : '--'
+      const rowStr = `${formatTimeHhMmSs(rs.t).padEnd(11, ' ')}${formatElapsedPlusMmSs(rs.elapsedSec).padEnd(9, ' ')}${`${rs.ramUsedPercent}%`.padEnd(6, ' ')}${shmStr.padEnd(10, ' ')}${`${rs.freeDiskGb}GB`.padEnd(9, ' ')}${chromeCnt.padEnd(13, ' ')}${perWrkCompact.padEnd(37, ' ')}${String(rs.activeWorkers).padEnd(5, ' ')}${`${rs.slotsInUse}/${rs.totalSlots}`.padEnd(7, ' ')}${rs.note || ''}`
       doc.text(sanitizePdfText(rowStr), marginLeft + 1.5, y + 2.5)
       y += 4
     }
@@ -567,7 +678,7 @@ export async function buildParallelScanPdfBuffer(params: {
   doc.setTextColor(15, 23, 42)
   doc.text(
     sanitizePdfText(
-      `4. Combined Chronological Logs (${logsToRender.length} lines rendered from ${allDiskLogs.length} total disk lines | mode=${mode})`,
+      `4. Combined Chronological Logs (${logsToRender.length} lines rendered from ${allDiskLogs.length} run lines [${rawAllDiskLogs.length} total disk lines] | mode=${mode} | scope=${runScope})`,
     ),
     marginLeft,
     y,
@@ -692,7 +803,9 @@ export async function buildParallelScanPdfBuffer(params: {
     doc.setFontSize(7)
     doc.setTextColor(100, 116, 139)
     doc.text(
-      sanitizePdfText(`Parallel Scan Log | Scan: ${scanDisplay} (${scanId}) | Mode: ${mode.toUpperCase()}`),
+      sanitizePdfText(
+        `Parallel Scan Log | Scan: ${scanDisplay} (${scanId}) | Mode: ${mode.toUpperCase()} | Scope: ${runScope.toUpperCase()}`,
+      ),
       marginLeft,
       pageHeight - 6,
     )
@@ -708,7 +821,8 @@ export async function buildParallelScanPdfBuffer(params: {
   const buffer = Buffer.from(arrayBuf)
   const safeId = (scanId || 'scan').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16)
   const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
-  const filename = `parallel-log-${safeId}-${mode}-${ts}.pdf`
+  const scopeSuffix = runScope === 'all' ? '-allruns' : ''
+  const filename = `parallel-log-${safeId}-${mode}${scopeSuffix}-${ts}.pdf`
 
   return { buffer, filename }
 }
