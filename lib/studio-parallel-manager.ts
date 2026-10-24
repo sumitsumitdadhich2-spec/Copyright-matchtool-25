@@ -279,7 +279,7 @@ export function readFreeDiskGb(): number {
 }
 
 export function readChromeProcessCount(): number {
-  return inspectChromeProcesses().totalProcs
+  return inspectChromeProcesses().totalCount
 }
 
 export function readChromeProcsPerWorker(maxWorkers = 10): {
@@ -293,17 +293,17 @@ export function readChromeProcsPerWorker(maxWorkers = 10): {
   const count = Math.max(1, Math.min(20, maxWorkers))
   for (let i = 1; i <= count; i++) {
     const wId = `W${String(i).padStart(2, '0')}`
-    perWorkerProcs[wId] = info.perWorkerProcs[wId] || 0
-    perWorkerRssMb[wId] = info.perWorkerRssMb[wId] || 0
+    perWorkerProcs[wId] = info.perWorkerCount?.[wId] || 0
+    perWorkerRssMb[wId] = info.perWorkerRssMb?.[wId] || 0
   }
-  for (const [wId, c] of Object.entries(info.perWorkerProcs)) {
+  for (const [wId, c] of Object.entries(info.perWorkerCount ?? {})) {
     if (c > 0 && !(wId in perWorkerProcs)) {
       perWorkerProcs[wId] = c
-      perWorkerRssMb[wId] = info.perWorkerRssMb[wId] || 0
+      perWorkerRssMb[wId] = info.perWorkerRssMb?.[wId] || 0
     }
   }
   return {
-    totalProcs: info.totalProcs,
+    totalProcs: info.totalCount ?? 0,
     perWorkerProcs,
     perWorkerRssMb,
   }
@@ -2100,10 +2100,10 @@ export class StudioParallelManager {
     // If no other scan is actively leasing slots, ensure all w01..w20 profiles have 0 leftover Chrome processes
     if (globalProfileSlotPool.getSummary(this.maxTotalPoolSlots).inUseSlots === 0) {
       const info = inspectChromeProcesses()
-      if (info.totalProcs > 0) {
+      if (info.totalCount > 0) {
         const cleanupPromises: Promise<unknown>[] = []
-        for (const wKey of Object.keys(info.perWorkerProcs)) {
-          if ((info.perWorkerProcs[wKey] || 0) > 0) {
+        for (const wKey of Object.keys(info.perWorkerCount ?? {})) {
+          if ((info.perWorkerCount?.[wKey] || 0) > 0) {
             const num = wKey.replace(/^W/i, '').padStart(2, '0')
             cleanupPromises.push(
               killWorkerChromeProcessesByProfileDir(`${BASE_PROFILE_NAME}-w${num}`),
