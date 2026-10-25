@@ -88,23 +88,18 @@ export function maxMovieEndSecInHissa2(text: string): number {
   if (!hissa2) return 0
 
   let maxEndSec = 0
-  const lines = hissa2.split('\n')
   const movieRe =
     /\bMovie[:\s]+((?:\d+:)?\d{1,2}:\d{1,2}(?:\.\d+)?)\s*(?:-|–|—|to)\s*((?:\d+:)?\d{1,2}:\d{1,2}(?:\.\d+)?)/gi
 
-  for (const line of lines) {
-    if (/\bNOT[\s_]*FOUND\b/i.test(line)) continue
-    let m: RegExpExecArray | null
-    movieRe.lastIndex = 0
-    while ((m = movieRe.exec(line)) !== null) {
-      const startMs = parseTsFlexibleToMs(m[1])
-      const endMs = parseTsFlexibleToMs(m[2])
-      if (startMs !== null && startMs / 1000 > maxEndSec) {
-        maxEndSec = startMs / 1000
-      }
-      if (endMs !== null && endMs / 1000 > maxEndSec) {
-        maxEndSec = endMs / 1000
-      }
+  let m: RegExpExecArray | null
+  while ((m = movieRe.exec(hissa2)) !== null) {
+    const startMs = parseTsFlexibleToMs(m[1])
+    const endMs = parseTsFlexibleToMs(m[2])
+    if (startMs !== null && startMs / 1000 > maxEndSec) {
+      maxEndSec = startMs / 1000
+    }
+    if (endMs !== null && endMs / 1000 > maxEndSec) {
+      maxEndSec = endMs / 1000
     }
   }
   return maxEndSec
@@ -116,7 +111,7 @@ export function maxMovieEndSecInHissa2(text: string): number {
  * - A' = A + offsetFrames / 24 (computed in exact integer milliseconds, no float drift)
  * - B' = B + offsetFrames / 24
  * - f1' = f1 + offsetFrames, f2' = f2 + offsetFrames (exact integers)
- * Leaves the Short range, HISSA 1, and NOT FOUND lines 100% byte-identical.
+ * Leaves the Short range, HISSA 1, and NOT FOUND entries 100% byte-identical.
  */
 export function shiftMovieTimestampsInHissa2(text: string, offsetFrames: number): string {
   if (typeof text !== 'string' || !text) return text
@@ -129,60 +124,49 @@ export function shiftMovieTimestampsInHissa2(text: string, offsetFrames: number)
   const movieRangeWithOptionalFramesRe =
     /(\bMovie[:\s]+)((?:\d+:)?\d{1,2}:\d{1,2}(?:\.\d+)?)(\s*(?:-|–|—|to)\s*)((?:\d+:)?\d{1,2}:\d{1,2}(?:\.\d+)?)(?:(\s*\(\s*)(\d+)(\s*(?:-|–|—|to)\s*)(\d+)(\s*frames?\s*\)))?/gi
 
-  const shiftedHissa2 = hissa2
-    .split('\n')
-    .map((line) => {
-      if (/\bNOT[\s_]*FOUND\b/i.test(line)) {
-        return line
+  const shiftedHissa2 = hissa2.replace(
+    movieRangeWithOptionalFramesRe,
+    (
+      fullMatch,
+      moviePrefix: string,
+      tsA: string,
+      rangeSep: string,
+      tsB: string,
+      frameOpen: string | undefined,
+      f1Str: string | undefined,
+      frameSep: string | undefined,
+      f2Str: string | undefined,
+      frameClose: string | undefined,
+    ) => {
+      const msA = parseTsFlexibleToMs(tsA)
+      const msB = parseTsFlexibleToMs(tsB)
+      if (msA === null || msB === null) {
+        return fullMatch
       }
-      if (!/\bMovie[:\s]+/i.test(line)) {
-        return line
+      const shiftedA = formatMsAsMovieTimestamp(msA + offsetMs)
+      const shiftedB = formatMsAsMovieTimestamp(msB + offsetMs)
+
+      if (
+        frameOpen !== undefined &&
+        f1Str !== undefined &&
+        frameSep !== undefined &&
+        f2Str !== undefined &&
+        frameClose !== undefined
+      ) {
+        const f1 = Number.parseInt(f1Str, 10)
+        const f2 = Number.parseInt(f2Str, 10)
+        if (Number.isFinite(f1) && Number.isFinite(f2)) {
+          const shiftedF1 = f1 + safeOffsetFrames
+          const shiftedF2 = f2 + safeOffsetFrames
+          return `${moviePrefix}${shiftedA}${rangeSep}${shiftedB}${frameOpen}${shiftedF1}${frameSep}${shiftedF2}${frameClose}`
+        }
       }
-      return line.replace(
-        movieRangeWithOptionalFramesRe,
-        (
-          fullMatch,
-          moviePrefix: string,
-          tsA: string,
-          rangeSep: string,
-          tsB: string,
-          frameOpen: string | undefined,
-          f1Str: string | undefined,
-          frameSep: string | undefined,
-          f2Str: string | undefined,
-          frameClose: string | undefined,
-        ) => {
-          const msA = parseTsFlexibleToMs(tsA)
-          const msB = parseTsFlexibleToMs(tsB)
-          if (msA === null || msB === null) {
-            return fullMatch
-          }
-          const shiftedA = formatMsAsMovieTimestamp(msA + offsetMs)
-          const shiftedB = formatMsAsMovieTimestamp(msB + offsetMs)
 
-          if (
-            frameOpen !== undefined &&
-            f1Str !== undefined &&
-            frameSep !== undefined &&
-            f2Str !== undefined &&
-            frameClose !== undefined
-          ) {
-            const f1 = Number.parseInt(f1Str, 10)
-            const f2 = Number.parseInt(f2Str, 10)
-            if (Number.isFinite(f1) && Number.isFinite(f2)) {
-              const shiftedF1 = f1 + safeOffsetFrames
-              const shiftedF2 = f2 + safeOffsetFrames
-              return `${moviePrefix}${shiftedA}${rangeSep}${shiftedB}${frameOpen}${shiftedF1}${frameSep}${shiftedF2}${frameClose}`
-            }
-          }
-
-          const computedF1 = Math.round(((msA + offsetMs) / 1000) * SCAN_FPS)
-          const computedF2 = Math.round(((msB + offsetMs) / 1000) * SCAN_FPS)
-          return `${moviePrefix}${shiftedA}${rangeSep}${shiftedB} (${computedF1}-${computedF2} frames)`
-        },
-      )
-    })
-    .join('\n')
+      const computedF1 = Math.round(((msA + offsetMs) / 1000) * SCAN_FPS)
+      const computedF2 = Math.round(((msB + offsetMs) / 1000) * SCAN_FPS)
+      return `${moviePrefix}${shiftedA}${rangeSep}${shiftedB} (${computedF1}-${computedF2} frames)`
+    },
+  )
 
   return `${prefix}${shiftedHissa2}`
 }

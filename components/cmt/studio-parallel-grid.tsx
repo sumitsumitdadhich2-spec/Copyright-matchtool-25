@@ -1138,7 +1138,7 @@ export function StudioParallelGrid({
             <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="text-[11px] font-semibold uppercase tracking-wider text-cyan-300">
-                  Window Preview ({previewValidation.previewWindows.length} Windows · Max 5:00 · 5s seam overlap)
+                  Window Preview ({previewValidation.previewWindows.length} Windows · Max 5:00 · no overlap)
                 </span>
                 {effectiveMovieDurationSec && effectiveMovieDurationSec > 0 ? (
                   previewValidation.savedWindowsOutOfBounds.length > 0 ? (
@@ -1202,7 +1202,7 @@ export function StudioParallelGrid({
         <div className="px-4 pb-4">
           <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400 mb-2 flex items-center justify-between">
             <span>
-              Active / Saved Scan Windows ({windows.length} Windows · Max 5:00 each · 5s seam overlap)
+              Active / Saved Scan Windows ({windows.length} Windows · Max 5:00 each · no overlap)
             </span>
             <span className="text-[10px] font-mono text-zinc-500">
               Queue Priority: Largest contiguous runs pulled first

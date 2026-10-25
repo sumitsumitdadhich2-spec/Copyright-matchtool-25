@@ -529,8 +529,8 @@ export function parseMinuteInputToContiguousRuns(input: string): ContiguousMinut
  * Build the parallel scan windows according to strict rules:
  * 1. Contiguous minute runs, gaps skipped.
  * 2. Run <= 300s (5:00) => single window, no overlap.
- * 3. Run > 300s => n = Math.ceil(runSeconds / 290) equal parts with 5s overlap at internal seams.
- * 4. Assert every window is <= 300s (never > 5:00).
+ * 3. Run > 300s => contiguous boundaries b_0 = runStart, b_k = min(runEnd, round(runStart + k*runSeconds/n) + 5) for k = 1..n-1, b_n = runEnd (no overlap, no gap).
+ * 4. Assert every window is <= 300s (never > 5:00); increase n if any window would exceed 300s.
  * 5. Compute queue priority order so windows from the largest runs (e.g. 71-101, 25-42) are pulled first.
  */
 export function buildParallelWindowsFromMinuteInput(
@@ -574,13 +574,25 @@ export function buildParallelWindowsFromMinuteInput(
         endFormatted: formatParallelTimecode(runEnd),
       })
     } else {
-      const n = Math.ceil(runSeconds / 290)
+      let n = Math.ceil(runSeconds / 290)
+      let boundaries: number[] = []
+      while (true) {
+        boundaries = [runStart]
+        for (let k = 1; k < n; k++) {
+          boundaries.push(Math.min(runEnd, Math.round(runStart + (k * runSeconds) / n) + 5))
+        }
+        boundaries.push(runEnd)
+        const allWithin300 = boundaries.slice(0, -1).every((bStart, k) => {
+          const bEnd = boundaries[k + 1]
+          return bEnd - bStart <= 300
+        })
+        if (allWithin300) break
+        n += 1
+      }
+
       for (let k = 0; k < n; k++) {
-        const seamStart = k === 0 ? runStart : Math.round(runStart + (k * runSeconds) / n)
-        const rawSeamEnd =
-          k === n - 1 ? runEnd : Math.min(runEnd, Math.round(runStart + ((k + 1) * runSeconds) / n) + 5)
-        const endSec = Math.min(runEnd, Math.min(rawSeamEnd, seamStart + 300))
-        const startSec = seamStart
+        const startSec = boundaries[k]
+        const endSec = boundaries[k + 1]
         const durationSec = endSec - startSec
         if (durationSec > 300) {
           throw new Error(`Window exceeds 300s (${durationSec}s) at run ${run.label}`)
@@ -630,7 +642,7 @@ export function buildParallelWindowsFromMinuteInput(
 }
 
 /**
- * Split a single window into 2 equal halves (with 5s internal seam overlap) when context-limit is hit.
+ * Split a single window into 2 equal contiguous halves (no overlap) when context-limit is hit.
  */
 export function splitParallelWindowInHalf(
   win: ParallelWindowSpec,
@@ -638,8 +650,12 @@ export function splitParallelWindowInHalf(
 ): [ParallelWindowSpec, ParallelWindowSpec] {
   const totalSec = win.endSec - win.startSec
   const midSec = Math.round(win.startSec + totalSec / 2)
-  const firstEnd = Math.min(win.endSec, Math.min(midSec + 5, win.startSec + 300))
+  const firstEnd = Math.min(win.endSec, Math.min(midSec, win.startSec + 300))
   const secondStart = midSec
+
+  if (firstEnd - win.startSec > 300 || win.endSec - secondStart > 300) {
+    throw new Error(`Split window half exceeds 300s (${win.startFormatted}-${win.endFormatted})`)
+  }
 
   const w1Num = nextWindowNumberStart
   const w2Num = nextWindowNumberStart + 1
@@ -744,7 +760,7 @@ export function extractHissa1And2EntriesFromResponse(rawText: string): {
     const line = rawLine.trim().replace(/^[-*•]+\s*/, '').replace(/\*\*/g, '')
     if (!line || /HISSA\s*1/i.test(line)) continue
     const m = line.match(
-      /^(\d{1,2}:\d{2}(?::\d{2})?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*(?:=|:|-|–|—)\s*(.+)$/i,
+      /^(?:\d+[.)]\s*)?(?:Short[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*\([^)]*\))?\s*(?:=|:|-|–|—)\s*(.+)$/i,
     )
     if (m) {
       const sStart = parseParallelTimecodeToSeconds(m[1])
@@ -772,7 +788,7 @@ export function extractHissa1And2EntriesFromResponse(rawText: string): {
     if (!line || /HISSA\s*2/i.test(line)) continue
 
     const foundMatch = line.match(
-      /^(\d{1,2}:\d{2}(?::\d{2})?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*=\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*$/i,
+      /^(?:\d+[.)]\s*)?(?:Short[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*\([^)]*\))?\s*(?:=|-->|->|→)\s*(?:Movie[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*\([^)]*\))?\s*$/i,
     )
     if (foundMatch) {
       const sStart = parseParallelTimecodeToSeconds(foundMatch[1])
@@ -792,7 +808,7 @@ export function extractHissa1And2EntriesFromResponse(rawText: string): {
     }
 
     const nfMatch = line.match(
-      /^(\d{1,2}:\d{2}(?::\d{2})?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*=\s*(?:NOT[_\s-]*FOUND|NONE|N\/A|NULL|NO[_\s-]*MATCH|NAHI[_\s-]*MILA)\b/i,
+      /^(?:\d+[.)]\s*)?(?:Short[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*\([^)]*\))?\s*(?:=|-->|->|→)\s*(?:NOT[_\s-]*FOUND|NONE|N\/A|NULL|NO[_\s-]*MATCH|NAHI[_\s-]*MILA)\b/i,
     )
     if (nfMatch) {
       const sStart = parseParallelTimecodeToSeconds(nfMatch[1])
@@ -815,12 +831,15 @@ export function extractHissa1And2EntriesFromResponse(rawText: string): {
   }
 }
 
+const SEAM_TOL = 1.5
+
 /**
  * Merge results from all completed parallel windows:
  * 1. Build canonical short segments list from HISSA 1 / HISSA 2 across completed windows.
- * 2. Deduplicate seam overlaps (if two overlapping windows report the same movie range within ±6s, merge as 1 match).
- * 3. Flag CONFLICT if two windows report genuinely different movie ranges (>6s apart) for the same short segment.
- * 4. Produce clean TXT and JSON reports.
+ * 2. Seam stitch candidates that straddle contiguous window boundaries (windowA.endSec === windowB.startSec) within SEAM_TOL = 1.5s.
+ * 3. Deduplicate seam overlaps (if two windows report the same movie range within ±6s, merge as 1 match).
+ * 4. Flag CONFLICT if two windows report genuinely different movie ranges (>6s apart) for the same short segment.
+ * 5. Produce clean TXT and JSON reports.
  */
 export function mergeParallelWindowResults(params: {
   windows: Array<{
@@ -831,8 +850,22 @@ export function mergeParallelWindowResults(params: {
     endFormatted: string
     status: string
     rawResponseText?: string
+    runIndex?: number
   }>
 }): ParallelMergedReport {
+  const windowBoundsById = new Map<
+    string,
+    { startSec: number; endSec: number; runIndex?: number; orderIndex: number }
+  >()
+  params.windows.forEach((w, idx) => {
+    windowBoundsById.set(w.id, {
+      startSec: w.startSec,
+      endSec: w.endSec,
+      runIndex: w.runIndex,
+      orderIndex: idx,
+    })
+  })
+
   const segmentMap = new Map<
     string,
     {
@@ -916,9 +949,79 @@ export function mergeParallelWindowResults(params: {
     const shortRange = `${formatParallelTimecode(seg.shortStartSec)} to ${formatParallelTimecode(seg.shortEndSec)}`
     const description = seg.descriptions[0] || 'Scene segment'
 
+    // Step 1: SEAM STITCHING (before +/-6s dedupe), supporting chains (A+B+C)
+    type StitchableCandidate = (typeof seg.candidates)[number] & {
+      firstWindowId: string
+      lastWindowId: string
+      windowIds: string[]
+    }
+    const stitchWork: StitchableCandidate[] = seg.candidates.map((c) => ({
+      ...c,
+      firstWindowId: c.windowId,
+      lastWindowId: c.windowId,
+      windowIds: [c.windowId],
+    }))
+
+    let stitchedInPass = true
+    while (stitchedInPass && stitchWork.length > 1) {
+      stitchedInPass = false
+      outerLoop: for (let i = 0; i < stitchWork.length; i++) {
+        for (let j = 0; j < stitchWork.length; j++) {
+          if (i === j) continue
+          const candA = stitchWork[i]
+          const candB = stitchWork[j]
+          if (candA.windowIds.some((id) => candB.windowIds.includes(id))) continue
+
+          const windowA = windowBoundsById.get(candA.lastWindowId)
+          const windowB = windowBoundsById.get(candB.firstWindowId)
+          if (!windowA || !windowB) continue
+
+          // Never stitch windows from different runs or non-adjacent windows
+          if (
+            windowA.runIndex !== undefined &&
+            windowB.runIndex !== undefined &&
+            windowA.runIndex !== windowB.runIndex
+          ) {
+            continue
+          }
+          if (windowA.endSec !== windowB.startSec) continue
+
+          if (
+            candA.movieEndSec >= windowA.endSec - SEAM_TOL &&
+            candB.movieStartSec <= windowB.startSec + SEAM_TOL &&
+            Math.abs(candA.movieEndSec - candB.movieStartSec) <= SEAM_TOL
+          ) {
+            const unionStart = candA.movieStartSec
+            const unionEnd = candB.movieEndSec
+            const unionCand: StitchableCandidate = {
+              windowId: `${candA.windowId}+${candB.windowId}`,
+              windowRange: `${candA.windowRange} + ${candB.windowRange}`,
+              movieStartSec: unionStart,
+              movieEndSec: unionEnd,
+              movieRange: `${formatParallelTimecode(unionStart)} to ${formatParallelTimecode(unionEnd)}`,
+              description: candA.description,
+              firstWindowId: candA.firstWindowId,
+              lastWindowId: candB.lastWindowId,
+              windowIds: [...candA.windowIds, ...candB.windowIds],
+            }
+            const firstIdx = Math.min(i, j)
+            const secondIdx = Math.max(i, j)
+            stitchWork[firstIdx] = unionCand
+            stitchWork.splice(secondIdx, 1)
+            stitchedInPass = true
+            break outerLoop
+          }
+        }
+      }
+    }
+
+    const candidatesAfterStitch: typeof seg.candidates = stitchWork.map(
+      ({ firstWindowId: _f, lastWindowId: _l, windowIds: _w, ...rest }) => rest,
+    )
+
     // Deduplicate seam overlaps (movie timestamps within ±6s of each other)
     const distinctClusters: typeof seg.candidates = []
-    for (const cand of seg.candidates) {
+    for (const cand of candidatesAfterStitch) {
       const duplicate = distinctClusters.find(
         (c) =>
           Math.abs(c.movieStartSec - cand.movieStartSec) <= 6 &&
@@ -958,7 +1061,7 @@ export function mergeParallelWindowResults(params: {
         primaryMovieStartSec: primary.movieStartSec,
         primaryMovieEndSec: primary.movieEndSec,
         primaryWindowId: primary.windowId,
-        candidates: seg.candidates,
+        candidates: candidatesAfterStitch,
       })
     } else {
       conflictCount++

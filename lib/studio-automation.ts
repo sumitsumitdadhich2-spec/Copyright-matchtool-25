@@ -4067,11 +4067,25 @@ export class StudioBrowserController {
 
         currentStage = 'run/execute'
         // Attach network response listener BEFORE pressing Run so we capture exact GenerateContent status + body on 403/errors
+        // and track GenerateContent/StreamGenerateContent request completion for the completion gate.
         let capturedRunError: { status: number; url: string; body: string } | null = null
+        let genContentSeenCount = 0
+        let genContentInFlight = 0
         const onRunResponse = async (res: PlaywrightResponse) => {
           try {
             const url = res.url()
             const status = res.status()
+            const isGenContentStream = /GenerateContent|StreamGenerateContent/i.test(url)
+            if (isGenContentStream) {
+              genContentSeenCount += 1
+              genContentInFlight += 1
+              void res
+                .finished()
+                .catch(() => null)
+                .finally(() => {
+                  genContentInFlight = Math.max(0, genContentInFlight - 1)
+                })
+            }
             const isGenApi =
               /GenerateContent|StreamGenerateContent|MakerSuiteService|alkali|generativelanguage|batchexecute|aistudio\.google\.com\/_\//i.test(
                 url,
@@ -4095,12 +4109,21 @@ export class StudioBrowserController {
 
         const runStarted = Date.now()
         const TIMEOUT_MS = 10 * 60_000
+        const INCOMPLETE_REASONS = new Set([
+          'empty',
+          'missing_hissa',
+          'empty_hissa2',
+          'truncated_last_line',
+        ])
         let rawAnswer = ''
         let lastCandidateText = ''
         let stableSeconds = 0
         let stopEverSeen = false
         let stopGoneConsecutivePolls = 0
-        let doneIndicator: 'STOP_GONE' | 'HISSA_FOUND' | 'STABLE_6S' | null = null
+        let hissa2FirstSeenLogged = false
+        let incompleteAfterAbStartedAt: number | null = null
+        let lastIncompleteLogAt = 0
+        let doneIndicator: 'COMPLETION_GATE' | 'INCOMPLETE_60S_CAP' | null = null
         let permissionDeniedTriggered = false
         let transientBannerReason: string | null = null
 
@@ -4112,6 +4135,7 @@ export class StudioBrowserController {
           } else {
             await promptInput.press('Control+Enter')
           }
+          this.logStep('press Run', `${jobLabel} [${activeModelName}]`)
 
           // Poll every 1 s up to 10-min timeout.
           while (Date.now() - runStarted < TIMEOUT_MS) {
@@ -4260,15 +4284,19 @@ export class StudioBrowserController {
               const spinnerVisible = await this.isThinkingOrRunningSpinnerVisible(page)
               const candidateText = await this.extractFinalAnswerWithoutThoughts(page)
 
-              if (candidateText.length > 0) {
-                if (candidateText === lastCandidateText) {
-                  stableSeconds += 1
-                } else {
-                  lastCandidateText = candidateText
-                  stableSeconds = 1
-                }
+              if (!hissa2FirstSeenLogged && /HISSA\s*2\b/i.test(candidateText)) {
+                hissa2FirstSeenLogged = true
+                this.logStep(
+                  'HISSA 2 first seen',
+                  `${jobLabel} [${activeModelName}] (${candidateText.length} chars at ${mm}:${ss})`,
+                )
+              }
+
+              if (candidateText === lastCandidateText) {
+                stableSeconds += 1
               } else {
-                stableSeconds = 0
+                lastCandidateText = candidateText
+                stableSeconds = 1
               }
 
               if (stopEverSeen && !stopVisible && !spinnerVisible) {
@@ -4277,26 +4305,70 @@ export class StudioBrowserController {
                 stopGoneConsecutivePolls = 0
               }
 
-              // Indicator A: STOP_GONE (Stop was seen at least once, now Stop + scoped spinner are gone for 2 consecutive polls)
-              if (stopEverSeen && !stopVisible && !spinnerVisible && stopGoneConsecutivePolls >= 2) {
-                doneIndicator = 'STOP_GONE'
-              }
-              // Indicator B: HISSA_FOUND (both HISSA 1 and HISSA 2 present in answer text, and Stop is gone OR text unchanged for 3s)
-              else if (
-                /HISSA\s*1\b/i.test(candidateText) &&
-                /HISSA\s*2\b/i.test(candidateText) &&
-                (!stopVisible || stableSeconds >= 3)
-              ) {
-                doneIndicator = 'HISSA_FOUND'
-              }
-              // Indicator C: STABLE_6S (answer text is non-empty and unchanged for 6 consecutive seconds)
-              else if (candidateText.length > 0 && stableSeconds >= 6) {
-                doneIndicator = 'STABLE_6S'
-              }
+              // COMPLETION GATE:
+              // a) stop button not visible AND spinner not visible for >= 3 consecutive polls, and stopEverSeen is true
+              // b) candidate text unchanged for >= 4 consecutive polls
+              // c) validateStudioAnswer(candidateText, {shortWindowSec}) is NOT in {empty, missing_hissa, empty_hissa2, truncated_last_line}
+              // d) GenerateContent/StreamGenerateContent request of THIS run has finished (if URL was matched)
+              const condA =
+                stopEverSeen && !stopVisible && !spinnerVisible && stopGoneConsecutivePolls >= 3
+              const condB = stableSeconds >= 4
+              const condD = genContentSeenCount === 0 || genContentInFlight === 0
 
-              if (doneIndicator) {
-                this.logStep(`done by ${doneIndicator}`, `${jobLabel} [${activeModelName}]`, 'success')
-                break
+              if (condA && condB) {
+                let gateReason = 'empty'
+                try {
+                  const gateVal = validateStudioAnswer(candidateText, {
+                    shortWindowSec: shortEndSec - shortStartSec,
+                  })
+                  gateReason = gateVal.ok ? 'ok' : gateVal.reason
+                } catch {
+                  gateReason = 'ok'
+                }
+
+                const condC = !INCOMPLETE_REASONS.has(gateReason)
+                if (condC && condD) {
+                  doneIndicator = 'COMPLETION_GATE'
+                  this.logStep(
+                    'done by COMPLETION_GATE',
+                    `${jobLabel} [${activeModelName}] (stopGone=${stopGoneConsecutivePolls}s, stable=${stableSeconds}s, chars=${candidateText.length}, precheck=${gateReason}, genInFlight=${genContentInFlight})`,
+                    'success',
+                  )
+                  break
+                }
+
+                if (!condC) {
+                  const nowMs = Date.now()
+                  if (incompleteAfterAbStartedAt === null) {
+                    incompleteAfterAbStartedAt = nowMs
+                    lastIncompleteLogAt = 0
+                  }
+                  const incompleteWaitSec = Math.floor((nowMs - incompleteAfterAbStartedAt) / 1000)
+                  if (lastIncompleteLogAt === 0 || nowMs - lastIncompleteLogAt >= 15_000) {
+                    lastIncompleteLogAt = nowMs
+                    const nonEmptyLines = candidateText
+                      .split('\n')
+                      .filter((l) => l.trim().length > 0)
+                    const lastLine =
+                      nonEmptyLines.length > 0 ? nonEmptyLines[nonEmptyLines.length - 1] : ''
+                    const lastLineTail = lastLine.slice(-80)
+                    const incompleteLog = `answer still incomplete: ${gateReason}, ${candidateText.length} chars, last line tail=${lastLineTail}`
+                    this.logStep('answer still incomplete', incompleteLog, 'warn')
+                    onLog?.('warn', `${incompleteLog} on ${jobLabel}`)
+                  }
+                  if (incompleteWaitSec >= 60) {
+                    doneIndicator = 'INCOMPLETE_60S_CAP'
+                    this.logStep(
+                      'incomplete 60s cap',
+                      `answer still incomplete after 60s post-(a)+(b): ${gateReason}, ${candidateText.length} chars -> breaking to retry`,
+                      'warn',
+                    )
+                    break
+                  }
+                }
+              } else {
+                incompleteAfterAbStartedAt = null
+                lastIncompleteLogAt = 0
               }
             }
 
@@ -4320,12 +4392,14 @@ export class StudioBrowserController {
         currentStage = 'run/validate'
         let validationReason = transientBannerReason || ''
         let fetchedSource: 'clipboard' | 'dom' = 'dom'
+        let fetchedRawText = ''
         let validation: StudioValidationResult | null = null
 
         if (!transientBannerReason) {
           const fetched = await this.fetchStudioResultFromTurnOrFallback(page)
           fetchedSource = fetched.source
           let answerText = fetched.text || lastCandidateText
+          fetchedRawText = answerText
           let clipDurationExceeded = false
 
           if (windowClip && answerText) {
@@ -4413,27 +4487,8 @@ export class StudioBrowserController {
                 )
               }
             } else {
-              // If doneIndicator was HISSA_FOUND in non-parallel mode, preserve; in parallel mode enforce full validation
-              if (
-                !parallelMode &&
-                doneIndicator === 'HISSA_FOUND' &&
-                /HISSA\s*1\b/i.test(answerText) &&
-                /HISSA\s*2\b/i.test(answerText)
-              ) {
-                this.logStep(
-                  'HISSA_FOUND preserved',
-                  `Validation reason=${validation.reason}, but HISSA_FOUND was detected on screen. Marking DONE (validation skipped).`,
-                  'warn',
-                )
-                onLog?.(
-                  'warn',
-                  `[validate] Validation flagged reason=${validation.reason}, but HISSA_FOUND was detected on screen. Marking DONE (validation skipped) and accepting answer (${answerText.length} chars).`,
-                )
-                rawAnswer = answerText
-              } else {
-                validationReason =
-                  !doneIndicator && validation.reason === 'empty' ? 'timeout_10m' : validation.reason
-              }
+              validationReason =
+                !doneIndicator && validation.reason === 'empty' ? 'timeout_10m' : validation.reason
             }
           }
         }
@@ -4441,6 +4496,12 @@ export class StudioBrowserController {
         if (!rawAnswer) {
           invalidResultRetries += 1
           const badReason = validationReason || 'empty'
+          const newlineCount = (fetchedRawText.match(/\n/g) || []).length
+          const first300 = JSON.stringify(fetchedRawText.slice(0, 300))
+          const last400 = JSON.stringify(fetchedRawText.slice(-400))
+          const badDiagMsg = `BAD_RESULT_DIAG [reason=${badReason}] fetchedSource=${fetchedSource} length=${fetchedRawText.length} newlines=${newlineCount} first300=${first300} last400=${last400}`
+          this.logStep('BAD result diagnostic', badDiagMsg, 'warn')
+          onLog?.('warn', `${badDiagMsg} on ${jobLabel}`)
           this.logStep(
             `RETRY [runWindowJob] (${invalidResultRetries}/${MAX_INVALID_RESULT_RETRIES})`,
             `result BAD: ${badReason} -> naya chat, same window retry`,

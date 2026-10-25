@@ -1798,7 +1798,26 @@ export class StudioParallelManager {
       if (params.onLog) this.onLogCallback = params.onLog
 
       // Build/update windows list upfront so the UI shows the planned windows even if 360p compression runs first
+      const savedWindowsHadOverlap =
+        this.windows.length > 1 &&
+        this.windows.some(
+          (w, idx) =>
+            idx > 0 &&
+            w.runIndex === this.windows[idx - 1].runIndex &&
+            w.startSec < this.windows[idx - 1].endSec,
+        )
+      if (savedWindowsHadOverlap) {
+        this.appendCombinedLog({
+          workerId: 'SYS',
+          level: 'INFO',
+          step: 'rebuilt windows',
+          message: 'rebuilt windows: saved windows had overlap',
+        })
+        this.onLogCallback?.('info', 'rebuilt windows: saved windows had overlap')
+      }
+
       const canResume =
+        !savedWindowsHadOverlap &&
         Boolean(params.resumeExisting) &&
         this.hasResumableStateOnDisk() &&
         this.windows.length > 0 &&
@@ -2520,6 +2539,7 @@ export class StudioParallelManager {
         win.stage = windowClip.cached
           ? 'Clip ready (cached)'
           : `Clip ready (extracted, ${sizeMb} MB, ${extractSec} s)`
+        win.summaryText = 'Clip ready'
         this.persistStateToDisk()
       } catch (clipErr) {
         if (
