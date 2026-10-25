@@ -20,8 +20,11 @@ import {
 import { buildStudioChunkPrompt } from './studio-prompt'
 import { parseChunkMatches } from './gemini'
 import {
+  checkHissa2ShortCoverage,
   cleanStudioAnswerText,
   isPromptEchoText,
+  isThinkingOnlyText,
+  stitchContinuedStudioAnswer,
   validateStudioAnswer,
   type StudioValidationResult,
 } from './studio-result-validator'
@@ -3299,7 +3302,22 @@ export class StudioBrowserController {
             // ignore
           }
 
-          return (clone.innerText || clone.textContent || '').trim()
+          const cloneText = (clone.innerText || clone.textContent || '').trim()
+          if (cloneText) {
+            return cloneText
+          }
+          // FIX 3(b): If removing thought panels emptied the turn, check if the raw turn only had thinking text
+          const rawTurnText = (lastTurn.innerText || lastTurn.textContent || '').trim()
+          if (
+            rawTurnText &&
+            !/\bHISSA\s*1\b/i.test(rawTurnText) &&
+            /\b(?:MATCHED\s+SECTION|Sub-segment|Offset\s*=|Movie:\s*frame\s*\d+|Short:\s*frame\s*\d+|Initiating\s+Video\s+Analysis)\b/i.test(
+              rawTurnText,
+            )
+          ) {
+            return rawTurnText
+          }
+          return ''
         } finally {
           try {
             container.remove()
@@ -3314,6 +3332,9 @@ export class StudioBrowserController {
       },
     )
 
+    if (isThinkingOnlyText(extracted)) {
+      return extracted.trim()
+    }
     return cleanStudioAnswerText(extracted)
   }
 
@@ -3427,6 +3448,7 @@ export class StudioBrowserController {
     const t = (txt || '').trim()
     if (!t) return true
     if (isPromptEchoText(t)) return true
+    if (isThinkingOnlyText(t)) return true
     if (/^(?:you\s+are\s+a\s+forensic\s+video\s+analyst|initiating\s+video\s+analysis|thinking\b|thoughts\b)/i.test(t)) {
       return true
     }
@@ -3434,6 +3456,224 @@ export class StudioBrowserController {
       return true
     }
     return false
+  }
+
+  /**
+   * FIX 3(a): Capture diagnostics when an answer is INCOMPLETE / truncated:
+   * - Last model turn's footer text (duration, thumb_up/thumb_down, etc.)
+   * - Any visible error / "Stopped" / safety banner
+   * - StreamGenerateContent finishReason (MAX_TOKENS / STOP / OTHER) if seen on the network
+   * - Save a diagnostic PNG screenshot in `data/`
+   */
+  private async captureIncompleteDiagnostics(
+    page: Page,
+    params: {
+      scanId: string
+      jobLabel: string
+      reason: string
+      finishReason: string | null
+      onLog?: (level: 'info' | 'warn' | 'error' | 'success', msg: string) => void
+    },
+  ): Promise<void> {
+    const { scanId, jobLabel, reason, finishReason, onLog } = params
+    try {
+      const turnSelectors = STUDIO_SELECTORS.modelTurnContainers
+      const errorSelectors = STUDIO_SELECTORS.errorBanners
+      const domDiag = await page
+        .evaluate(
+          ({ turnSels, errSels }) => {
+            let turns: Element[] = []
+            for (const sel of turnSels) {
+              if (sel.includes(':has-text(')) continue
+              try {
+                const found = Array.from(document.querySelectorAll(sel))
+                if (found.length > 0) {
+                  turns = found
+                  break
+                }
+              } catch {
+                // ignore
+              }
+            }
+            const lastTurn = turns[turns.length - 1] as HTMLElement | undefined
+            const turnText = (lastTurn?.innerText || lastTurn?.textContent || '').trim()
+            const durationMatch = turnText.match(/\b\d+m\s*\d+(?:\.\d+)?s\b|\b\d+(?:\.\d+)?s\b/gi)
+            const footerTail = turnText.slice(-160).replace(/\s+/g, ' ')
+
+            const banners: string[] = []
+            for (const s of errSels) {
+              if (s.includes(':has-text(')) continue
+              try {
+                document.querySelectorAll(s).forEach((el) => {
+                  const h = el as HTMLElement
+                  const t = (h.innerText || h.textContent || '').trim().replace(/\s+/g, ' ')
+                  if (t && t.length <= 240) banners.push(t)
+                })
+              } catch {
+                // ignore
+              }
+            }
+            const bodyText = document.body?.innerText || ''
+            const stoppedMatch = bodyText.match(
+              /\b(?:generation\s+stopped|stopped\s+generating|response\s+stopped|safety\s+ratings|prohibited\s+content|max_tokens)\b[^\n]{0,80}/i,
+            )
+            if (stoppedMatch) {
+              banners.push(stoppedMatch[0].trim())
+            }
+
+            return {
+              durationTokens: durationMatch ? durationMatch.slice(-3).join(',') : 'none',
+              footerTail,
+              bannerText: banners.length > 0 ? Array.from(new Set(banners)).join(' | ').slice(0, 240) : 'none',
+            }
+          },
+          { turnSels: [...turnSelectors], errSels: [...errorSelectors] },
+        )
+        .catch(() => ({ durationTokens: 'err', footerTail: '', bannerText: 'err' }))
+
+      let screenshotRelPath = 'none'
+      try {
+        const safeScan = (scanId || 'scan').replace(/[^a-zA-Z0-9_-]+/g, '_')
+        const safeJob = (jobLabel || 'win').replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 60)
+        const fileName = `incomplete_${safeScan}_${safeJob}_${Date.now()}.png`
+        const fullPath = path.join(DATA_DIR, fileName)
+        fs.mkdirSync(DATA_DIR, { recursive: true })
+        await page.screenshot({ path: fullPath, fullPage: false, timeout: 5000 })
+        screenshotRelPath = `data/${fileName}`
+      } catch {
+        // ignore screenshot error
+      }
+
+      const diagMsg = `INCOMPLETE_DIAG [reason=${reason}] finishReason=${finishReason || 'unknown'} turnDuration=${domDiag.durationTokens} banner=${JSON.stringify(domDiag.bannerText)} footerTail=${JSON.stringify(domDiag.footerTail)} screenshot=${screenshotRelPath}`
+      this.logStep('INCOMPLETE_DIAG', diagMsg, 'warn')
+      onLog?.('warn', `${diagMsg} on ${jobLabel}`)
+    } catch {
+      // ignore diagnostic error
+    }
+  }
+
+  /**
+   * FIX 3(c): Send a follow-up "Continue EXACTLY from where you stopped..." message in the same AI Studio chat,
+   * wait for the new model turn to finish streaming, and fetch its text.
+   */
+  private async sendContinueFollowUpAndFetch(
+    page: Page,
+    params: {
+      jobLabel: string
+      activeModelName: string
+      continueAttempt: number
+      scope?: { scanId?: string | null; username?: string | null }
+      onLog?: (level: 'info' | 'warn' | 'error' | 'success', msg: string) => void
+    },
+  ): Promise<string> {
+    const { jobLabel, activeModelName, continueAttempt, scope, onLog } = params
+    const CONTINUE_PROMPT =
+      'Continue EXACTLY from where you stopped. Output only the remaining lines in the same format, no repetition, no explanation.'
+
+    await this.waitIfPausedOrThrowIfStopped(scope)
+
+    const turnSelectors = STUDIO_SELECTORS.modelTurnContainers
+    const prevTurnCount = await page
+      .evaluate((turnSels) => {
+        for (const sel of turnSels) {
+          if (sel.includes(':has-text(')) continue
+          try {
+            const found = document.querySelectorAll(sel)
+            if (found.length > 0) return found.length
+          } catch {
+            // ignore
+          }
+        }
+        return 0
+      }, [...turnSelectors])
+      .catch(() => 0)
+
+    const promptInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.promptInput, 5000)
+    if (!promptInput) {
+      throw new Error('Could not find prompt input textarea for CONTINUE follow-up')
+    }
+    await promptInput.click()
+    await promptInput.fill(CONTINUE_PROMPT)
+    await new Promise((r) => setTimeout(r, 400))
+
+    const runBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 4000)
+    if (runBtn) {
+      await runBtn.click()
+    } else {
+      await promptInput.press('Control+Enter')
+    }
+
+    this.logStep(
+      `continue #${continueAttempt} sent`,
+      `${jobLabel} [${activeModelName}] — waiting for continuation turn`,
+      'info',
+    )
+    onLog?.(
+      'info',
+      `CONTINUE [runWindowJob] (#${continueAttempt}/2) sent follow-up in same chat on ${jobLabel}`,
+    )
+
+    const contStart = Date.now()
+    const CONT_TIMEOUT_MS = 4 * 60_000
+    let stopEverSeen = false
+    let stopGonePolls = 0
+    let lastText = ''
+    let stablePolls = 0
+
+    while (Date.now() - contStart < CONT_TIMEOUT_MS) {
+      await this.waitIfPausedOrThrowIfStopped(scope)
+
+      const stopLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.stopButton, 100)
+      const stopVisible = Boolean(stopLoc)
+      if (stopVisible) stopEverSeen = true
+
+      const spinnerVisible = await this.isThinkingOrRunningSpinnerVisible(page)
+      const elapsedSec = Math.floor((Date.now() - contStart) / 1000)
+
+      if (elapsedSec >= 2) {
+        if (!stopVisible && !spinnerVisible && (await this.checkLastTurnProhibited(page))) {
+          throw new Error('POLICY_BLOCKED: Gemini prohibited content')
+        }
+
+        const curTurnCount = await page
+          .evaluate((turnSels) => {
+            for (const sel of turnSels) {
+              if (sel.includes(':has-text(')) continue
+              try {
+                const found = document.querySelectorAll(sel)
+                if (found.length > 0) return found.length
+              } catch {
+                // ignore
+              }
+            }
+            return 0
+          }, [...turnSelectors])
+          .catch(() => prevTurnCount)
+
+        const candidate = await this.extractFinalAnswerWithoutThoughts(page)
+        if (candidate === lastText && candidate.length > 0) {
+          stablePolls += 1
+        } else {
+          lastText = candidate
+          stablePolls = candidate.length > 0 ? 1 : 0
+        }
+
+        if ((stopEverSeen || curTurnCount > prevTurnCount) && !stopVisible && !spinnerVisible) {
+          stopGonePolls += 1
+        } else {
+          stopGonePolls = 0
+        }
+
+        if (stopGonePolls >= 3 && stablePolls >= 4 && candidate.length > 0) {
+          break
+        }
+      }
+
+      await new Promise((r) => setTimeout(r, 1000))
+    }
+
+    const fetched = await this.fetchStudioResultFromTurnOrFallback(page)
+    return fetched.text || lastText
   }
 
   /**
@@ -4304,6 +4544,7 @@ export class StudioBrowserController {
           url: string
           body: string
         } | null
+        let capturedFinishReason: string | null = null
         let genContentSeenCount = 0
         let genContentInFlight = 0
         const onRunResponse = async (res: PlaywrightResponse) => {
@@ -4326,8 +4567,14 @@ export class StudioBrowserController {
                 url,
               )
             if (!isGenApi && status < 400) return
-            if (status >= 400 || /GenerateContent|MakerSuiteService|alkali|batchexecute/i.test(url)) {
+            if (status >= 400 || /GenerateContent|StreamGenerateContent|MakerSuiteService|alkali|batchexecute/i.test(url)) {
               const text = await res.text().catch(() => '')
+              const finishMatch =
+                text.match(/"finishReason"\s*:\s*"([^"]+)"/i) ||
+                text.match(/\b(MAX_TOKENS|PROHIBITED_CONTENT|SAFETY|RECITATION|STOP)\b/)
+              if (finishMatch && finishMatch[1]) {
+                capturedFinishReason = finishMatch[1].toUpperCase()
+              }
               if (
                 status >= 400 ||
                 /PERMISSION_DENIED|caller does not have permission|"error"\s*:/i.test(text)
@@ -4349,6 +4596,7 @@ export class StudioBrowserController {
           'missing_hissa',
           'empty_hissa2',
           'truncated_last_line',
+          'thinking_only',
         ])
         let rawAnswer = ''
         let lastCandidateText = ''
@@ -4543,7 +4791,7 @@ export class StudioBrowserController {
               // COMPLETION GATE:
               // a) stop button not visible AND spinner not visible for >= 3 consecutive polls, and stopEverSeen is true
               // b) candidate text unchanged for >= 4 consecutive polls
-              // c) validateStudioAnswer(candidateText, {shortWindowSec}) is NOT in {empty, missing_hissa, empty_hissa2, truncated_last_line}
+              // c) validateStudioAnswer(candidateText, {shortWindowSec}) is NOT in {empty, missing_hissa, empty_hissa2, truncated_last_line, thinking_only}
               // d) GenerateContent/StreamGenerateContent request of THIS run has finished (if URL was matched)
               const condA =
                 stopEverSeen && !stopVisible && !spinnerVisible && stopGoneConsecutivePolls >= 3
@@ -4621,22 +4869,26 @@ export class StudioBrowserController {
           continue
         }
 
-        // Fetch and validate answer (with Fix 6: 10s wait + single re-fetch if validation is INCOMPLETE)
+        // Fetch and validate answer (with Fix 6: 10s wait + single re-fetch if validation is INCOMPLETE,
+        // and Fix 3: diagnostics + up to 2 CONTINUE follow-up attempts in the same chat)
         currentStage = 'run/validate'
         let validationReason = transientBannerReason || ''
         let fetchedSource: 'clipboard' | 'dom' = 'dom'
         let fetchedRawText = ''
+        let accumulatedUnshiftedText = ''
         let validation: StudioValidationResult | null = null
+        const shortDurationSec = shortEndSec - shortStartSec
 
-        const fetchShiftAndValidateOnce = async (): Promise<void> => {
-          const fetched = await this.fetchStudioResultFromTurnOrFallback(page)
-          fetchedSource = fetched.source
-          let answerText = cleanStudioAnswerText(fetched.text || lastCandidateText)
+        const shiftValidateAndCheckCoverage = (unshiftedInput: string): void => {
+          rawAnswer = ''
+          validation = null
+          let answerText = isThinkingOnlyText(unshiftedInput)
+            ? unshiftedInput.trim()
+            : cleanStudioAnswerText(unshiftedInput)
           fetchedRawText = answerText
           let clipDurationExceeded = false
-          validation = null
 
-          if (windowClip && answerText) {
+          if (windowClip && answerText && !isThinkingOnlyText(answerText)) {
             const maxMovieEnd = maxMovieEndSecInHissa2(answerText)
             if (maxMovieEnd > windowClip.durationSec + 10) {
               clipDurationExceeded = true
@@ -4654,10 +4906,9 @@ export class StudioBrowserController {
           }
 
           if (!clipDurationExceeded) {
-            // Wrap validation in try/catch so internal validator exceptions never cause a failure/retry
             try {
               validation = validateStudioAnswer(answerText, {
-                shortWindowSec: shortEndSec - shortStartSec,
+                shortWindowSec: shortDurationSec,
               })
             } catch (valErr) {
               const valErrMsg = valErr instanceof Error ? valErr.message : String(valErr)
@@ -4670,9 +4921,72 @@ export class StudioBrowserController {
                 'warn',
                 `ERROR [validate] Studio validator exception: ${valErrMsg}. Marking DONE (validation skipped) and accepting answer.`,
               )
-              rawAnswer = answerText
+              rawAnswer = cleanStudioAnswerText(answerText)
+              return
             }
           }
+
+          const curVal = validation as StudioValidationResult | null
+          if (!curVal) return
+
+          if (!curVal.ok) {
+            validationReason =
+              !doneIndicator && curVal.reason === 'empty' ? 'timeout_10m' : curVal.reason
+            return
+          }
+
+          // FIX 4: Clean HISSA 1 + HISSA 2 text (no UI noise, no Grounding Sources, no thumb_up/duration)
+          let candidateCleanAnswer = cleanStudioAnswerText(curVal.cleanedText)
+
+          // FIX 1: Coverage check (never compare HISSA 1 count with HISSA 2 count!) + out-of-window check
+          if (parallelMode) {
+            const parsedEntries = extractHissa1And2EntriesFromResponse(candidateCleanAnswer)
+            const cov = checkHissa2ShortCoverage(parsedEntries.hissa2Entries, shortDurationSec)
+            if (!cov.ok) {
+              candidateCleanAnswer = ''
+              validationReason = cov.reason || 'hissa2_coverage_gap'
+            } else {
+              if (cov.warning) {
+                this.logStep('HISSA 2 coverage note', cov.warning, 'warn')
+              }
+              const outOfWin = parsedEntries.hissa2Entries.find(
+                (e) =>
+                  e.found &&
+                  e.movieStartSec !== null &&
+                  e.movieEndSec !== null &&
+                  (e.movieStartSec < movieStartSec - 5 || e.movieEndSec > movieEndSec + 5),
+              )
+              if (outOfWin && outOfWin.movieStartSec !== null && outOfWin.movieEndSec !== null) {
+                candidateCleanAnswer = ''
+                validationReason = `out-of-window (${formatParallelTimecode(outOfWin.movieStartSec)}-${formatParallelTimecode(outOfWin.movieEndSec)} outside ${formatParallelTimecode(movieStartSec)}-${formatParallelTimecode(movieEndSec)} ±5s)`
+              }
+            }
+          }
+
+          if (candidateCleanAnswer) {
+            rawAnswer = candidateCleanAnswer
+            if (curVal.stats.softWarning) {
+              this.logStep('result coverage note', curVal.stats.softWarning, 'warn')
+            }
+            const matchNote =
+              curVal.stats.matchLineCount > 0 ? `${curVal.stats.matchLineCount} matches` : '0 matches'
+            this.logStep(
+              'SUCCESS [validate]',
+              `result check OK (HISSA 1 + HISSA 2, ${curVal.stats.totalValidHissa2Lines} lines: ${matchNote}, ${curVal.stats.notFoundLineCount} notFound, source=${fetchedSource})`,
+              'success',
+            )
+            onLog?.(
+              'success',
+              `SUCCESS [validate] ${jobLabel}: valid result (${curVal.stats.totalValidHissa2Lines} lines: ${matchNote}, ${curVal.stats.notFoundLineCount} not found, source=${fetchedSource})`,
+            )
+          }
+        }
+
+        const fetchShiftAndValidateOnce = async (): Promise<void> => {
+          const fetched = await this.fetchStudioResultFromTurnOrFallback(page)
+          fetchedSource = fetched.source
+          accumulatedUnshiftedText = fetched.text || lastCandidateText
+          shiftValidateAndCheckCoverage(accumulatedUnshiftedText)
         }
 
         if (!transientBannerReason) {
@@ -4680,7 +4994,7 @@ export class StudioBrowserController {
 
           // FIX 6 (after fetch): If validation failed with an INCOMPLETE reason, wait 10s once and re-fetch + re-validate
           const firstVal = validation as StudioValidationResult | null
-          if (firstVal && !firstVal.ok && INCOMPLETE_REASONS.has(firstVal.reason)) {
+          if (!rawAnswer && firstVal && !firstVal.ok && INCOMPLETE_REASONS.has(firstVal.reason)) {
             this.logStep(
               'incomplete post-fetch -> 10s re-fetch',
               `${jobLabel}: validation=${firstVal.reason} -> waiting 10s and re-fetching once before retry`,
@@ -4690,57 +5004,65 @@ export class StudioBrowserController {
             await fetchShiftAndValidateOnce()
           }
 
-          const finalVal = validation as StudioValidationResult | null
-          if (finalVal) {
-            if (finalVal.ok) {
-              rawAnswer = finalVal.cleanedText
+          // FIX 3(a) & FIX 3(c): On incomplete/truncated result, capture diagnostics + screenshot,
+          // and if HISSA 1 is present and NOT thinking_only, attempt up to 2 CONTINUE follow-ups in the same chat!
+          if (
+            !rawAnswer &&
+            (INCOMPLETE_REASONS.has(validationReason) ||
+              validationReason.startsWith('hissa2_coverage_gap'))
+          ) {
+            await this.captureIncompleteDiagnostics(page, {
+              scanId,
+              jobLabel,
+              reason: validationReason,
+              finishReason: capturedFinishReason,
+              onLog,
+            })
 
-              // Parallel Window Scan extra strict checks (Section 5):
-              // 1) HISSA 1 scene count == HISSA 2 entry count
-              // 2) Movie timestamps must fall within [movieStartSec - 5, movieEndSec + 5] (no offset added)
-              if (parallelMode) {
-                const parsedEntries = extractHissa1And2EntriesFromResponse(rawAnswer)
-                const h1Count = parsedEntries.hissa1Entries.length
-                const h2Count = finalVal.stats.totalValidHissa2Lines
-                if (h1Count > 0 && h1Count !== h2Count) {
-                  rawAnswer = ''
-                  validationReason = `hissa1_hissa2_count_mismatch (HISSA 1=${h1Count}, HISSA 2=${h2Count})`
-                } else {
-                  const outOfWin = parsedEntries.hissa2Entries.find(
-                    (e) =>
-                      e.found &&
-                      e.movieStartSec !== null &&
-                      e.movieEndSec !== null &&
-                      (e.movieStartSec < movieStartSec - 5 || e.movieEndSec > movieEndSec + 5),
+            const canContinueInSameChat =
+              /\bHISSA\s*1\b/i.test(accumulatedUnshiftedText) &&
+              validationReason !== 'thinking_only' &&
+              !isThinkingOnlyText(accumulatedUnshiftedText) &&
+              (validationReason === 'truncated_last_line' ||
+                validationReason === 'empty_hissa2' ||
+                validationReason === 'missing_hissa' ||
+                validationReason.startsWith('hissa2_coverage_gap'))
+
+            if (canContinueInSameChat) {
+              for (let contAttempt = 1; contAttempt <= 2 && !rawAnswer; contAttempt++) {
+                try {
+                  this.logStep(
+                    `CONTINUE recovery (${contAttempt}/2)`,
+                    `${jobLabel}: reason=${validationReason} -> sending Continue in same chat`,
+                    'warn',
                   )
-                  if (outOfWin && outOfWin.movieStartSec !== null && outOfWin.movieEndSec !== null) {
-                    rawAnswer = ''
-                    validationReason = `out-of-window (${formatParallelTimecode(outOfWin.movieStartSec)}-${formatParallelTimecode(outOfWin.movieEndSec)} outside ${formatParallelTimecode(movieStartSec)}-${formatParallelTimecode(movieEndSec)} ±5s)`
+                  const contText = await this.sendContinueFollowUpAndFetch(page, {
+                    jobLabel,
+                    activeModelName,
+                    continueAttempt: contAttempt,
+                    scope,
+                    onLog,
+                  })
+                  if (contText && contText.trim()) {
+                    accumulatedUnshiftedText = stitchContinuedStudioAnswer(
+                      accumulatedUnshiftedText,
+                      contText,
+                    )
+                    shiftValidateAndCheckCoverage(accumulatedUnshiftedText)
                   }
+                } catch (contErr) {
+                  const contMsg = contErr instanceof Error ? contErr.message : String(contErr)
+                  if (contMsg.startsWith('POLICY_BLOCKED:') || contMsg.startsWith('STOPPED:')) {
+                    throw contErr
+                  }
+                  this.logStep(
+                    `continue #${contAttempt} error`,
+                    `${jobLabel}: ${contMsg.slice(0, 160)}`,
+                    'warn',
+                  )
+                  break
                 }
               }
-
-              if (rawAnswer) {
-                if (finalVal.stats.softWarning) {
-                  this.logStep('result coverage note', finalVal.stats.softWarning, 'warn')
-                }
-                const matchNote =
-                  finalVal.stats.matchLineCount > 0
-                    ? `${finalVal.stats.matchLineCount} matches`
-                    : '0 matches'
-                this.logStep(
-                  'SUCCESS [validate]',
-                  `result check OK (HISSA 1 + HISSA 2, ${finalVal.stats.totalValidHissa2Lines} lines: ${matchNote}, ${finalVal.stats.notFoundLineCount} notFound, source=${fetchedSource})`,
-                  'success',
-                )
-                onLog?.(
-                  'success',
-                  `SUCCESS [validate] ${jobLabel}: valid result (${finalVal.stats.totalValidHissa2Lines} lines: ${matchNote}, ${finalVal.stats.notFoundLineCount} not found, source=${fetchedSource})`,
-                )
-              }
-            } else {
-              validationReason =
-                !doneIndicator && finalVal.reason === 'empty' ? 'timeout_10m' : finalVal.reason
             }
           }
         }
@@ -4756,7 +5078,7 @@ export class StudioBrowserController {
           const newlineCount = (cleanedDiagText.match(/\n/g) || []).length
           const first300 = JSON.stringify(cleanedDiagText.slice(0, 300))
           const last400 = JSON.stringify(cleanedDiagText.slice(-400))
-          const badDiagMsg = `BAD_RESULT_DIAG [reason=${badReason}] fetchedSource=${fetchedSource} prohibited=${prohibitedDetected} rawLength=${fetchedRawText.length} cleanedLength=${cleanedDiagText.length} newlines=${newlineCount} first300=${first300} last400=${last400}`
+          const badDiagMsg = `BAD_RESULT_DIAG [reason=${badReason}] fetchedSource=${fetchedSource} finishReason=${capturedFinishReason || 'unknown'} prohibited=${prohibitedDetected} rawLength=${fetchedRawText.length} cleanedLength=${cleanedDiagText.length} newlines=${newlineCount} first300=${first300} last400=${last400}`
           this.logStep('BAD result diagnostic', badDiagMsg, 'warn')
           onLog?.('warn', `${badDiagMsg} on ${jobLabel}`)
           this.logStep(

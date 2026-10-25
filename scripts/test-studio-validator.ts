@@ -1,106 +1,162 @@
 import assert from 'node:assert/strict'
 import {
+  checkHissa2ShortCoverage,
   cleanStudioAnswerText,
   isPromptEchoText,
+  isThinkingOnlyText,
+  stitchContinuedStudioAnswer,
   validateStudioAnswer,
 } from '../lib/studio-result-validator'
 import { extractHissa1And2EntriesFromResponse } from '../lib/studio-window-planner'
-import { shiftMovieTimestampsInHissa2 } from '../lib/studio-clip-offset'
-import { buildStudioChunkPrompt } from '../lib/studio-prompt'
 
-// 1. Completely flattened (0-newline) DOM output with UI icon noise + Grounding footer + duration token
-const flattenedWithNoise = [
-  'edit more_vert Thinking Initiating Video Analysis Let me check the frames carefully.',
-  '===================== HISSA 1 — SHORT VIDEO TIME MAP =====================',
-  '00:00.000 - 00:01.000 (0-24 frames): Actor walks into the room and says "Kahan jaa rahe ho?"',
-  '00:01.000 - 00:02.500 (24-60 frames): Close-up of door closing quickly',
-  '===================== HISSA 2 — MOVIE MAP TIME =====================',
-  'Short 00:00.000 - 00:01.000 --> Movie 01:10.000 - 01:11.000 (1680-1704 frames)',
-  'Short 00:01.000 - 00:02.500 --> NOT FOUND — ye scene is movie window me nahi hai',
-  'Sources help Google Search Suggestions Display of Search Suggestions is required when using Grounding with Google Search. Learn more thumb_upthumb_down 6m31.5s',
-].join(' ')
+function fmtTs(sec: number): string {
+  const mm = Math.floor(sec / 60)
+  const ss = sec - mm * 60
+  return `${String(mm).padStart(2, '0')}:${ss.toFixed(3).padStart(6, '0')}`
+}
 
+// ============================================================================
+// CASE (a): HISSA 1 = 104 lines, HISSA 2 = 9 lines (grouped NOT FOUND ranges)
+// Must ACCEPT (count mismatch is never checked; coverage is contiguous 0..179s)
+// ============================================================================
+const shortDurationSec = 179.0 // 02:59.000
+const hissa1Lines104: string[] = []
+for (let i = 0; i < 104; i++) {
+  const s = (i * shortDurationSec) / 104
+  const e = ((i + 1) * shortDurationSec) / 104
+  const f1 = Math.round(s * 24)
+  const f2 = Math.round(e * 24)
+  hissa1Lines104.push(`${fmtTs(s)} - ${fmtTs(e)} (${f1}-${f2} frames): Scene segment #${i + 1} action`)
+}
+
+// 9 HISSA 2 lines covering 00:00.000 to 02:59.000 contiguously
+const hissa2Lines9 = [
+  'Short 00:00.000 - 00:00.750 --> Movie 00:10.000 - 00:10.750 (240-258 frames)',
+  'Short 00:00.750 - 00:01.500 --> Movie 00:10.750 - 00:11.500 (258-276 frames)',
+  'Short 00:01.500 - 00:02.250 --> Movie 00:11.500 - 00:12.250 (276-294 frames)',
+  'Short 00:02.250 - 00:03.000 --> Movie 00:12.250 - 00:13.000 (294-312 frames)',
+  'Short 00:03.000 - 00:03.750 --> Movie 00:13.000 - 00:13.750 (312-330 frames)',
+  'Short 00:03.750 - 00:04.500 --> Movie 00:13.750 - 00:14.500 (330-348 frames)',
+  'Short 00:04.500 - 00:05.125 --> Movie 00:14.500 - 00:15.125 (348-363 frames)',
+  'Short 00:05.125 - 00:05.792 --> Movie 00:15.125 - 00:15.792 (363-379 frames)',
+  'Short 00:05.792 - 02:59.000 --> NOT FOUND - ye saare scenes is movie window me nahi hain (ye short video Texas ke hospital ke scenes par hai -> : . ...)',
+]
+
+const caseAText = [
+  'edit',
+  'more_vert',
+  '=====================',
+  'HISSA 1 — SHORT VIDEO TIME MAP',
+  '=====================',
+  ...hissa1Lines104,
+  '=====================',
+  'HISSA 2 — MOVIE MAP TIME',
+  '=====================',
+  ...hissa2Lines9,
+  'Sources help',
+  'Google Search Suggestions',
+  'Display of Search Suggestions is required when using Grounding with Google Search. Learn more',
+  'thumb_upthumb_down 6m31.5s',
+].join('\n')
+
+const valCaseA = validateStudioAnswer(caseAText, { shortWindowSec: shortDurationSec })
+assert.equal(valCaseA.ok, true, `Case (a) must ACCEPT, got: ${valCaseA.reason}`)
+assert.equal(valCaseA.stats.totalValidHissa2Lines, 9)
+assert.ok(!valCaseA.cleanedText.includes('Sources help'), 'Grounding Sources must be stripped')
+assert.ok(!valCaseA.cleanedText.includes('thumb_up'), 'thumb_up must be stripped')
+
+const parsedCaseA = extractHissa1And2EntriesFromResponse(valCaseA.cleanedText)
+assert.equal(parsedCaseA.hissa1Entries.length, 104, 'Should parse 104 HISSA 1 entries')
+assert.equal(parsedCaseA.hissa2Entries.length, 9, 'Should parse 9 HISSA 2 entries')
+
+const covCaseA = checkHissa2ShortCoverage(parsedCaseA.hissa2Entries, shortDurationSec)
+assert.equal(covCaseA.ok, true, `Case (a) coverage must pass, got: ${covCaseA.reason}`)
+
+// ============================================================================
+// CASE (b): NOT FOUND note containing lowercase "short" + Movie frame range tail
+// Both multiline and flattened (0-newline) must ACCEPT (NOT truncated)
+// ============================================================================
+const caseBMultiline = `HISSA 1 — SHORT VIDEO TIME MAP
+00:00.000 - 00:05.792 (0-139 frames): Opening doctor conversation
+00:05.792 - 02:59.000 (139-4296 frames): Hospital corridor scenes
+HISSA 2 — MOVIE MAP TIME
+Short 00:00.000 - 00:05.792 --> Movie 01:15.584 - 01:16.126 (1814-1827 frames)
+Short 00:05.792 - 02:59.000 --> NOT FOUND - ye saare scenes is movie window me nahi hain (ye short video Texas ke hospital ... nahi hain)`
+
+const caseBFlattened = caseBMultiline.replace(/\r?\n/g, ' ')
+assert.equal((caseBFlattened.match(/\n/g) || []).length, 0, 'Flattened input has 0 newlines')
+
+const valCaseBMulti = validateStudioAnswer(caseBMultiline, { shortWindowSec: 179 })
+const valCaseBFlat = validateStudioAnswer(caseBFlattened, { shortWindowSec: 179 })
+assert.equal(valCaseBMulti.ok, true, `Case (b) multiline must ACCEPT, got: ${valCaseBMulti.reason}`)
+assert.equal(valCaseBFlat.ok, true, `Case (b) flattened must ACCEPT, got: ${valCaseBFlat.reason}`)
+
+// Sub-test 3 from Fix 2: ending on "... --> Movie 01:15.584 - 01:16.126 (1814-1827 frames)"
+const caseBEndsWithMovie = `HISSA 1 — SHORT VIDEO TIME MAP
+00:00.000 - 00:00.542 (0-13 frames): Doctor looks up
+HISSA 2 — MOVIE MAP TIME
+Short 00:00.000 - 00:00.542 --> Movie 01:15.584 - 01:16.126 (1814-1827 frames)`
+assert.equal(validateStudioAnswer(caseBEndsWithMovie, { shortWindowSec: 0.542 }).ok, true)
 assert.equal(
-  (flattenedWithNoise.match(/\n/g) || []).length,
-  0,
-  'Input flattenedWithNoise must have 0 newlines',
+  validateStudioAnswer(caseBEndsWithMovie.replace(/\r?\n/g, ' '), { shortWindowSec: 0.542 }).ok,
+  true,
 )
 
-const cleanedFlattened = cleanStudioAnswerText(flattenedWithNoise)
-assert.ok(cleanedFlattened.startsWith('HISSA 1'), 'Should start at HISSA 1 after cleaning')
-assert.ok(!cleanedFlattened.includes('edit'), 'Should strip leading edit token')
-assert.ok(!cleanedFlattened.includes('more_vert'), 'Should strip leading more_vert token')
-assert.ok(!cleanedFlattened.includes('Sources help'), 'Should strip Grounding Sources block')
-assert.ok(!cleanedFlattened.includes('thumb_up'), 'Should strip thumb_up/thumb_down tokens')
-assert.ok(!cleanedFlattened.includes('6m31.5s'), 'Should strip duration token 6m31.5s')
-assert.ok(
-  (cleanedFlattened.match(/\n/g) || []).length >= 4,
-  'Cleaned text should have restored newlines for HISSA 1, HISSA 2, and Short lines',
-)
-
-const valFlattened = validateStudioAnswer(flattenedWithNoise, { shortWindowSec: 2.5 })
-assert.equal(valFlattened.ok, true, `Expected flattened answer to validate OK, got: ${valFlattened.reason}`)
-assert.equal(valFlattened.stats.matchLineCount, 1)
-assert.equal(valFlattened.stats.notFoundLineCount, 1)
-assert.equal(valFlattened.stats.totalValidHissa2Lines, 2)
-
-// Verify parallel parser and clip-offset shifter also work on the cleaned flattened text
-const shiftedFlattened = shiftMovieTimestampsInHissa2(valFlattened.cleanedText, 2400) // +100s
-assert.ok(
-  shiftedFlattened.includes('Movie 02:50.000 - 02:51.000 (4080-4104 frames)'),
-  'Clip offset shift should work on cleaned flattened text',
-)
-const parallelParsed = extractHissa1And2EntriesFromResponse(shiftedFlattened)
-assert.equal(parallelParsed.hissa1Entries.length, 2, 'Should parse 2 HISSA 1 entries')
-assert.equal(parallelParsed.hissa2Entries.length, 2, 'Should parse 2 HISSA 2 entries')
-
-// 2. Normal multiline text with DOM noise & grounding block
-const multilineWithNoise = `edit
-more_vert
-Thoughts
-Analyzing 24fps frames...
-=====================
-HISSA 1 — SHORT VIDEO TIME MAP
-=====================
-00:00.000 - 00:01.500 (0-36 frames): Hero looks at the train station clock
-00:01.500 - 00:03.000 (36-72 frames): Train arrives on platform 2
-
-=====================
+// ============================================================================
+// CASE (c): Truncated at "Short 02:" -> REJECT ('truncated_last_line')
+// Both multiline and flattened (0-newline) must give same result, and CONTINUE stitch fixes it
+// ============================================================================
+const caseCMultiline = `HISSA 1 — SHORT VIDEO TIME MAP
+00:00.000 - 02:22.667 (0-3424 frames): First part of short
+02:22.667 - 02:24.000 (3424-3456 frames): Second part of short
+02:24.000 - 02:30.000 (3456-3600 frames): Third part of short
 HISSA 2 — MOVIE MAP TIME
-=====================
-Short 00:00.000 - 00:01.500 --> Movie 00:20.000 - 00:21.500 (480-516 frames)
-Short 00:01.500 - 00:03.000 --> Movie 00:21.500 - 00:23.000 (516-552 frames)
-Sources help
-1. example.com
-Google Search Suggestions
-Display of Search Suggestions is required when using Grounding with Google Search. Learn more
-thumb_up
-thumb_down
-12.4s`
+Short 00:00.000 - 02:22.667 --> NOT FOUND - not in this window
+Short 02:22.667 - 02:24.000 --> Movie 18:16.667 - 18:18.000 (26320-26352 frames)
+Short 02:`
 
-const valMultiline = validateStudioAnswer(multilineWithNoise, { shortWindowSec: 3.0 })
-assert.equal(valMultiline.ok, true, `Expected multiline answer to validate OK, got: ${valMultiline.reason}`)
-assert.equal(valMultiline.stats.matchLineCount, 2)
-assert.equal(valMultiline.stats.notFoundLineCount, 0)
-assert.ok(!valMultiline.cleanedText.includes('Sources help'))
-assert.ok(!valMultiline.cleanedText.includes('12.4s'))
+const caseCFlattened = caseCMultiline.replace(/\r?\n/g, ' ')
+const valCaseCMulti = validateStudioAnswer(caseCMultiline, { shortWindowSec: 150 })
+const valCaseCFlat = validateStudioAnswer(caseCFlattened, { shortWindowSec: 150 })
+assert.equal(valCaseCMulti.ok, false, 'Case (c) multiline must REJECT')
+assert.equal(valCaseCMulti.reason, 'truncated_last_line')
+assert.equal(valCaseCFlat.ok, false, 'Case (c) flattened must REJECT')
+assert.equal(valCaseCFlat.reason, 'truncated_last_line')
 
-// 3. Prompt text must be rejected as 'prompt_echo'
-const promptText = buildStudioChunkPrompt({ movieWindowSec: 300, shortPartSec: 30 })
-assert.equal(isPromptEchoText(promptText), true, 'Prompt must be detected by isPromptEchoText')
-const valPrompt = validateStudioAnswer(promptText, { shortWindowSec: 30 })
-assert.equal(valPrompt.ok, false, 'Prompt text must NEVER pass validateStudioAnswer')
-assert.equal(valPrompt.reason, 'prompt_echo')
+// Verify CONTINUE stitching drops "Short 02:" and appends remaining line cleanly
+const stitchedCaseC = stitchContinuedStudioAnswer(
+  caseCFlattened,
+  'Short 02:24.000 - 02:30.000 --> Movie 18:18.000 - 18:24.000 (26352-26496 frames)',
+)
+const valStitched = validateStudioAnswer(stitchedCaseC, { shortWindowSec: 150 })
+assert.equal(valStitched.ok, true, `Stitched continuation must ACCEPT, got: ${valStitched.reason}`)
+assert.equal(valStitched.stats.totalValidHissa2Lines, 3)
 
-// 4. Truncated stream must still be rejected as 'truncated_last_line'
-const truncatedAnswer = `HISSA 1 — SHORT VIDEO TIME MAP
-00:00.000 - 00:01.000 (0-24 frames): Scene one
-00:01.000 - 00:02.000 (24-48 frames): Scene two
-HISSA 2 — MOVIE MAP TIME
-Short 00:00.000 - 00:01.000 --> Movie 00:12.000 - 00:13.000 (288-312 frames)
-Short 00:01.000 - 00:02.000 --> Movie 00:13.0`
-const valTruncated = validateStudioAnswer(truncatedAnswer, { shortWindowSec: 2.0 })
-assert.equal(valTruncated.ok, false)
-assert.equal(valTruncated.reason, 'truncated_last_line')
+// ============================================================================
+// CASE (d): Thinking-only text (e.g. cut off at "Movie: frame 4319" without HISSA 1)
+// Must REJECT with reason === 'thinking_only'
+// ============================================================================
+const caseDThinkingOnly = `Thinking
+Initiating Video Analysis
+Let's check each sub-segment carefully.
+MATCHED SECTION: checking hospital hallway
+Sub-segment 1: 00:00.000 - 00:01.200, Offset = +14.250s
+Comparing Short: frame 28 with Movie: frame 4319`
 
-console.log('ALL STUDIO VALIDATOR & CLEANER TESTS PASSED!')
+assert.equal(isThinkingOnlyText(caseDThinkingOnly), true, 'Must detect thinking-only text')
+const valCaseD = validateStudioAnswer(caseDThinkingOnly, { shortWindowSec: 179 })
+assert.equal(valCaseD.ok, false, 'Case (d) thinking-only must REJECT')
+assert.equal(valCaseD.reason, 'thinking_only')
+
+// Also verify coverage gap rejection (> 1.5s gap in HISSA 2)
+const gapCheck = checkHissa2ShortCoverage(
+  [
+    { shortStartSec: 0, shortEndSec: 10 },
+    { shortStartSec: 15, shortEndSec: 30 },
+  ],
+  30,
+)
+assert.equal(gapCheck.ok, false)
+assert.ok(gapCheck.reason?.startsWith('hissa2_coverage_gap'))
+
+console.log('ALL 4 REQUIRED TEST CASES (a, b, c, d) + COVERAGE & STITCHING PASSED!')

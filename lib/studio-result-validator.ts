@@ -57,6 +57,25 @@ export function isPromptEchoText(text: string): boolean {
 }
 
 /**
+ * FIX 3(b): Detect thinking-only text when "HISSA 1" is absent and model reasoning/thought markers are present.
+ */
+export function isThinkingOnlyText(text: string): boolean {
+  const raw = (text || '').trim()
+  if (!raw) return false
+  if (/\bHISSA\s*1\b/i.test(raw)) return false
+  return (
+    /\bMATCHED\s+SECTION\b/i.test(raw) ||
+    /\bSub-segment\b/i.test(raw) ||
+    /\bOffset\s*=/i.test(raw) ||
+    /\bInitiating\s+Video\s+Analysis\b/i.test(raw) ||
+    /\bMovie:\s*frame\s*\d+/i.test(raw) ||
+    /\bShort:\s*frame\s*\d+/i.test(raw) ||
+    /^(?:Thoughts|Thinking)\b/i.test(raw) ||
+    /\bLet(?:'s|\s+me)\s+(?:analyze|check|verify|scan|look\s+at)\b/i.test(raw)
+  )
+}
+
+/**
  * Clean DOM / clipboard noise from an AI Studio model turn response:
  * 1. Strip leading UI icon tokens ("edit", "more_vert", "content_copy", "flag", "auto_awesome").
  * 2. Strip any thinking leak / preamble before "HISSA 1".
@@ -135,11 +154,8 @@ export function cleanStudioAnswerText(text: string): string {
     '$1\n$2',
   )
 
-  // 5) Newline before each HISSA 2 "Short mm:ss.mmm - mm:ss.mmm -->" entry
-  s = s.replace(
-    /([^\n])\s+(Short[:\s]+(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-->|->|—>|=>|→))/gi,
-    '$1\n$2',
-  )
+  // 5) Newline before each HISSA 2 case-sensitive "Short <ts>" entry (including truncated "Short 02:" at the end of a line)
+  s = s.replace(/([^\n])\s+(Short[:\s]+(?:\d+:)?\d{1,2}:\d{0,2})/g, '$1\n$2')
 
   // Collapse 3+ consecutive newlines to 2
   s = s.replace(/\n{3,}/g, '\n\n').trim()
@@ -177,50 +193,212 @@ function hasTruncatedTimestampToken(line: string): boolean {
 }
 
 /**
- * Check whether the tail of HISSA 2 looks cut off / truncated mid-stream.
- * Examines the final non-empty portion of normalized text, checking for:
- * 1. Dangling connectors / arrows / hyphens / colons at the end of the text.
- * 2. Incomplete millisecond timestamp at the end (e.g. "00:13.0" or "00:13.").
- * 3. An incomplete final "Short" entry that was cut off before its arrow or target.
+ * FIX 2: Strip free-text notes (and parenthetical remarks) after `NOT FOUND` up to the next
+ * real case-sensitive `Short <timestamp>` entry (or end of string).
+ * This ensures words like lowercase "short", arrows "->", colons ":", or dots "..." inside
+ * a NOT FOUND explanation never trigger false truncation.
+ */
+function stripNotFoundNotesFromHissa2(normalizedHissa2: string): string {
+  return normalizedHissa2
+    .replace(
+      /(\bNOT[\s_]*FOUND\b)(?:(?!\s+Short[:\s]+(?:\d+:)?\d{1,2}:)[\s\S])*/gi,
+      '$1',
+    )
+    .trim()
+}
+
+/**
+ * FIX 2: Check whether the tail of HISSA 2 looks cut off / truncated mid-stream.
+ * - First strips free-text notes after `NOT FOUND` so lowercase "short" or punctuation inside notes is ignored.
+ * - Uses case-sensitive real entry pattern `/(?:^|\s)Short[:\s]+(?:\d+:)?\d{1,2}:\d{0,2}/g` (and checks for bare trailing `Short...`).
+ * - Applies dangling connector and incomplete timestamp checks strictly to the last real entry.
  */
 function isTailTruncated(normalizedHissa2: string): boolean {
-  const trimmed = normalizedHissa2.trim().replace(/[\])]+$/, '').trim()
-  if (!trimmed) return false
+  const strippedNotes = stripNotFoundNotesFromHissa2(normalizedHissa2)
+  if (!strippedNotes) return false
 
-  // Dangling connector or incomplete timestamp token at the very end
-  if (/(?:-->|->|—>|=>|→|-|–|—|:|\.\d{0,2})$/.test(trimmed)) {
+  // If the text ends with a bare/incomplete "Short" starter that didn't even reach "Short dd:dd"
+  // e.g. "... (26320-26352 frames) Short" or "... Short 02:"
+  if (/(?:^|\s)Short(?::|\s+(?:\d+:)?\d{0,2}:?\d{0,2}(?:\.\d*)?)?$/.test(strippedNotes)) {
     return true
   }
 
-  const lastToken = trimmed.split(' ').pop() || ''
+  // Find the last real case-sensitive "Short <mm:ss>" entry in stripped text
+  const realEntryPattern = /(?:^|\s)(Short[:\s]+(?:\d+:)?\d{1,2}:\d{2})/g
+  let lastShortIndex: number | null = null
+  let m: RegExpExecArray | null
+  while ((m = realEntryPattern.exec(strippedNotes)) !== null) {
+    const leadingLen = m[0].length - m[1].length
+    lastShortIndex = m.index + leadingLen
+  }
+
+  if (lastShortIndex === null) {
+    return true
+  }
+
+  const lastEntryRaw = strippedNotes.slice(lastShortIndex).trim()
+  // Strip optional trailing frame range "(1814-1827 frames)" from the end of a Movie match entry before checking tail connectors
+  const lastEntryCore = lastEntryRaw.replace(/\s*\(\d+\s*-\s*\d+\s*frames\)\s*$/i, '').trim()
+
+  // Dangling connector or incomplete timestamp token at the end of the last real entry
+  if (/(?:-->|->|—>|=>|→|-|–|—|:|\.\d{0,2})$/.test(lastEntryCore)) {
+    return true
+  }
+
+  const lastToken = lastEntryCore.split(/\s+/).pop() || ''
   if (hasTruncatedTimestampToken(lastToken)) {
     return true
   }
 
-  // Find the last "Short" entry in normalized text
-  const allShorts = [...trimmed.matchAll(/\bShort\b/gi)]
-  const lastShortMatch = allShorts.pop()
-  if (lastShortMatch && lastShortMatch.index !== undefined) {
-    const lastEntry = trimmed.slice(lastShortMatch.index)
+  // Complete match entry: Short <start> - <end> --> Movie <start> - <end>
+  const hasCompleteMatch =
+    /^Short[:\s]+(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?(?:\s*\([^)]*\))?\s*(?:-->|->|—>|=>|→|=)\s*Movie[:\s]+(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?$/i.test(
+      lastEntryCore,
+    )
 
-    // Complete match entry: Short <start> - <end> --> Movie <start> - <end>
-    const hasCompleteMatch =
-      /\bShort[:\s]+(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-->|->|—>|=>|→)\s*Movie[:\s]+(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?/i.test(
-        lastEntry,
-      )
+  // Complete not-found entry: Short <start> - <end> --> NOT FOUND
+  const hasCompleteNotFound =
+    /^Short[:\s]+(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?(?:\s*\([^)]*\))?\s*(?:-->|->|—>|=>|→|:|-|–|—|=)?\s*NOT[\s_]*FOUND$/i.test(
+      lastEntryCore,
+    )
 
-    // Complete not-found entry: Short <start> - <end> --> NOT FOUND
-    const hasCompleteNotFound =
-      /\bShort[:\s]+(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-->|->|—>|=>|→|:|-|–|—)?\s*NOT[\s_]*FOUND\b/i.test(
-        lastEntry,
-      )
-
-    if (!hasCompleteMatch && !hasCompleteNotFound) {
-      return true
-    }
+  if (!hasCompleteMatch && !hasCompleteNotFound) {
+    return true
   }
 
   return false
+}
+
+function fmtSecShort(sec: number): string {
+  const s = Math.max(0, sec)
+  const mm = Math.floor(s / 60)
+  const rem = s - mm * 60
+  return `${String(mm).padStart(2, '0')}:${rem.toFixed(3).padStart(6, '0')}`
+}
+
+/**
+ * FIX 1: Check HISSA 2 Short-video timeline coverage instead of comparing HISSA 1 vs HISSA 2 line counts.
+ * Rules:
+ * a) Sort HISSA 2 entries (both found and NOT FOUND) by shortStartSec ascending.
+ * b) First entry start must be <= 1.0s (hard reject if > 1.5s) and last entry end must be >= shortDurationSec - 2.0s.
+ * c) Any gap or overlap between consecutive entries > 1.5s is rejected with `hissa2_coverage_gap (<where>)`.
+ * d) Never compares HISSA 1 count with HISSA 2 count.
+ */
+export function checkHissa2ShortCoverage(
+  hissa2Entries: ReadonlyArray<{ shortStartSec: number; shortEndSec: number }>,
+  shortDurationSec: number,
+): { ok: boolean; reason?: string; warning?: string } {
+  if (!hissa2Entries || hissa2Entries.length === 0) {
+    return { ok: false, reason: 'hissa2_coverage_gap (no HISSA 2 entries parsed)' }
+  }
+
+  const sorted = [...hissa2Entries].sort(
+    (a, b) => a.shortStartSec - b.shortStartSec || a.shortEndSec - b.shortEndSec,
+  )
+
+  const warnings: string[] = []
+  const first = sorted[0]
+  if (first.shortStartSec > 1.5) {
+    return {
+      ok: false,
+      reason: `hissa2_coverage_gap (start ${fmtSecShort(0)}->${fmtSecShort(first.shortStartSec)}, gap=${first.shortStartSec.toFixed(2)}s)`,
+    }
+  } else if (first.shortStartSec > 1.0) {
+    warnings.push(`first HISSA 2 entry starts at ${fmtSecShort(first.shortStartSec)} (> 1.0s)`)
+  }
+
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = sorted[i - 1]
+    const curr = sorted[i]
+    const diff = curr.shortStartSec - prev.shortEndSec
+    if (diff > 1.5) {
+      return {
+        ok: false,
+        reason: `hissa2_coverage_gap (${fmtSecShort(prev.shortEndSec)}->${fmtSecShort(curr.shortStartSec)}, gap=+${diff.toFixed(2)}s)`,
+      }
+    }
+    if (diff < -1.5) {
+      return {
+        ok: false,
+        reason: `hissa2_coverage_gap (${fmtSecShort(prev.shortEndSec)}->${fmtSecShort(curr.shortStartSec)}, overlap=${Math.abs(diff).toFixed(2)}s)`,
+      }
+    }
+  }
+
+  const last = sorted[sorted.length - 1]
+  if (shortDurationSec > 0 && last.shortEndSec < shortDurationSec - 2.0) {
+    return {
+      ok: false,
+      reason: `hissa2_coverage_gap (end ${fmtSecShort(last.shortEndSec)} < ${fmtSecShort(shortDurationSec - 2.0)})`,
+    }
+  }
+
+  return {
+    ok: true,
+    warning: warnings.length > 0 ? warnings.join('; ') : undefined,
+  }
+}
+
+/**
+ * FIX 3(c): Remove the trailing incomplete line / fragment from a partial Studio answer
+ * and stitch the continuation turn text onto it.
+ */
+export function stitchContinuedStudioAnswer(
+  previousPartialText: string,
+  continuationTurnText: string,
+): string {
+  const prevCleaned = cleanStudioAnswerText(previousPartialText)
+  if (!prevCleaned) return cleanStudioAnswerText(continuationTurnText)
+
+  // Drop the last line of prevCleaned if it is incomplete / truncated
+  const prevLines = prevCleaned.split('\n')
+  while (prevLines.length > 0) {
+    const lastLine = prevLines[prevLines.length - 1].trim()
+    if (!lastLine) {
+      prevLines.pop()
+      continue
+    }
+    // Keep HISSA headings or complete HISSA 1 lines (before HISSA 2)
+    const isHissaHeading = /^(?:={3,}\s*)?HISSA\s*[12]\b/i.test(lastLine)
+    if (isHissaHeading) break
+
+    const hasHissa2SoFar = /\bHISSA\s*2\b/i.test(prevCleaned)
+    if (hasHissa2SoFar) {
+      // Check if lastLine is a valid complete HISSA 2 line
+      const lineTruncated = isTailTruncated(lastLine)
+      if (lineTruncated) {
+        prevLines.pop()
+        continue
+      }
+    } else {
+      // In HISSA 1: a complete line has "mm:ss.mmm - mm:ss.mmm (f1-f2 frames): description"
+      const isCompleteHissa1Line =
+        /^(?:\d+:)?\d{1,2}:\d{2}\.\d{3}\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}\.\d{3}\s*\(\d+\s*-\s*\d+\s*frames\)\s*:\s*\S+/i.test(
+          lastLine,
+        )
+      if (!isCompleteHissa1Line) {
+        prevLines.pop()
+        continue
+      }
+    }
+    break
+  }
+
+  // Clean continuation text without stripping before HISSA 1 (since continuation usually only has remaining lines)
+  let cont = (continuationTurnText || '').replace(/\r\n/g, '\n').trim()
+  cont = cont.replace(/^[ \t]*(?:edit|more_vert|content_copy|flag|auto_awesome)[ \t]*$/gim, '')
+  cont = cont.replace(/^(?:\s*(?:edit|more_vert|content_copy|flag|auto_awesome)\b\s*)+/i, '').trim()
+  cont = cont.replace(
+    /(?:\n|\s)*(?:Sources\s+help\b|Google\s+Search\s+Suggestions\b|Display\s+of\s+Search\s+Suggestions\s+is\s+required\b)[\s\S]*$/i,
+    '',
+  )
+  cont = cont.replace(
+    /(?:[\s\n]+(?:thumb_upthumb_down|thumb_up|thumb_down|more_vert|edit|content_copy|flag|\d+m\s*\d+(?:\.\d+)?s|\d+(?:\.\d+)?s))+\s*$/gi,
+    '',
+  ).trim()
+
+  const stitched = `${prevLines.join('\n').trim()}\n${cont}`
+  return cleanStudioAnswerText(stitched)
 }
 
 /**
@@ -276,6 +454,16 @@ export function validateStudioAnswer(
     }
   }
 
+  // FIX 3(b): Reject thinking-only text before missing_hissa / empty checks
+  if (isThinkingOnlyText(trimmed)) {
+    return {
+      ok: false,
+      reason: 'thinking_only',
+      cleanedText: '',
+      stats: emptyStats,
+    }
+  }
+
   const preCleaned = cleanStudioAnswerText(trimmed)
 
   // Check 1: Too short (< 100 chars)
@@ -301,7 +489,7 @@ export function validateStudioAnswer(
   }
 
   // Check 6: Strip any thinking leak / preamble before "HISSA 1"
-  const cleanedText = preCleaned.slice(hissa1Match.index).trim()
+  const cleanedText = cleanStudioAnswerText(preCleaned.slice(hissa1Match.index).trim())
 
   // Extract HISSA 2 body in a newline-independent way:
   // Match only the HISSA 2 heading (and optional subtitle like "— MOVIE MAP TIME"), stopping before the first "Short" or timestamp token
