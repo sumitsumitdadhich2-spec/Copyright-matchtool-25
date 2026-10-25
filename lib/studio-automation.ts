@@ -17,6 +17,17 @@ import {
   loadStudioUserConfig,
   saveStudioUserConfig,
 } from './studio-settings'
+import {
+  DEFAULT_STUDIO_MODEL_NAME,
+  buildStudioModelChain,
+  canonicalizeStudioModelName,
+  getEffectiveModel,
+  loadStudioModelQuotaState,
+  markModelExhausted,
+  normalizeStudioThinkingLevel,
+  thinkingLevelToDisplayLabel,
+  type StudioThinkingLevel,
+} from './studio-model-state'
 import { buildStudioChunkPrompt } from './studio-prompt'
 import { parseChunkMatches } from './gemini'
 import {
@@ -1417,11 +1428,87 @@ export class StudioBrowserController {
     }
   }
 
+  /**
+   * Close any "paid API key" / billing / API key selection dialog ONLY via its cross (X / close) button.
+   * Never clicks any button that selects an API key, links a project, or sets up billing.
+   */
+  private async closePaidApiKeyPopupByCrossButton(page: Page): Promise<boolean> {
+    try {
+      const closed = await page.evaluate(() => {
+        const isVisible = (el: Element | null): el is HTMLElement => {
+          if (!el) return false
+          const h = el as HTMLElement
+          const r = h.getBoundingClientRect()
+          return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+        }
+
+        const dialogs = Array.from(
+          document.querySelectorAll('mat-dialog-container, [role="dialog"], [aria-modal="true"]'),
+        ).filter(isVisible)
+
+        let closedAny = false
+        for (const dlg of dialogs) {
+          const txt = (dlg.innerText || dlg.textContent || '').trim()
+          if (
+            !/paid\s+api\s+key|billing|select\s+an?\s+api\s+key|link\s+a\s+paid|pay-as-you-go|api\s+key\s+required|set\s+up\s+billing/i.test(
+              txt,
+            )
+          ) {
+            continue
+          }
+
+          const buttons = Array.from(dlg.querySelectorAll('button, [role="button"]')).filter(isVisible)
+          for (const b of buttons) {
+            const aria = (b.getAttribute('aria-label') || '').trim()
+            const title = (b.getAttribute('title') || b.getAttribute('mattooltip') || '').trim()
+            const iconText = (b.innerText || b.textContent || '').trim()
+            const isCloseCross =
+              /\b(close|dismiss)\b/i.test(aria) ||
+              /\b(close|dismiss)\b/i.test(title) ||
+              /^(close|×|✕|✖|x)$/i.test(iconText)
+            const isForbiddenAction =
+              /\b(select|save|confirm|upgrade|billing|link|create|enable|continue|accept)\b/i.test(
+                `${aria} ${iconText}`,
+              ) && !/^(close|×|✕|✖)$/i.test(iconText)
+
+            if (isCloseCross && !isForbiddenAction) {
+              b.click()
+              closedAny = true
+              break
+            }
+          }
+        }
+        return closedAny
+      })
+
+      if (closed) {
+        this.logStep('paid API key popup closed', 'Closed paid API key / billing dialog via X button', 'info')
+        await new Promise((r) => setTimeout(r, 350))
+      }
+      return closed
+    } catch {
+      return false
+    }
+  }
+
   public async dismissAnyOnboardingModals(page: Page) {
+    await this.closePaidApiKeyPopupByCrossButton(page)
+
     for (const sel of STUDIO_SELECTORS.dismissDialogs) {
       try {
         const btn = page.locator(sel).first()
         if ((await btn.count()) > 0 && (await btn.isVisible())) {
+          const isInsidePaidKeyDialog = await btn
+            .evaluate((el) => {
+              const dlg = el.closest('mat-dialog-container, [role="dialog"], [aria-modal="true"]') as HTMLElement | null
+              const txt = (dlg?.innerText || dlg?.textContent || '').trim()
+              return /paid\s+api\s+key|billing|select\s+an?\s+api\s+key|link\s+a\s+paid|pay-as-you-go/i.test(txt)
+            })
+            .catch(() => false)
+          if (isInsidePaidKeyDialog) {
+            await this.closePaidApiKeyPopupByCrossButton(page)
+            continue
+          }
           await btn.click({ timeout: 1500 })
           await new Promise((r) => setTimeout(r, 300))
         }
@@ -1787,7 +1874,7 @@ export class StudioBrowserController {
             if (
               t &&
               !isWelcomeHeading(t) &&
-              (/gemini/i.test(t) || /3\.[678]/i.test(t) || /2\.5/i.test(t))
+              (/\bargon\b/i.test(t) || /gemini/i.test(t) || /3\.[678]/i.test(t) || /2\.5/i.test(t))
             ) {
               return t
             }
@@ -1818,6 +1905,7 @@ export class StudioBrowserController {
           const t = (node.innerText || node.textContent || '').trim().replace(/\s+/g, ' ')
           if (!t || isWelcomeHeading(t)) continue
           if (
+            /\bargon\b/i.test(t) ||
             /^gemini[\s-]+\d+(\.\d+)?/i.test(t) ||
             /\bgemini[\s-]+3\.[678]\b/i.test(t) ||
             /\bgemini[\s-]+2\.5\b/i.test(t)
@@ -1833,47 +1921,67 @@ export class StudioBrowserController {
   }
 
   /**
-   * Select a specific model (e.g. "Gemini 3.8 Flash", "Gemini 3.7 Flash", "Gemini 3.6 Flash")
-   * in the Run Settings panel if it is not already selected.
+   * Select a specific model ("Argon", "Gemini 3.8 Flash", "Gemini 3.7 Flash", "Gemini 3.6 Flash")
+   * in the Run Settings panel.
+   * - Supports name-based matching for "Argon" (/argon/i) and version+flash matching for 3.8/3.7/3.6.
+   * - If a paid API key / billing popup appears when selecting "Argon", closes it ONLY via its X button,
+   *   reads back the active model, and if "Argon" is not selected, treats Argon as unavailable for this window
+   *   and falls back to the next model in the chain.
    */
-  private async selectModelInRunSettings(page: Page, targetModelName: string): Promise<string> {
-    const desired = (targetModelName || 'Gemini 3.8 Flash').trim()
-    const versionMatch = desired.match(/(\d+\.\d+)/)
-    const desiredVersion = versionMatch ? versionMatch[1] : ''
-    const isFlash = /flash/i.test(desired)
+  private async selectModelInRunSettings(
+    page: Page,
+    targetModelName: string,
+    fallbackChain?: string[],
+  ): Promise<{ selectedModelName: string; visibleCardText: string }> {
+    const chain =
+      fallbackChain && fallbackChain.length > 0
+        ? fallbackChain
+        : buildStudioModelChain(targetModelName || DEFAULT_STUDIO_MODEL_NAME)
 
-    const matchesDesired = (text: string): boolean => {
-      if (!text) return false
-      if (desiredVersion) {
-        const hasVer = text.includes(desiredVersion)
-        const hasVariant = !isFlash || /flash/i.test(text)
-        return hasVer && hasVariant
+    const trySelectSingleModel = async (
+      desiredRaw: string,
+    ): Promise<{ matched: boolean; cardText: string }> => {
+      const desired = (desiredRaw || DEFAULT_STUDIO_MODEL_NAME).trim()
+      const isArgon = /\bargon\b/i.test(desired)
+      const versionMatch = isArgon ? null : desired.match(/(\d+\.\d+)/)
+      const desiredVersion = versionMatch ? versionMatch[1] : ''
+      const isFlash = /flash/i.test(desired)
+
+      const matchesDesired = (text: string): boolean => {
+        if (!text) return false
+        if (isArgon) {
+          return /\bargon\b/i.test(text)
+        }
+        if (desiredVersion) {
+          const hasVer = text.includes(desiredVersion)
+          const hasVariant = !isFlash || /flash/i.test(text)
+          return hasVer && hasVariant
+        }
+        return text.toLowerCase().includes(desired.toLowerCase())
       }
-      return text.toLowerCase().includes(desired.toLowerCase())
-    }
 
-    const currentCardText = await this.readVisibleModelCardText(page)
-    if (matchesDesired(currentCardText)) {
-      return currentCardText
-    }
-
-    // If default 3.8 Flash was requested and some default model is already loaded, keep it unless fallback was requested
-    if (!desiredVersion || desiredVersion === '3.8') {
-      if (!currentCardText || matchesDesired(currentCardText)) {
-        return currentCardText || desired
+      const currentCardText = await this.readVisibleModelCardText(page)
+      if (matchesDesired(currentCardText)) {
+        return { matched: true, cardText: currentCardText }
       }
-    }
 
-    this.logStep('selecting model', `Switching model to "${desired}" (current="${currentCardText || 'default'}")`, 'info')
+      this.logStep(
+        'selecting model',
+        `Switching model to "${desired}" (current="${currentCardText || 'default'}")`,
+        'info',
+      )
 
-    const trigger = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSelectorTrigger, 2500)
-    if (trigger) {
+      const trigger = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSelectorTrigger, 2500)
+      if (!trigger) {
+        return { matched: matchesDesired(currentCardText), cardText: currentCardText || desired }
+      }
+
       await trigger.click().catch(() => {})
       await new Promise((r) => setTimeout(r, 450))
 
       const clickedModel = await page
         .evaluate(
-          ({ ver, wantFlash, fullLabel }) => {
+          ({ ver, wantFlash, wantArgon, fullLabel }) => {
             const isVisible = (el: Element | null): el is HTMLElement => {
               if (!el) return false
               const h = el as HTMLElement
@@ -1881,7 +1989,6 @@ export class StudioBrowserController {
               return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
             }
 
-            // Search inside overlay panes / model picker lists first
             const roots = Array.from(
               document.querySelectorAll(
                 '.cdk-overlay-pane, mat-dialog-container, [role="listbox"], [role="menu"], ms-model-carousel, [class*="model-list" i], [class*="model-picker" i]',
@@ -1902,7 +2009,12 @@ export class StudioBrowserController {
             for (const c of candidates) {
               const txt = (c.innerText || c.textContent || '').trim().replace(/\s+/g, ' ')
               if (!txt) continue
-              if (ver) {
+              if (wantArgon) {
+                if (/\bargon\b/i.test(txt)) {
+                  c.click()
+                  return txt
+                }
+              } else if (ver) {
                 if (txt.includes(ver) && (!wantFlash || /flash/i.test(txt)) && !/lite/i.test(txt)) {
                   c.click()
                   return txt
@@ -1914,19 +2026,57 @@ export class StudioBrowserController {
             }
             return null
           },
-          { ver: desiredVersion, wantFlash: isFlash, fullLabel: desired },
+          { ver: desiredVersion, wantFlash: isFlash, wantArgon: isArgon, fullLabel: desired },
         )
         .catch(() => null)
 
-      await new Promise((r) => setTimeout(r, 400))
+      await new Promise((r) => setTimeout(r, 450))
+
+      // Requirement 2: If selecting "Argon" (or any model) opened a "paid API key" / billing popup,
+      // close it ONLY via its cross (X) button.
+      await this.closePaidApiKeyPopupByCrossButton(page)
       await this.dismissOpenOverlayIfAny(page)
 
-      const updatedCardText = (await this.readVisibleModelCardText(page)) || clickedModel || desired
-      this.logStep('model selected', `Active model in Run Settings: ${updatedCardText}`, 'info')
-      return updatedCardText
+      const updatedCardText = (await this.readVisibleModelCardText(page)) || ''
+      const verified = matchesDesired(updatedCardText) || (!isArgon && Boolean(clickedModel))
+      return {
+        matched: verified,
+        cardText: updatedCardText || (verified ? clickedModel || desired : ''),
+      }
     }
 
-    return currentCardText || desired
+    const startCanonical = canonicalizeStudioModelName(targetModelName)
+    const startIdx = Math.max(
+      0,
+      chain.findIndex((m) => canonicalizeStudioModelName(m).toLowerCase() === startCanonical.toLowerCase()),
+    )
+
+    for (let i = startIdx; i < chain.length; i++) {
+      const candidateModel = chain[i]
+      const res = await trySelectSingleModel(candidateModel)
+      if (res.matched) {
+        this.logStep('model selected', `Active model in Run Settings: ${res.cardText || candidateModel}`, 'info')
+        return {
+          selectedModelName: canonicalizeStudioModelName(candidateModel),
+          visibleCardText: res.cardText || candidateModel,
+        }
+      }
+
+      const nextFallback = chain[i + 1]
+      if (nextFallback) {
+        this.logStep(
+          'model unavailable',
+          `"${candidateModel}" unavailable after selection/popup close (readBack="${res.cardText || 'none'}") -> falling back to "${nextFallback}"`,
+          'warn',
+        )
+      }
+    }
+
+    const fallbackCard = (await this.readVisibleModelCardText(page)) || targetModelName
+    return {
+      selectedModelName: canonicalizeStudioModelName(targetModelName),
+      visibleCardText: fallbackCard,
+    }
   }
 
   /**
@@ -2064,9 +2214,14 @@ export class StudioBrowserController {
    */
   private async configureRunSettings(
     page: Page,
-    config: { modelName: string; maxOutputTokens: number },
+    config: {
+      modelName: string
+      maxOutputTokens: number
+      thinkingLevel?: StudioThinkingLevel
+      fallbackChain?: string[]
+    },
     scope?: { scanId?: string | null; username?: string | null },
-  ) {
+  ): Promise<{ selectedModelName: string; visibleCardText: string }> {
     await this.waitIfPausedOrThrowIfStopped(scope)
 
     // 0. Wait up to ~5s for the already-open Run Settings panel elements to appear in DOM.
@@ -2083,10 +2238,17 @@ export class StudioBrowserController {
       )
     }
 
-    // 1. Select requested or fallback model (e.g. Gemini 3.8 Flash, 3.7 Flash, 3.6 Flash)
-    const activeModelText = await this.selectModelInRunSettings(page, config.modelName)
+    // 1. Select requested or fallback model ("Argon", "Gemini 3.8 Flash", "Gemini 3.7 Flash", "Gemini 3.6 Flash")
+    const modelSelection = await this.selectModelInRunSettings(
+      page,
+      config.modelName,
+      config.fallbackChain,
+    )
+    const activeModelText = modelSelection.visibleCardText
 
-    // 2. Set "Thinking level" dropdown to High & READ BACK visible value
+    // 2. Set "Thinking level" dropdown to user's chosen level (High / Medium / Low, default High) & READ BACK visible value
+    const desiredThinkingLabel = thinkingLevelToDisplayLabel(config.thinkingLevel)
+    const desiredThinkingRegex = new RegExp(`\\b${desiredThinkingLabel}\\b`, 'i')
     let verifiedThinkingText = ''
     let thinkingConfigError = ''
 
@@ -2130,25 +2292,25 @@ export class StudioBrowserController {
         }
       } else {
         const beforeThink = await this.readVisibleThinkingLevelText(page)
-        if (!/\bhigh\b/i.test(beforeThink)) {
+        if (!desiredThinkingRegex.test(beforeThink)) {
           await thinkSelect.scrollIntoViewIfNeeded().catch(() => {})
           await thinkSelect.click().catch(() => {})
           await new Promise((r) => setTimeout(r, 350))
 
-          // Click "High" strictly inside the opened overlay pane so we never click outside the panel
-          const highOpt = page
+          // Click the desired option ("High" / "Medium" / "Low") strictly inside the opened overlay pane
+          const targetOpt = page
             .locator(
-              '.cdk-overlay-pane mat-option:has-text("High"), .cdk-overlay-pane [role="option"]:has-text("High"), .cdk-overlay-pane [role="menuitem"]:has-text("High"), mat-option:has-text("High"), [role="option"]:has-text("High")',
+              `.cdk-overlay-pane mat-option:has-text("${desiredThinkingLabel}"), .cdk-overlay-pane [role="option"]:has-text("${desiredThinkingLabel}"), .cdk-overlay-pane [role="menuitem"]:has-text("${desiredThinkingLabel}"), mat-option:has-text("${desiredThinkingLabel}"), [role="option"]:has-text("${desiredThinkingLabel}")`,
             )
             .first()
 
-          if ((await highOpt.count()) > 0 && (await highOpt.isVisible().catch(() => false))) {
-            await highOpt.click().catch(() => {})
+          if ((await targetOpt.count()) > 0 && (await targetOpt.isVisible().catch(() => false))) {
+            await targetOpt.click().catch(() => {})
             await new Promise((r) => setTimeout(r, 350))
           } else {
             const pState = await this.getRunSettingsPanelState(page)
             const stateDesc = pState.open ? 'khula (open)' : 'band (closed)'
-            thinkingConfigError = `"High" option not found after opening Thinking level dropdown (panel=${stateDesc})`
+            thinkingConfigError = `"${desiredThinkingLabel}" option not found after opening Thinking level dropdown (panel=${stateDesc})`
             if (thinkAttempt >= 2) {
               await this.dumpRunSettingsPanelDiagnostics(page, `${thinkingConfigError} (attempt ${thinkAttempt}/2)`)
             }
@@ -2159,13 +2321,13 @@ export class StudioBrowserController {
         // Verify panel is still open after dropdown selection (do not toggle if closed, just check state)
         const postSelectState = await this.getRunSettingsPanelState(page)
         const readBackThink = await this.readVisibleThinkingLevelText(page)
-        if (/\bhigh\b/i.test(readBackThink)) {
+        if (desiredThinkingRegex.test(readBackThink)) {
           verifiedThinkingText = readBackThink
           break
         }
         if (!thinkingConfigError) {
           const stateDesc = postSelectState.open ? 'khula (open)' : 'band (closed)'
-          thinkingConfigError = `expected "High", read back "${readBackThink || 'empty'}" (panel=${stateDesc})`
+          thinkingConfigError = `expected "${desiredThinkingLabel}", read back "${readBackThink || 'empty'}" (panel=${stateDesc})`
         }
         if (thinkAttempt >= 2) {
           await this.dumpRunSettingsPanelDiagnostics(page, `thinking level read-back mismatch: ${thinkingConfigError}`)
@@ -2253,7 +2415,7 @@ export class StudioBrowserController {
 
     // Final read-back verification (keep Run Settings panel open — do NOT click Toggle run settings panel)
     const finalThinkingReadBack = (await this.readVisibleThinkingLevelText(page)) || verifiedThinkingText
-    if (!/\bhigh\b/i.test(finalThinkingReadBack)) {
+    if (!desiredThinkingRegex.test(finalThinkingReadBack)) {
       const pState = await this.getRunSettingsPanelState(page)
       const stateDesc = pState.open ? 'khula (open)' : 'band (closed)'
       await this.dumpRunSettingsPanelDiagnostics(
@@ -2261,15 +2423,16 @@ export class StudioBrowserController {
         `final thinking read-back check failed: "${finalThinkingReadBack}" (panel=${stateDesc})`,
       )
       throw new Error(
-        `Studio thinking level config failed: expected "High", read back "${finalThinkingReadBack || 'empty'}" (panel=${stateDesc})`,
+        `Studio thinking level config failed: expected "${desiredThinkingLabel}", read back "${finalThinkingReadBack || 'empty'}" (panel=${stateDesc})`,
       )
     }
 
     this.logStep(
       'model set',
-      `thinking=High · model=${activeModelText || config.modelName || 'default'}`,
+      `thinking=${desiredThinkingLabel} · model=${activeModelText || modelSelection.selectedModelName || config.modelName || 'default'}`,
       'success',
     )
+    return modelSelection
   }
 
   /**
@@ -3635,6 +3798,34 @@ export class StudioBrowserController {
           throw new Error('POLICY_BLOCKED: Gemini prohibited content')
         }
 
+        // Check if an internal error or quota error occurred during continuation turn
+        const contErrDetected = await page
+          .evaluate((sels) => {
+            const re =
+              /(an\s+internal\s+error\s+has\s+occurred|internal\s+error\s+has\s+occurred|something\s+went\s+wrong|failed\s+to\s+generate|quota\s+exceeded|resource[_\s]+exhausted)/i
+            for (const s of sels) {
+              if (s.includes(':has-text(')) continue
+              try {
+                for (const node of Array.from(document.querySelectorAll(s))) {
+                  const el = node as HTMLElement
+                  if (!el || !el.innerText) continue
+                  if (el.offsetParent !== null || el.getClientRects().length > 0) {
+                    const t = el.innerText.trim()
+                    if (re.test(t)) return t
+                  }
+                }
+              } catch {
+                // ignore
+              }
+            }
+            return null
+          }, [...STUDIO_SELECTORS.errorBanners])
+          .catch(() => null)
+
+        if (contErrDetected) {
+          throw new Error(`CONTINUE_TURN_ERROR: ${contErrDetected.slice(0, 160)}`)
+        }
+
         const curTurnCount = await page
           .evaluate((turnSels) => {
             for (const sel of turnSels) {
@@ -3651,6 +3842,15 @@ export class StudioBrowserController {
           .catch(() => prevTurnCount)
 
         const candidate = await this.extractFinalAnswerWithoutThoughts(page)
+        if (
+          curTurnCount > prevTurnCount &&
+          /^(?:an\s+internal\s+error\s+has\s+occurred|internal\s+error\s+has\s+occurred|something\s+went\s+wrong|failed\s+to\s+generate)\b/i.test(
+            candidate.trim(),
+          )
+        ) {
+          throw new Error(`CONTINUE_TURN_ERROR: ${candidate.trim().slice(0, 160)}`)
+        }
+
         if (candidate === lastText && candidate.length > 0) {
           stablePolls += 1
         } else {
@@ -4041,6 +4241,7 @@ export class StudioBrowserController {
     scanId: string
     jobLabel: string
     modelName: string
+    thinkingLevel?: StudioThinkingLevel
     maxOutputTokens: number
     maxInputTokens?: number | null
     pageRecycleInterval?: number
@@ -4099,6 +4300,9 @@ export class StudioBrowserController {
     } = params
 
     const userCfg = await loadStudioUserConfig(username)
+    const effectiveThinkingLevel = normalizeStudioThinkingLevel(
+      params.thinkingLevel ?? userCfg.studioThinkingLevel,
+    )
     const rawEffectiveMaxInputTokens = computeEffectiveMaxInputTokens(
       maxOutputTokens,
       params.maxInputTokens !== undefined ? params.maxInputTokens : userCfg.studioMaxInputTokens,
@@ -4122,14 +4326,41 @@ export class StudioBrowserController {
     const MAX_ATTEMPTS = params.maxAttempts ?? (parallelMode ? 5 : 3)
     const MAX_PERMISSION_RETRIES = 10
     let permissionDeniedRetries = 0
+    const MAX_INTERNAL_ERROR_REFRESH = 3
+    let internalErrorRefreshes = 0
     const MAX_INVALID_RESULT_RETRIES = parallelMode ? MAX_ATTEMPTS : 3
     let invalidResultRetries = 0
 
-    // Model fallback chain when 403 PERMISSION_DENIED occurs on Run
-    const MODEL_FALLBACK_CHAIN = ['Gemini 3.8 Flash', 'Gemini 3.7 Flash', 'Gemini 3.6 Flash']
-    let activeModelIndex = 0
-    let activeModelName = modelName || MODEL_FALLBACK_CHAIN[0]
+    // Requirement 1 & 5: Build model fallback chain starting from user's chosen model:
+    // Argon -> Gemini 3.8 Flash -> Gemini 3.7 Flash -> Gemini 3.6 Flash
+    const chosenModel = canonicalizeStudioModelName(
+      modelName || userCfg.studioModelName || DEFAULT_STUDIO_MODEL_NAME,
+    )
+    const MODEL_FALLBACK_CHAIN = buildStudioModelChain(chosenModel)
+    const formatQuotaResetTime = async (): Promise<string> => {
+      const qState = await loadStudioModelQuotaState()
+      const timestamps = Object.values(qState.exhausted).filter((t) => Number.isFinite(t) && t > 0)
+      const earliestTs = timestamps.length > 0 ? Math.min(...timestamps) : Date.now()
+      return new Date(earliestTs).toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZoneName: 'short',
+      })
+    }
+
+    const initialEffectiveModel = await getEffectiveModel(chosenModel, MODEL_FALLBACK_CHAIN)
+    if (!initialEffectiveModel) {
+      const resetTimeStr = await formatQuotaResetTime()
+      throw new Error(`NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`)
+    }
+
+    let activeModelName = initialEffectiveModel
+    let activeModelIndex = Math.max(
+      0,
+      MODEL_FALLBACK_CHAIN.findIndex((m) => m.toLowerCase() === activeModelName.toLowerCase()),
+    )
     let resetOnPermissionDenied = false
+    let resetOnInternalError = false
 
     this.activeMaxAttempts = MAX_ATTEMPTS
     this.activeModelName = activeModelName
@@ -4162,19 +4393,23 @@ export class StudioBrowserController {
 
       try {
         let page = await this.ensurePage(username)
-        if (this.browserLaunchInfo && attempt === 1 && permissionDeniedRetries === 0) {
+        if (this.browserLaunchInfo && attempt === 1 && permissionDeniedRetries === 0 && internalErrorRefreshes === 0) {
           const isFallbackWarn = /WARN|mode=headless/i.test(this.browserLaunchInfo)
           this.logStep('browser info', this.browserLaunchInfo, isFallbackWarn ? 'warn' : 'info')
         }
 
-        // (a) On 403 PERMISSION_DENIED retry: alternate between:
-        //   - Odd 403 retry (1, 3, 5, 7, 9): Hard page reset (close old page, clear cache + site storage via CDP without touching cookies, open fresh page in same context, goto new_chat)
-        //   - Even 403 retry (2, 4, 6, 8): Full browser restart (close context, relaunch persistent profile, open fresh page, goto new_chat)
+        // (a) On 403 PERMISSION_DENIED retry OR internal error hard refresh: alternate between:
+        //   - Odd retry (1, 3, 5...): Hard page reset (close old page, clear cache + site storage via CDP without touching cookies, open fresh page in same context, goto new_chat)
+        //   - Even retry (2, 4, 6...): Full browser restart (close context, relaunch persistent profile, open fresh page, goto new_chat)
         // On normal start or any other error retry: open a NEW chat on aistudio.google.com.
-        if (resetOnPermissionDenied) {
+        if (resetOnPermissionDenied || resetOnInternalError) {
+          const isInternalErrReset = resetOnInternalError
           resetOnPermissionDenied = false
-          const permAttemptNum = permissionDeniedRetries + 1
-          const isHardPageReset = permissionDeniedRetries % 2 === 1
+          resetOnInternalError = false
+          const resetCounter = isInternalErrReset ? internalErrorRefreshes : permissionDeniedRetries
+          const resetMax = isInternalErrReset ? MAX_INTERNAL_ERROR_REFRESH : MAX_PERMISSION_RETRIES
+          const resetPrefix = isInternalErrReset ? 'internal error' : '403'
+          const isHardPageReset = resetCounter % 2 === 1
           const storageTypesToClear = 'local_storage,indexeddb,cache_storage,service_workers,websql'
 
           const clearCacheAndStorageViaCdp = async (targetPage: Page): Promise<string[]> => {
@@ -4229,9 +4464,9 @@ export class StudioBrowserController {
               clearedList.length > 0
                 ? clearedList.join(' + ')
                 : `cache + storage (${storageTypesToClear})`
-            const resetDetail = `${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}, attempt ${permAttemptNum}/${MAX_PERMISSION_RETRIES}, model=${activeModelName}) — old page closed, cleared [${clearedDesc}] for https://aistudio.google.com (cookies preserved), opened new page -> new_chat`
-            this.logStep('403 -> hard reset (page+cache)', resetDetail, 'info')
-            onLog?.('info', `403 -> hard reset (page+cache): ${resetDetail}`)
+            const resetDetail = `${jobLabel} (${resetPrefix} refresh ${resetCounter}/${resetMax}, model=${activeModelName}) — old page closed, cleared [${clearedDesc}] for https://aistudio.google.com (cookies preserved), opened new page -> new_chat`
+            this.logStep(`${resetPrefix} -> hard reset (page+cache)`, resetDetail, 'info')
+            onLog?.('info', `${resetPrefix} -> hard reset (page+cache): ${resetDetail}`)
 
             await page.goto(STUDIO_URLS.newChat, {
               waitUntil: 'domcontentloaded',
@@ -4274,9 +4509,9 @@ export class StudioBrowserController {
               clearedList.length > 0
                 ? clearedList.join(' + ')
                 : `cache + storage (${storageTypesToClear})`
-            const restartDetail = `${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}, attempt ${permAttemptNum}/${MAX_PERMISSION_RETRIES}, model=${activeModelName}) — context closed & relaunched persistent profile (${this.profileDirName}), cleared [${clearedDesc}] for https://aistudio.google.com (cookies preserved), opened new page -> new_chat`
-            this.logStep('403 -> browser restart', restartDetail, 'info')
-            onLog?.('info', `403 -> browser restart: ${restartDetail}`)
+            const restartDetail = `${jobLabel} (${resetPrefix} refresh ${resetCounter}/${resetMax}, model=${activeModelName}) — context closed & relaunched persistent profile (${this.profileDirName}), cleared [${clearedDesc}] for https://aistudio.google.com (cookies preserved), opened new page -> new_chat`
+            this.logStep(`${resetPrefix} -> browser restart`, restartDetail, 'info')
+            onLog?.('info', `${resetPrefix} -> browser restart: ${restartDetail}`)
 
             await page.goto(STUDIO_URLS.newChat, {
               waitUntil: 'domcontentloaded',
@@ -4313,9 +4548,26 @@ export class StudioBrowserController {
           )
         }
 
-        // (b) Configure Run Settings (panel is already open in new chat: wait for elements, select model/fallback model, set Thinking=High; leave panel open)
+        // (b) Configure Run Settings (panel is already open in new chat: wait for elements, select model/fallback model, set Thinking=chosen level; leave panel open)
         currentStage = 'setup/run_settings'
-        await this.configureRunSettings(page, { modelName: activeModelName, maxOutputTokens }, scope)
+        const runSettingsRes = await this.configureRunSettings(
+          page,
+          {
+            modelName: activeModelName,
+            maxOutputTokens,
+            thinkingLevel: effectiveThinkingLevel,
+            fallbackChain: MODEL_FALLBACK_CHAIN,
+          },
+          scope,
+        )
+        if (runSettingsRes.selectedModelName && runSettingsRes.selectedModelName !== activeModelName) {
+          activeModelName = runSettingsRes.selectedModelName
+          this.activeModelName = activeModelName
+          const newIdx = MODEL_FALLBACK_CHAIN.findIndex(
+            (m) => m.toLowerCase() === activeModelName.toLowerCase(),
+          )
+          if (newIdx >= 0) activeModelIndex = newIdx
+        }
 
         // (c) Attach Video 1 = short part & Video 2 = movie_360p, set start/end & 24 FPS (waits 10s after each Save)
         // Guarded by RAM > 90% check and Global UPLOAD GATE (max 2 concurrent uploads across all scans/workers)
@@ -4589,7 +4841,7 @@ export class StudioBrowserController {
         }
         page.on('response', onRunResponse)
 
-        const runStarted = Date.now()
+        let runStarted = Date.now()
         const TIMEOUT_MS = 10 * 60_000
         const INCOMPLETE_REASONS = new Set([
           'empty',
@@ -4608,7 +4860,28 @@ export class StudioBrowserController {
         let lastIncompleteLogAt = 0
         let doneIndicator: 'COMPLETION_GATE' | 'INCOMPLETE_60S_CAP' | null = null
         let permissionDeniedTriggered = false
+        let internalErrorDetected = false
+        let internalErrorContinueTriedInChat = false
+        let quotaContinuePartialText: string | null = null
         let transientBannerReason: string | null = null
+
+        const cancelStuckStopButtonIfVisible = async () => {
+          try {
+            const stuckStop = await findFirstVisibleLocator(page, STUDIO_SELECTORS.stopButton, 250)
+            if (stuckStop) {
+              this.logStep('canceling stuck generation', `${jobLabel}: clicking Stop button`, 'warn')
+              await stuckStop.click().catch(() => {})
+              const stopWaitDeadline = Date.now() + 5000
+              while (Date.now() < stopWaitDeadline) {
+                const stillThere = await findFirstVisibleLocator(page, STUDIO_SELECTORS.stopButton, 100)
+                if (!stillThere) break
+                await new Promise((r) => setTimeout(r, 250))
+              }
+            }
+          } catch {
+            /* ignore */
+          }
+        }
 
         try {
           // (e) Press Run
@@ -4640,7 +4913,6 @@ export class StudioBrowserController {
                 /PERMISSION_DENIED|caller does not have permission/i.test(capturedRunError.body))
 
             if (domPermissionDenied || netPermissionDenied) {
-              // Give network response body a brief moment to settle if DOM fired first
               if (!capturedRunError) {
                 await new Promise((r) => setTimeout(r, 500))
               }
@@ -4659,14 +4931,26 @@ export class StudioBrowserController {
 
               permissionDeniedRetries += 1
 
-              // Model fallback: advance to next model in MODEL_FALLBACK_CHAIN (3.8 Flash -> 3.7 Flash -> 3.6 Flash)
+              // Model fallback: advance to next non-exhausted model in MODEL_FALLBACK_CHAIN without marking quota state
               const prevModel = activeModelName
-              if (activeModelIndex + 1 < MODEL_FALLBACK_CHAIN.length) {
-                activeModelIndex += 1
-              } else {
-                activeModelIndex = (activeModelIndex + 1) % MODEL_FALLBACK_CHAIN.length
-              }
-              activeModelName = MODEL_FALLBACK_CHAIN[activeModelIndex]
+              const quotaSnap = await loadStudioModelQuotaState()
+              const nonExhaustedChain = MODEL_FALLBACK_CHAIN.filter(
+                (m) => !quotaSnap.exhausted[canonicalizeStudioModelName(m)],
+              )
+              const chainToCycle =
+                nonExhaustedChain.length > 0 ? nonExhaustedChain : MODEL_FALLBACK_CHAIN
+              const curIdxInCycle = chainToCycle.findIndex(
+                (m) => m.toLowerCase() === prevModel.toLowerCase(),
+              )
+              const nextModelInCycle =
+                curIdxInCycle >= 0 && curIdxInCycle + 1 < chainToCycle.length
+                  ? chainToCycle[curIdxInCycle + 1]
+                  : chainToCycle[(curIdxInCycle + 1) % chainToCycle.length]
+              activeModelName = nextModelInCycle
+              activeModelIndex = Math.max(
+                0,
+                MODEL_FALLBACK_CHAIN.findIndex((m) => m.toLowerCase() === activeModelName.toLowerCase()),
+              )
 
               const nextResetLabel =
                 permissionDeniedRetries % 2 === 1 ? '403 -> hard reset (page+cache)' : '403 -> browser restart'
@@ -4695,10 +4979,10 @@ export class StudioBrowserController {
             const ss = String(elapsed % 60).padStart(2, '0')
             this.logStep(`running ${mm}:${ss}`, `${jobLabel} [${activeModelName}]`)
 
-            // Error/quota/alert banner detection (real alert/banner containers + specific phrases only)
+            // Error/quota/alert banner detection + last model turn error detection
             const errBannerText = await page.evaluate((sels) => {
               const strictRegex =
-                /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|try\s+again\s+later|prohibited_content|blocked\s+due\s+to\s+safety|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i
+                /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|try\s+again\s+later|you\s+have\s+exceeded\s+your\s+quota|prohibited_content|blocked\s+due\s+to\s+safety|an\s+internal\s+error\s+has\s+occurred|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i
               for (const s of sels) {
                 if (s.includes(':has-text(')) continue
                 try {
@@ -4719,6 +5003,87 @@ export class StudioBrowserController {
               }
               return null
             }, [...STUDIO_SELECTORS.errorBanners])
+
+            const netQuotaExceeded =
+              capturedRunError !== null &&
+              (capturedRunError.status === 429 ||
+                /RESOURCE_EXHAUSTED|quota\s+exceeded|rateLimitExceeded/i.test(capturedRunError.body))
+
+            const domQuotaExceeded =
+              errBannerText !== null &&
+              /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|you\s+have\s+exceeded\s+your\s+quota)/i.test(
+                errBannerText,
+              )
+
+            // Requirement 4 & 5: Quota Exceeded -> mark model exhausted, switch model in Run Settings, continue in SAME chat
+            if (domQuotaExceeded || netQuotaExceeded) {
+              const quotaDetail = errBannerText || capturedRunError?.body || 'HTTP 429 RESOURCE_EXHAUSTED'
+              await cancelStuckStopButtonIfVisible()
+              const exhaustedModel = activeModelName
+              await markModelExhausted(exhaustedModel)
+
+              const nextAvailableModel = await getEffectiveModel(chosenModel, MODEL_FALLBACK_CHAIN)
+              if (!nextAvailableModel) {
+                const resetTimeStr = await formatQuotaResetTime()
+                const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`
+                this.logStep('all models quota exhausted', allExhaustedMsg, 'error')
+                onLog?.('error', `${allExhaustedMsg} (${jobLabel})`)
+                throw new Error(allExhaustedMsg)
+              }
+
+              const switchLogMsg = `${jobLabel}: ${exhaustedModel} quota exhausted -> ${nextAvailableModel} par switch, same chat me continue (${quotaDetail.slice(0, 120)})`
+              this.logStep('quota exhausted -> switch model', switchLogMsg, 'warn')
+              onLog?.('warn', switchLogMsg)
+
+              activeModelName = nextAvailableModel
+              this.activeModelName = activeModelName
+              activeModelIndex = Math.max(
+                0,
+                MODEL_FALLBACK_CHAIN.findIndex((m) => m.toLowerCase() === activeModelName.toLowerCase()),
+              )
+
+              const switchedRes = await this.selectModelInRunSettings(
+                page,
+                activeModelName,
+                MODEL_FALLBACK_CHAIN,
+              )
+              if (switchedRes.selectedModelName) {
+                activeModelName = switchedRes.selectedModelName
+                this.activeModelName = activeModelName
+              }
+
+              const partialNow = await this.extractFinalAnswerWithoutThoughts(page)
+              const hasPartialHissa =
+                Boolean(partialNow && /\bHISSA\s*1\b/i.test(partialNow) && !isThinkingOnlyText(partialNow))
+
+              if (hasPartialHissa) {
+                quotaContinuePartialText = partialNow
+                break
+              }
+
+              // No partial answer yet -> re-run in the SAME chat
+              capturedRunError = null
+              capturedFinishReason = null
+              runStarted = Date.now()
+              stopEverSeen = false
+              stopGoneConsecutivePolls = 0
+              stableSeconds = 0
+              lastCandidateText = ''
+
+              const retryRunBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 2500)
+              const runBtnEnabled = retryRunBtn
+                ? await retryRunBtn.isEnabled().catch(() => false)
+                : false
+              if (retryRunBtn && runBtnEnabled) {
+                await retryRunBtn.click().catch(() => {})
+                this.logStep('re-press Run (same chat)', `${jobLabel} [${activeModelName}]`, 'info')
+                continue
+              } else {
+                // Prompt was already submitted as a turn -> send Continue in same chat
+                quotaContinuePartialText = ''
+                break
+              }
+            }
 
             if (errBannerText) {
               const netDetail = capturedRunError
@@ -4746,8 +5111,13 @@ export class StudioBrowserController {
                   maxInputTokens: effectiveMaxInputTokens,
                 }
               }
-              if (/(internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i.test(errBannerText)) {
-                transientBannerReason = `error_banner:${errBannerText.slice(0, 80)}`
+              if (
+                /(an\s+internal\s+error\s+has\s+occurred|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i.test(
+                  errBannerText,
+                )
+              ) {
+                internalErrorDetected = true
+                transientBannerReason = `internal_error:${errBannerText.slice(0, 80)}`
                 break
               }
               throw new Error(`AI Studio banner error: ${errBannerText.slice(0, 180)}${netDetail}`)
@@ -4763,6 +5133,49 @@ export class StudioBrowserController {
               const spinnerVisible = await this.isThinkingOrRunningSpinnerVisible(page)
               if (!stopVisible && !spinnerVisible && (await this.checkLastTurnProhibited(page))) {
                 throw new Error('POLICY_BLOCKED: Gemini prohibited content')
+              }
+
+              // Requirement 6: Also check the last model turn text + network 500/INTERNAL for "An internal error has occurred"
+              const turnInternalError = await page
+                .evaluate((turnSels) => {
+                  let turns: Element[] = []
+                  for (const sel of turnSels) {
+                    if (sel.includes(':has-text(')) continue
+                    try {
+                      const found = Array.from(document.querySelectorAll(sel))
+                      if (found.length > 0) {
+                        turns = found
+                        break
+                      }
+                    } catch {
+                      // ignore
+                    }
+                  }
+                  const lastTurn = turns[turns.length - 1] as HTMLElement | undefined
+                  if (!lastTurn) return null
+                  const t = (lastTurn.innerText || lastTurn.textContent || '').trim()
+                  if (
+                    /(an\s+internal\s+error\s+has\s+occurred|internal\s+error\s+has\s+occurred|something\s+went\s+wrong|failed\s+to\s+generate\s+content)/i.test(
+                      t,
+                    ) &&
+                    !/permission\s+denied|caller\s+does\s+not\s+have\s+permission|quota\s+exceeded/i.test(t)
+                  ) {
+                    return t.slice(0, 160)
+                  }
+                  return null
+                }, [...STUDIO_SELECTORS.modelTurnContainers])
+                .catch(() => null)
+
+              const netInternalError =
+                capturedRunError !== null &&
+                (capturedRunError.status === 500 ||
+                  capturedRunError.status === 503 ||
+                  /\bINTERNAL\b|internal\s+error\s+has\s+occurred/i.test(capturedRunError.body))
+
+              if (turnInternalError || (netInternalError && !stopVisible && !spinnerVisible)) {
+                internalErrorDetected = true
+                transientBannerReason = `internal_error:${(turnInternalError || capturedRunError?.body || 'HTTP 500 INTERNAL').slice(0, 80)}`
+                break
               }
 
               const candidateText = await this.extractFinalAnswerWithoutThoughts(page)
@@ -4989,7 +5402,108 @@ export class StudioBrowserController {
           shiftValidateAndCheckCoverage(accumulatedUnshiftedText)
         }
 
-        if (!transientBannerReason) {
+        // Requirement 4: If quota was exceeded after a partial answer arrived (or after prompt turn was sent),
+        // continue in the SAME chat with the newly switched model and stitch!
+        if (quotaContinuePartialText !== null) {
+          accumulatedUnshiftedText = quotaContinuePartialText
+          for (let qCont = 1; qCont <= 2 && !rawAnswer; qCont++) {
+            try {
+              const contText = await this.sendContinueFollowUpAndFetch(page, {
+                jobLabel,
+                activeModelName,
+                continueAttempt: qCont,
+                scope,
+                onLog,
+              })
+              if (contText && contText.trim()) {
+                accumulatedUnshiftedText = accumulatedUnshiftedText
+                  ? stitchContinuedStudioAnswer(accumulatedUnshiftedText, contText)
+                  : contText
+                shiftValidateAndCheckCoverage(accumulatedUnshiftedText)
+              }
+            } catch (qContErr) {
+              const qMsg = qContErr instanceof Error ? qContErr.message : String(qContErr)
+              if (qMsg.startsWith('POLICY_BLOCKED:') || qMsg.startsWith('STOPPED')) {
+                throw qContErr
+              }
+              if (/internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate/i.test(qMsg)) {
+                internalErrorDetected = true
+                transientBannerReason = `internal_error:${qMsg.slice(0, 80)}`
+              }
+              break
+            }
+          }
+        }
+
+        // Requirement 6: "An internal error has occurred" handling:
+        // (a) Cancel stuck Stop button if visible, then try 1 Continue in the SAME chat ("internal error -> Continue (1/1)")
+        // (b) If internal error happens again or result is still invalid -> hard refresh (up to MAX_INTERNAL_ERROR_REFRESH = 3) without consuming normal attempt
+        if (internalErrorDetected && !rawAnswer) {
+          await cancelStuckStopButtonIfVisible()
+
+          if (!internalErrorContinueTriedInChat) {
+            internalErrorContinueTriedInChat = true
+            const partialBeforeErr = await this.extractFinalAnswerWithoutThoughts(page)
+            const hasValidPartialBeforeErr =
+              partialBeforeErr &&
+              /\bHISSA\s*1\b/i.test(partialBeforeErr) &&
+              !/^(?:an\s+internal\s+error|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i.test(
+                partialBeforeErr.trim(),
+              )
+
+            this.logStep(
+              'internal error -> Continue (1/1)',
+              `${jobLabel} [${activeModelName}] (${transientBannerReason || 'internal error'})`,
+              'warn',
+            )
+            onLog?.(
+              'warn',
+              `${jobLabel}: internal error -> Continue (1/1) in same chat`,
+            )
+
+            try {
+              const contAfterErr = await this.sendContinueFollowUpAndFetch(page, {
+                jobLabel,
+                activeModelName,
+                continueAttempt: 1,
+                scope,
+                onLog,
+              })
+              if (contAfterErr && contAfterErr.trim()) {
+                accumulatedUnshiftedText = hasValidPartialBeforeErr
+                  ? stitchContinuedStudioAnswer(partialBeforeErr, contAfterErr)
+                  : contAfterErr
+                shiftValidateAndCheckCoverage(accumulatedUnshiftedText)
+              }
+            } catch (ieContErr) {
+              const ieMsg = ieContErr instanceof Error ? ieContErr.message : String(ieContErr)
+              if (ieMsg.startsWith('POLICY_BLOCKED:') || ieMsg.startsWith('STOPPED')) {
+                throw ieContErr
+              }
+              this.logStep(
+                'internal error Continue failed',
+                `${jobLabel}: ${ieMsg.slice(0, 140)}`,
+                'warn',
+              )
+            }
+          }
+
+          if (!rawAnswer) {
+            await cancelStuckStopButtonIfVisible()
+            if (internalErrorRefreshes < MAX_INTERNAL_ERROR_REFRESH) {
+              internalErrorRefreshes += 1
+              const refreshLog = `internal error again -> hard refresh (${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
+              this.logStep(refreshLog, `${jobLabel} [${activeModelName}]`, 'warn')
+              onLog?.('warn', `${jobLabel}: ${refreshLog}`)
+              await this.saveRotatedSessionFromContext(username)
+              resetOnInternalError = true
+              attempt -= 1
+              continue
+            }
+          }
+        }
+
+        if (!transientBannerReason && quotaContinuePartialText === null) {
           await fetchShiftAndValidateOnce()
 
           // FIX 6 (after fetch): If validation failed with an INCOMPLETE reason, wait 10s once and re-fetch + re-validate

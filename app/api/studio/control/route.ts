@@ -18,6 +18,7 @@ import {
   saveStudioUserConfig,
   saveUserGoogleCookies,
 } from '@/lib/studio-settings'
+import { DEFAULT_STUDIO_MODEL_NAME } from '@/lib/studio-model-state'
 import {
   buildStudioScanPlan,
   clipMatchToShortSegment,
@@ -232,7 +233,8 @@ export async function POST(req: NextRequest) {
                 username,
                 scanId: 'test-clip',
                 jobLabel,
-                modelName: cfg.studioModelName || 'Gemini 3.8 Flash',
+                modelName: cfg.studioModelName || DEFAULT_STUDIO_MODEL_NAME,
+                thinkingLevel: cfg.studioThinkingLevel,
                 maxOutputTokens: cfg.studioMaxOutputTokens || 65536,
                 maxInputTokens: cfg.studioMaxInputTokens,
                 pageRecycleInterval: cfg.studioPageRecycleInterval,

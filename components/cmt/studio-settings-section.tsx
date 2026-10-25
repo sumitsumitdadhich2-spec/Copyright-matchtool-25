@@ -14,6 +14,14 @@ import {
   Trash2,
 } from 'lucide-react'
 import type { PublicStudioSettings } from '@/lib/studio-settings'
+import type { StudioThinkingLevel } from '@/lib/studio-model-state'
+
+const STUDIO_MODEL_DROPDOWN_OPTIONS = [
+  'Argon',
+  'Gemini 3.8 Flash',
+  'Gemini 3.7 Flash',
+  'Gemini 3.6 Flash',
+] as const
 
 interface Props {
   studio?: PublicStudioSettings
@@ -22,7 +30,10 @@ interface Props {
 
 export function StudioSettingsSection({ studio, onRefresh }: Props) {
   const [engine, setEngine] = useState<'api' | 'studio'>(studio?.chunkScanEngine ?? 'api')
-  const [modelName, setModelName] = useState(studio?.studioModelName ?? 'Gemini 3.8 Flash')
+  const [modelName, setModelName] = useState(studio?.studioModelName ?? 'Argon')
+  const [thinkingLevel, setThinkingLevel] = useState<StudioThinkingLevel>(
+    studio?.studioThinkingLevel ?? 'high',
+  )
   const [maxOutputTokens, setMaxOutputTokens] = useState(studio?.studioMaxOutputTokens ?? 65536)
   const [maxInputTokensStr, setMaxInputTokensStr] = useState<string>(
     studio?.studioMaxInputTokens ? String(studio.studioMaxInputTokens) : '',
@@ -58,12 +69,14 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
   const [configSaved, setConfigSaved] = useState(false)
   const [connectingDrive, setConnectingDrive] = useState(false)
   const [showOAuthGuide, setShowOAuthGuide] = useState(false)
+  const [resettingQuota, setResettingQuota] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     if (!studio) return
     setEngine(studio.chunkScanEngine)
-    setModelName(studio.studioModelName)
+    setModelName(studio.studioModelName || 'Argon')
+    setThinkingLevel(studio.studioThinkingLevel || 'high')
     setMaxOutputTokens(studio.studioMaxOutputTokens)
     setMaxInputTokensStr(studio.studioMaxInputTokens ? String(studio.studioMaxInputTokens) : '')
     setPageRecycleInterval(studio.studioPageRecycleInterval ?? 5)
@@ -79,6 +92,7 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
   }, [
     studio?.chunkScanEngine,
     studio?.studioModelName,
+    studio?.studioThinkingLevel,
     studio?.studioMaxOutputTokens,
     studio?.studioMaxInputTokens,
     studio?.studioPageRecycleInterval,
@@ -132,6 +146,7 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
         studio: {
           chunkScanEngine: engine,
           studioModelName: modelName,
+          studioThinkingLevel: thinkingLevel,
           studioMaxOutputTokens: Number(maxOutputTokens),
           studioMaxInputTokens:
             parsedMaxInput !== null && Number.isFinite(parsedMaxInput) && parsedMaxInput > 0
@@ -157,6 +172,26 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
     setConfigSaved(true)
     setTimeout(() => setConfigSaved(false), 2500)
     onRefresh()
+  }
+
+  async function resetExhaustedQuota(targetModel?: string | null) {
+    setResettingQuota(true)
+    setError(null)
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ resetModelQuota: targetModel || true }),
+      })
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}))
+        setError(j.error || 'Failed to reset model quota state')
+      } else {
+        onRefresh()
+      }
+    } finally {
+      setResettingQuota(false)
+    }
   }
 
   async function toggleBooleanSetting(
@@ -506,16 +541,72 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-            <label className="space-y-1 text-xs sm:col-span-2">
-              <span className="text-muted-foreground">Model name (as shown in AI Studio picker)</span>
-              <input
-                type="text"
-                value={modelName}
+            <label className="space-y-1 text-xs">
+              <span className="text-muted-foreground">Model (AI Studio picker)</span>
+              <select
+                value={
+                  STUDIO_MODEL_DROPDOWN_OPTIONS.includes(
+                    modelName as (typeof STUDIO_MODEL_DROPDOWN_OPTIONS)[number],
+                  )
+                    ? modelName
+                    : 'Argon'
+                }
                 onChange={(e) => setModelName(e.target.value)}
-                placeholder="Gemini 3.8 Flash"
                 className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring"
-              />
+              >
+                {STUDIO_MODEL_DROPDOWN_OPTIONS.map((opt) => (
+                  <option key={opt} value={opt}>
+                    {opt}
+                  </option>
+                ))}
+              </select>
             </label>
+
+            <label className="space-y-1 text-xs">
+              <span className="text-muted-foreground">Thinking level (default High)</span>
+              <select
+                value={thinkingLevel}
+                onChange={(e) => setThinkingLevel(e.target.value as StudioThinkingLevel)}
+                className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring"
+              >
+                <option value="high">High</option>
+                <option value="medium">Medium</option>
+                <option value="low">Low</option>
+              </select>
+            </label>
+
+            {studio?.studioExhaustedModels &&
+              Object.keys(studio.studioExhaustedModels).length > 0 && (
+                <div className="sm:col-span-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-300">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {Object.entries(studio.studioExhaustedModels).map(([mName, untilTs]) => {
+                      const localTimeStr = new Date(untilTs).toLocaleTimeString([], {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })
+                      return (
+                        <span key={mName} className="font-mono">
+                          {mName} quota khatam, {localTimeStr} par wapas
+                        </span>
+                      )
+                    })}
+                    {studio.studioEffectiveModelName &&
+                      studio.studioEffectiveModelName !== studio.studioModelName && (
+                        <span className="text-muted-foreground">
+                          (Effective: <strong className="text-foreground">{studio.studioEffectiveModelName}</strong>)
+                        </span>
+                      )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void resetExhaustedQuota(null)}
+                    disabled={resettingQuota}
+                    className="rounded border border-amber-500/50 bg-amber-500/20 px-2 py-0.5 text-[10px] font-medium text-amber-200 hover:bg-amber-500/30 disabled:opacity-50"
+                  >
+                    {resettingQuota ? 'Resetting...' : 'Reset'}
+                  </button>
+                </div>
+              )}
 
             <label className="space-y-1 text-xs">
               <span className="text-muted-foreground">Max output tokens</span>
@@ -646,7 +737,7 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
 
           <div className="flex items-center justify-between pt-1">
             <span className="text-[11px] text-muted-foreground">
-              Temp = 0 · Thinking = High · Safety = OFF · 24 FPS
+              Temp = 0 · Thinking = {thinkingLevel === 'medium' ? 'Medium' : thinkingLevel === 'low' ? 'Low' : 'High'} · Safety = OFF · 24 FPS
             </span>
             <button
               type="button"

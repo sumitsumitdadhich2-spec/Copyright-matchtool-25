@@ -39,6 +39,10 @@ import {
   DEFAULT_STUDIO_UPLOAD_GATE,
   loadStudioUserConfig,
 } from './studio-settings'
+import {
+  DEFAULT_STUDIO_MODEL_NAME,
+  getEffectiveModel,
+} from './studio-model-state'
 import type { ChunkMatch, Scan } from './types'
 
 export type ParallelWindowStatus =
@@ -1570,7 +1574,7 @@ export class StudioParallelManager {
         ...w,
         status: 'QUEUED',
         workerId: null,
-        modelName: 'Gemini 3.8 Flash',
+        modelName: DEFAULT_STUDIO_MODEL_NAME,
         stage: 'queued',
         tokens: null,
         attempt: 0,
@@ -1850,6 +1854,11 @@ export class StudioParallelManager {
             w.status === 'NEEDS_ATTENTION',
         )
 
+      const initialEffectiveModel =
+        (await getEffectiveModel(cfg.studioModelName)) ||
+        cfg.studioModelName ||
+        DEFAULT_STUDIO_MODEL_NAME
+
       if (!canResume) {
         const effectiveMovieDur =
           this.movieDurationSec && this.movieDurationSec > 0 ? this.movieDurationSec : undefined
@@ -1861,7 +1870,7 @@ export class StudioParallelManager {
           ...w,
           status: 'QUEUED',
           workerId: null,
-          modelName: cfg.studioModelName || 'Gemini 3.8 Flash',
+          modelName: initialEffectiveModel,
           stage: 'queued',
           tokens: null,
           attempt: 0,
@@ -2125,7 +2134,7 @@ export class StudioParallelManager {
             ...w,
             status: 'QUEUED',
             workerId: null,
-            modelName: cfg.studioModelName || 'Gemini 3.8 Flash',
+            modelName: initialEffectiveModel,
             stage: 'Extracting clip...',
             tokens: null,
             attempt: 0,
@@ -2693,11 +2702,18 @@ export class StudioParallelManager {
     }
 
     try {
+      const effectiveWinModel =
+        (await getEffectiveModel(cfg.studioModelName)) ||
+        cfg.studioModelName ||
+        DEFAULT_STUDIO_MODEL_NAME
+      win.modelName = effectiveWinModel
+
       const result = await ctrl.runWindowJob({
         username: this.username || 'admin',
         scanId: jobScanScope,
         jobLabel,
-        modelName: cfg.studioModelName || 'Gemini 3.8 Flash',
+        modelName: cfg.studioModelName || DEFAULT_STUDIO_MODEL_NAME,
+        thinkingLevel: cfg.studioThinkingLevel,
         maxOutputTokens: cfg.studioMaxOutputTokens || 65536,
         maxInputTokens: cfg.studioMaxInputTokens,
         pageRecycleInterval: cfg.studioPageRecycleInterval || 5,
@@ -2734,7 +2750,7 @@ export class StudioParallelManager {
           ...spec,
           status: 'QUEUED',
           workerId: null,
-          modelName: cfg.studioModelName || 'Gemini 3.8 Flash',
+          modelName: effectiveWinModel,
           stage: 'queued (split)',
           tokens: null,
           attempt: 0,

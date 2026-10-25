@@ -66,6 +66,7 @@ import { computeShortCoverage, coverageLine } from './short-coverage'
 import { globalGeminiCoordinator, CandidateLane } from './global-gemini-coordinator'
 import { globalChunkScanCoordinator, registerSchedulerChunkChecker } from './chunk-scan-coordinator'
 import { computeEffectiveMaxInputTokens, loadStudioUserConfig } from './studio-settings'
+import { DEFAULT_STUDIO_MODEL_NAME, getEffectiveModel } from './studio-model-state'
 import {
   buildStudioScanPlan,
   clipMatchToShortSegment,
@@ -1778,6 +1779,11 @@ class Scheduler {
           if (activeSeg.status === 'pending') activeSeg.status = 'scanning'
         }
 
+        const effectiveStudioModel =
+          (await getEffectiveModel(studioCfg.studioModelName)) ||
+          studioCfg.studioModelName ||
+          DEFAULT_STUDIO_MODEL_NAME
+
         // Mark all 60s chunks covered by (shortPart, movieBlock) as 'scanning'
         const coveredSegs = targetSegments.filter((s) => shortPart.segmentIndexes.includes(s.index))
         for (const seg of coveredSegs) {
@@ -1785,7 +1791,7 @@ class Scheduler {
             const ch = seg.chunks[ci]
             if (ch && ch.status === 'pending') {
               ch.status = 'scanning'
-              ch.model = studioCfg.studioModelName
+              ch.model = effectiveStudioModel
             }
           }
         }
@@ -1796,7 +1802,8 @@ class Scheduler {
             username: owner,
             scanId: scan.id,
             jobLabel,
-            modelName: studioCfg.studioModelName,
+            modelName: studioCfg.studioModelName || DEFAULT_STUDIO_MODEL_NAME,
+            thinkingLevel: studioCfg.studioThinkingLevel,
             maxOutputTokens: studioCfg.studioMaxOutputTokens,
             maxInputTokens: studioCfg.studioMaxInputTokens,
             pageRecycleInterval: studioCfg.studioPageRecycleInterval,
@@ -1897,11 +1904,14 @@ class Scheduler {
               isGoogleVerified: res.isRealTokenCount,
             }
 
+            const usedStudioModel =
+              studioController.getActiveRunMeta().modelName || effectiveStudioModel
+
             // Assign each match its 60s chunkIndex = floor((movieStart - trimStart) / 60)
             const enrichedMatches: ChunkMatch[] = res.matches.map((m) => ({
               ...m,
               chunkIndex: deriveChunkIndexForMovieTime(scan, m.movieStart, movieBlock.chunkIndexes),
-              model: studioCfg.studioModelName,
+              model: usedStudioModel,
             }))
 
             // FIX 2: Clip each match to [seg.start, seg.end] and shift movieStart/movieEnd proportionally
@@ -1926,7 +1936,7 @@ class Scheduler {
                 if (!ch) continue
                 this.recordChunkOutput(
                   ch,
-                  studioCfg.studioModelName,
+                  usedStudioModel,
                   `[GEMINI STUDIO · ${jobLabel} · offset=${res.calibratedOffsetMode}]\n${res.rawText}`,
                   tokenUsage,
                   'success',

@@ -1,10 +1,19 @@
 import crypto from 'crypto'
 import { readJSONRecord, writeJSONRecord } from './json-record'
+import {
+  DEFAULT_STUDIO_MODEL_NAME,
+  DEFAULT_STUDIO_THINKING_LEVEL,
+  getEffectiveModel,
+  loadStudioModelQuotaState,
+  normalizeStudioThinkingLevel,
+  type StudioThinkingLevel,
+} from './studio-model-state'
 import type { ChunkScanEngine } from './types'
 
 export interface StudioUserConfig {
   chunkScanEngine: ChunkScanEngine
   studioModelName: string
+  studioThinkingLevel: StudioThinkingLevel
   studioMaxOutputTokens: number
   /** Optional override for max input tokens before shrinking; null/0 = auto (1_048_576 - studioMaxOutputTokens - 5_000) */
   studioMaxInputTokens: number | null
@@ -49,6 +58,9 @@ export interface StudioUserConfig {
 export interface PublicStudioSettings {
   chunkScanEngine: ChunkScanEngine
   studioModelName: string
+  studioEffectiveModelName: string
+  studioThinkingLevel: StudioThinkingLevel
+  studioExhaustedModels: Record<string, number>
   studioMaxOutputTokens: number
   studioMaxInputTokens: number | null
   effectiveMaxInputTokens: number
@@ -123,7 +135,8 @@ export const DEFAULT_STUDIO_MINUTE_INPUT =
 
 const DEFAULT_STUDIO_CONFIG: StudioUserConfig = {
   chunkScanEngine: 'api',
-  studioModelName: 'Gemini 3.8 Flash',
+  studioModelName: DEFAULT_STUDIO_MODEL_NAME,
+  studioThinkingLevel: DEFAULT_STUDIO_THINKING_LEVEL,
   studioMaxOutputTokens: 65536,
   studioMaxInputTokens: null,
   studioPageRecycleInterval: 5,
@@ -196,12 +209,14 @@ export async function loadStudioUserConfig(username: string): Promise<StudioUser
     !rawModel || rawModel === 'Gemini 2.5 Pro' || rawModel === 'Gemini 3.8 Pro'
       ? DEFAULT_STUDIO_CONFIG.studioModelName
       : rawModel
+  const studioThinkingLevel = normalizeStudioThinkingLevel(raw?.studioThinkingLevel)
 
   return {
     ...DEFAULT_STUDIO_CONFIG,
     ...(raw || {}),
     chunkScanEngine: raw?.chunkScanEngine === 'studio' ? 'studio' : 'api',
     studioModelName: resolvedModelName,
+    studioThinkingLevel,
     studioMaxOutputTokens,
     studioMaxInputTokens,
     studioPageRecycleInterval,
@@ -400,9 +415,16 @@ export async function getPublicStudioSettings(username: string): Promise<PublicS
     }
   }
 
+  const quotaState = await loadStudioModelQuotaState()
+  const effectiveModel =
+    (await getEffectiveModel(cfg.studioModelName)) || cfg.studioModelName
+
   return {
     chunkScanEngine: cfg.chunkScanEngine,
     studioModelName: cfg.studioModelName,
+    studioEffectiveModelName: effectiveModel,
+    studioThinkingLevel: cfg.studioThinkingLevel,
+    studioExhaustedModels: quotaState.exhausted,
     studioMaxOutputTokens: cfg.studioMaxOutputTokens,
     studioMaxInputTokens: cfg.studioMaxInputTokens ?? null,
     effectiveMaxInputTokens: computeEffectiveMaxInputTokens(

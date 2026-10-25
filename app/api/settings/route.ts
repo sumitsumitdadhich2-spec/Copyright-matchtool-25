@@ -25,6 +25,10 @@ import {
   saveStudioUserConfig,
   saveUserGoogleCookies,
 } from '@/lib/studio-settings'
+import {
+  normalizeStudioThinkingLevel,
+  resetModelQuotaState,
+} from '@/lib/studio-model-state'
 
 export const runtime = 'nodejs'
 
@@ -132,8 +136,18 @@ export async function PUT(req: Request) {
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   const body = (await req.json().catch(() => ({}))) as Record<string, unknown>
 
+  if (body.resetModelQuota !== undefined) {
+    const targetModel = typeof body.resetModelQuota === 'string' ? body.resetModelQuota : null
+    await resetModelQuotaState(targetModel)
+    return NextResponse.json({ ok: true, studio: await getPublicStudioSettings(session.username) })
+  }
+
   if (body.studio && typeof body.studio === 'object') {
     const st = body.studio as Record<string, unknown>
+    if (st.resetModelQuota !== undefined) {
+      const targetModel = typeof st.resetModelQuota === 'string' ? st.resetModelQuota : null
+      await resetModelQuotaState(targetModel)
+    }
     const parseMaxInput = (val: unknown): number | null => {
       if (val === null || val === undefined || val === '' || val === 'auto' || Number(val) <= 0) return null
       const n = Number(val)
@@ -142,6 +156,9 @@ export async function PUT(req: Request) {
     await saveStudioUserConfig(session.username, {
       ...(st.chunkScanEngine !== undefined ? { chunkScanEngine: st.chunkScanEngine === 'studio' ? 'studio' : 'api' } : {}),
       ...(typeof st.studioModelName === 'string' ? { studioModelName: st.studioModelName.trim() } : {}),
+      ...(st.studioThinkingLevel !== undefined
+        ? { studioThinkingLevel: normalizeStudioThinkingLevel(st.studioThinkingLevel) }
+        : {}),
       ...(st.studioMaxOutputTokens !== undefined ? { studioMaxOutputTokens: Number(st.studioMaxOutputTokens) } : {}),
       ...(st.studioMaxInputTokens !== undefined ? { studioMaxInputTokens: parseMaxInput(st.studioMaxInputTokens) } : {}),
       ...(st.studioPageRecycleInterval !== undefined
@@ -220,8 +237,17 @@ export async function POST(req: Request) {
       )
     }
   }
+  if (body.resetModelQuota !== undefined) {
+    const targetModel = typeof body.resetModelQuota === 'string' ? body.resetModelQuota : null
+    await resetModelQuotaState(targetModel)
+    return NextResponse.json({ ok: true, studio: await getPublicStudioSettings(username) })
+  }
   if (body.studio && typeof body.studio === 'object') {
     const st = body.studio as Record<string, unknown>
+    if (st.resetModelQuota !== undefined) {
+      const targetModel = typeof st.resetModelQuota === 'string' ? st.resetModelQuota : null
+      await resetModelQuotaState(targetModel)
+    }
     const parseMaxInput = (val: unknown): number | null => {
       if (val === null || val === undefined || val === '' || val === 'auto' || Number(val) <= 0) return null
       const n = Number(val)
@@ -230,6 +256,9 @@ export async function POST(req: Request) {
     await saveStudioUserConfig(username, {
       ...(st.chunkScanEngine !== undefined ? { chunkScanEngine: st.chunkScanEngine === 'studio' ? 'studio' : 'api' } : {}),
       ...(typeof st.studioModelName === 'string' ? { studioModelName: st.studioModelName.trim() } : {}),
+      ...(st.studioThinkingLevel !== undefined
+        ? { studioThinkingLevel: normalizeStudioThinkingLevel(st.studioThinkingLevel) }
+        : {}),
       ...(st.studioMaxOutputTokens !== undefined ? { studioMaxOutputTokens: Number(st.studioMaxOutputTokens) } : {}),
       ...(st.studioMaxInputTokens !== undefined ? { studioMaxInputTokens: parseMaxInput(st.studioMaxInputTokens) } : {}),
       ...(st.studioPageRecycleInterval !== undefined
