@@ -19,7 +19,12 @@ import {
 } from './studio-settings'
 import { buildStudioChunkPrompt } from './studio-prompt'
 import { parseChunkMatches } from './gemini'
-import { validateStudioAnswer, type StudioValidationResult } from './studio-result-validator'
+import {
+  cleanStudioAnswerText,
+  isPromptEchoText,
+  validateStudioAnswer,
+  type StudioValidationResult,
+} from './studio-result-validator'
 import { extractHissa1And2EntriesFromResponse, formatParallelTimecode } from './studio-window-planner'
 import { maxMovieEndSecInHissa2, shiftMovieTimestampsInHissa2 } from './studio-clip-offset'
 import { fmtTime } from './format'
@@ -2205,6 +2210,44 @@ export class StudioBrowserController {
       /* ignore */
     }
 
+    // 5. Optional: Turn OFF "Grounding with Google Search" in Run Settings if it is currently ON
+    try {
+      const turnedOffGrounding = await page
+        .evaluate(() => {
+          const switches = Array.from(
+            document.querySelectorAll(
+              'button[role="switch"], mat-slide-toggle button, [role="switch"]',
+            ),
+          )
+          for (const sw of switches) {
+            const el = sw as HTMLElement
+            const aria = (el.getAttribute('aria-label') || '').toLowerCase()
+            const row = el.closest(
+              'mat-slide-toggle, .run-settings-row, .settings-item, .tool-row, div',
+            ) as HTMLElement | null
+            const rowText = (row?.innerText || row?.textContent || '').toLowerCase()
+            if (
+              aria.includes('grounding') ||
+              aria.includes('google search') ||
+              /grounding\s+with\s+google\s+search/i.test(rowText)
+            ) {
+              if (el.getAttribute('aria-checked') === 'true') {
+                el.click()
+                return true
+              }
+            }
+          }
+          return false
+        })
+        .catch(() => false)
+      if (turnedOffGrounding) {
+        this.logStep('grounding toggle off', 'Disabled Grounding with Google Search', 'info')
+        await new Promise((r) => setTimeout(r, 250))
+      }
+    } catch {
+      /* ignore */
+    }
+
     // Final read-back verification (keep Run Settings panel open — do NOT click Toggle run settings panel)
     const finalThinkingReadBack = (await this.readVisibleThinkingLevelText(page)) || verifiedThinkingText
     if (!/\bhigh\b/i.test(finalThinkingReadBack)) {
@@ -3181,6 +3224,9 @@ export class StudioBrowserController {
   /**
    * Copy ONLY the final model response text from the latest turn,
    * explicitly stripping any thinking / thought blocks (`ms-thought-chunk`, etc.).
+   * Attaches the cloned turn to an off-screen hidden container in `document.body`
+   * so Chromium computes real layout-aware `innerText` with proper `\n` line breaks
+   * on block elements (`p, div, li, br`).
    */
   private async extractFinalAnswerWithoutThoughts(page: Page): Promise<string> {
     const thoughtSelectors = STUDIO_SELECTORS.thoughtContainersToExclude
@@ -3201,34 +3247,66 @@ export class StudioBrowserController {
             // ignore invalid CSS selector
           }
         }
-        const lastTurn = turns[turns.length - 1]
+        const lastTurn = turns[turns.length - 1] as HTMLElement | undefined
         if (!lastTurn) return ''
 
-        // Clone the DOM node so we can safely remove all thought/thinking elements before reading innerText
-        const clone = lastTurn.cloneNode(true) as HTMLElement
-        for (const tSel of thoughtSels) {
-          if (tSel.includes(':has-text(')) continue
+        const origRect = lastTurn.getBoundingClientRect()
+        const origWidth = origRect && origRect.width > 50 ? Math.round(origRect.width) : 800
+
+        const container = document.createElement('div')
+        container.setAttribute('data-cmt-offscreen-extract', 'true')
+        container.style.cssText = `position:fixed;left:-99999px;top:0;width:${origWidth}px;pointer-events:none;white-space:normal;z-index:-1;`
+
+        try {
+          const clone = lastTurn.cloneNode(true) as HTMLElement
+          container.appendChild(clone)
+          document.body.appendChild(container)
+
+          for (const tSel of thoughtSels) {
+            if (tSel.includes(':has-text(')) continue
+            try {
+              clone.querySelectorAll(tSel).forEach((el) => el.remove())
+            } catch {
+              // ignore invalid CSS selector
+            }
+          }
+
+          // Remove thought panels in JS: for every 'mat-expansion-panel, details' inside the cloned last turn,
+          // if its innerText starts with "Thoughts" or "Thinking" (case-insensitive), remove it.
           try {
-            clone.querySelectorAll(tSel).forEach((el) => el.remove())
+            clone.querySelectorAll('mat-expansion-panel, details').forEach((el) => {
+              const txt = ((el as HTMLElement).innerText || el.textContent || '').trim()
+              if (/^(thoughts|thinking)\b/i.test(txt)) {
+                el.remove()
+              }
+            })
           } catch {
-            // ignore invalid CSS selector
+            // ignore
+          }
+
+          // Ensure <br> and block elements produce line breaks even if custom web components use inline/flex styles
+          try {
+            clone.querySelectorAll('br').forEach((br) => {
+              br.replaceWith('\n')
+            })
+            clone
+              .querySelectorAll('p, div, li, h1, h2, h3, h4, h5, h6, pre, blockquote, tr')
+              .forEach((blk) => {
+                blk.prepend(document.createTextNode('\n'))
+                blk.append(document.createTextNode('\n'))
+              })
+          } catch {
+            // ignore
+          }
+
+          return (clone.innerText || clone.textContent || '').trim()
+        } finally {
+          try {
+            container.remove()
+          } catch {
+            // ignore
           }
         }
-
-        // Remove thought panels in JS: for every 'mat-expansion-panel, details' inside the cloned last turn,
-        // if its innerText starts with "Thoughts" or "Thinking" (case-insensitive), remove it.
-        try {
-          clone.querySelectorAll('mat-expansion-panel, details').forEach((el) => {
-            const txt = ((el as HTMLElement).innerText || el.textContent || '').trim()
-            if (/^(thoughts|thinking)\b/i.test(txt)) {
-              el.remove()
-            }
-          })
-        } catch {
-          // ignore
-        }
-
-        return (clone.innerText || clone.textContent || '').trim()
       },
       {
         turnSels: [...turnSelectors],
@@ -3236,245 +3314,19 @@ export class StudioBrowserController {
       },
     )
 
-    return extracted
+    return cleanStudioAnswerText(extracted)
   }
 
   /**
-   * CHANGE 3: Fetch the final answer via the AI Studio UI ("Copy as text" on the last model turn's
-   * three-dot options menu -> clipboard with sentinel guard), falling back to coordinate ratios
-   * and finally to DOM extraction (`extractFinalAnswerWithoutThoughts`).
-   * Total time cap: ~15 seconds.
+   * FIX 4: Inspect the last model turn in DOM for Prohibited Content / Safety Ratings block.
+   * Returns true ONLY if `[aria-label="Safety Ratings"]` or `"Prohibited content"` is present in the last turn
+   * AND the turn does NOT contain both `HISSA 1` and `HISSA 2` (so a normal complete answer that happens to mention
+   * those words in a description is never falsely blocked).
    */
-  private async fetchStudioResultFromTurnOrFallback(
-    page: Page,
-  ): Promise<{ text: string; source: 'clipboard' | 'dom' }> {
-    // 1. Primary path (race-free across parallel Xvfb workers): read directly from this worker's DOM turn!
-    const domDirectText = await this.extractFinalAnswerWithoutThoughts(page)
-    if (
-      domDirectText &&
-      /HISSA\s*1\b/i.test(domDirectText) &&
-      /HISSA\s*2\b/i.test(domDirectText)
-    ) {
-      return { text: domDirectText, source: 'dom' }
-    }
-
-    // 2. Fallback: Use shared X11 clipboard guarded by a global mutex + sentinel + DOM cross-check
-    return withClipboardLock(async () => {
-      const fetchDeadline = Date.now() + 15_000
-
-      if (this.context) {
-        await this.context
-          .grantPermissions(['clipboard-read', 'clipboard-write'], {
-            origin: 'https://aistudio.google.com',
-          })
-          .catch(() => {})
-      }
-
-    const writeSentinel = async (): Promise<string> => {
-      const sentinel = `__CMT_SENTINEL_${Date.now()}_${Math.random().toString(36).slice(2, 7)}__`
-      await page
-        .evaluate(async (s) => {
-          try {
-            await navigator.clipboard.writeText(s)
-          } catch {
-            // ignore
-          }
-        }, sentinel)
-        .catch(() => {})
-      return sentinel
-    }
-
-    const readClipboardUntilChanged = async (sentinel: string, maxWaitMs = 3000): Promise<string | null> => {
-      const waitEnd = Math.min(fetchDeadline, Date.now() + maxWaitMs)
-      while (Date.now() < waitEnd) {
-        const txt = await page
-          .evaluate(async () => {
-            try {
-              return await navigator.clipboard.readText()
-            } catch {
-              return ''
-            }
-          })
-          .catch(() => '')
-        if (txt && txt !== sentinel && !txt.startsWith('__CMT_SENTINEL_')) {
-          return txt.trim()
-        }
-        await new Promise((r) => setTimeout(r, 100))
-      }
-      return null
-    }
-
-    const clickCopyAsTextInOpenMenu = async (): Promise<string | null> => {
-      for (const itemSel of STUDIO_SELECTORS.copyAsTextMenuItem) {
-        try {
-          const itemLoc = page.locator(itemSel).first()
-          if ((await itemLoc.count()) > 0 && (await itemLoc.isVisible().catch(() => false))) {
-            const itemText = ((await itemLoc.innerText().catch(() => '')) || '').trim()
-            // Strict safety: ONLY click "Copy as text", never "Copy as markdown", "Delete", or "Branch from here"
-            if (/copy\s+as\s+text/i.test(itemText) && !/markdown|delete|branch/i.test(itemText)) {
-              const sentinel = await writeSentinel()
-              await itemLoc.click({ timeout: 1500 })
-              const copied = await readClipboardUntilChanged(sentinel, 3000)
-              if (copied) return copied
-            }
-          }
-        } catch {
-          // try next selector
-        }
-      }
-      return null
-    }
-
-    // Find the last model turn Locator
-    let lastTurnLoc: ReturnType<Page['locator']> | null = null
-    for (const tSel of STUDIO_SELECTORS.modelTurnContainers) {
-      try {
-        const allTurns = page.locator(tSel)
-        const cnt = await allTurns.count()
-        if (cnt > 0) {
-          lastTurnLoc = allTurns.nth(cnt - 1)
-          break
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    // Fallback (a): UI flow using DOM locators scoped strictly inside lastTurn (max 3 tries)
-    if (lastTurnLoc) {
-      for (let copyTry = 1; copyTry <= 3 && Date.now() < fetchDeadline; copyTry++) {
-        try {
-          await lastTurnLoc.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {})
-          const turnBox = await lastTurnLoc.boundingBox().catch(() => null)
-          if (turnBox && turnBox.width > 40 && turnBox.height > 20) {
-            // Click near the center of the last model turn to reveal its turn options toolbar
-            const clickX = Math.round(turnBox.x + turnBox.width * 0.5)
-            const clickY = Math.round(
-              Math.max(85, Math.min(VIEWPORT.height - 60, turnBox.y + Math.min(turnBox.height * 0.5, 220))),
-            )
-            await page.mouse.click(clickX, clickY)
-          } else {
-            await lastTurnLoc.hover({ timeout: 1500 }).catch(() => {})
-          }
-          await new Promise((r) => setTimeout(r, 250))
-
-          // Find the three-dot (more_vert) button strictly inside lastTurnLoc and below the page header
-          let clickedMoreBtn = false
-          for (const btnSel of STUDIO_SELECTORS.turnOptionsButton) {
-            const candidates = lastTurnLoc.locator(btnSel)
-            const cCount = await candidates.count().catch(() => 0)
-            for (let i = 0; i < cCount; i++) {
-              const btn = candidates.nth(i)
-              if (!(await btn.isVisible().catch(() => false))) continue
-              const box = await btn.boundingBox().catch(() => null)
-              // Must be below the top page header bar (y > 68)
-              if (!box || box.y <= 68) continue
-
-              const isInsideTurnAndNotHeader = await btn
-                .evaluate((el) => {
-                  if (el.closest('header, mat-toolbar, ms-toolbar, ms-header, .toolbar')) return false
-                  return Boolean(el.closest('ms-chat-turn, [data-turn-role="model"], .model-turn'))
-                })
-                .catch(() => false)
-
-              if (!isInsideTurnAndNotHeader) continue
-
-              await btn.click({ timeout: 1500 })
-              clickedMoreBtn = true
-              break
-            }
-            if (clickedMoreBtn) break
-          }
-
-          if (clickedMoreBtn) {
-            await new Promise((r) => setTimeout(r, 300))
-            const copied = await clickCopyAsTextInOpenMenu()
-            if (copied) {
-              return { text: copied, source: 'clipboard' }
-            }
-            // Wrong menu opened or "Copy as text" not found — press Escape and retry
-            await page.keyboard.press('Escape').catch(() => {})
-            await new Promise((r) => setTimeout(r, 200))
-          }
-        } catch {
-          await page.keyboard.press('Escape').catch(() => {})
-        }
-      }
-    }
-
-    // Fallback (b): Coordinate ratios on VIEWPORT (1366x840)
-    // 1. Turn center: (0.586, 0.506) -> (800, 425)
-    // 2. Turn three-dot: (0.742, 0.113) -> (1014, 95)
-    // 3. "Copy as text" item: overlay locator first, or coordinate (0.792, 0.227) -> (1082, 191) if verified safe
-    if (Date.now() < fetchDeadline) {
-      try {
-        if (lastTurnLoc) {
-          await lastTurnLoc.scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => {})
-        }
-        const turnClickX = Math.round(0.586 * VIEWPORT.width)
-        const turnClickY = Math.round(0.506 * VIEWPORT.height)
-        await page.mouse.click(turnClickX, turnClickY)
-        await new Promise((r) => setTimeout(r, 250))
-
-        const moreX = Math.round(0.742 * VIEWPORT.width)
-        const moreY = Math.round(0.113 * VIEWPORT.height)
-        // Verify element at (moreX, moreY) is not a top header bar button before clicking
-        const safeToClickMoreAtCoord = await page
-          .evaluate(
-            ({ x, y }) => {
-              const el = document.elementFromPoint(x, y)
-              if (!el) return false
-              if (el.closest('header, mat-toolbar, ms-toolbar, ms-header')) return false
-              return true
-            },
-            { x: moreX, y: moreY },
-          )
-          .catch(() => false)
-
-        if (safeToClickMoreAtCoord) {
-          await page.mouse.click(moreX, moreY)
-          await new Promise((r) => setTimeout(r, 300))
-
-          // First try clicking the "Copy as text" item in the opened overlay via locator
-          const copiedViaOverlay = await clickCopyAsTextInOpenMenu()
-          if (copiedViaOverlay) {
-            return { text: copiedViaOverlay, source: 'clipboard' }
-          }
-
-          // Otherwise check if (0.792, 0.227) points to "Copy as text"
-          const copyX = Math.round(0.792 * VIEWPORT.width)
-          const copyY = Math.round(0.227 * VIEWPORT.height)
-          const isCopyAsTextAtCoord = await page
-            .evaluate(
-              ({ x, y }) => {
-                const el = document.elementFromPoint(x, y) as HTMLElement | null
-                if (!el) return false
-                const item = (el.closest('[role="menuitem"], button, .mat-mdc-menu-item') || el) as HTMLElement
-                const txt = (item.innerText || item.textContent || '').trim()
-                return /copy\s+as\s+text/i.test(txt) && !/markdown|delete|branch/i.test(txt)
-              },
-              { x: copyX, y: copyY },
-            )
-            .catch(() => false)
-
-          if (isCopyAsTextAtCoord) {
-            const sentinel = await writeSentinel()
-            await page.mouse.click(copyX, copyY)
-            const copied = await readClipboardUntilChanged(sentinel, 3000)
-            if (copied) {
-              return { text: copied, source: 'clipboard' }
-            }
-          }
-          await page.keyboard.press('Escape').catch(() => {})
-        }
-      } catch {
-        await page.keyboard.press('Escape').catch(() => {})
-      }
-    }
-
-    // Debug dump of buttons inside the last turn so selectors can be tuned if UI copy failed
-    try {
-      const turnButtonsDump = await page.evaluate((turnSels) => {
+  private async checkLastTurnProhibited(page: Page): Promise<boolean> {
+    const turnSelectors = STUDIO_SELECTORS.modelTurnContainers
+    return page
+      .evaluate((turnSels) => {
         let turns: Element[] = []
         for (const sel of turnSels) {
           if (sel.includes(':has-text(')) continue
@@ -3488,23 +3340,401 @@ export class StudioBrowserController {
             // ignore
           }
         }
-        const lastTurn = turns[turns.length - 1]
-        if (!lastTurn) return 'no lastTurn found'
-        const btns = Array.from(lastTurn.querySelectorAll('button, [role="button"]')).slice(0, 12)
-        return btns
-          .map((b) => {
-            const h = b as HTMLElement
-            const r = h.getBoundingClientRect()
-            const aria = h.getAttribute('aria-label') || ''
-            const txt = (h.innerText || h.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 30)
-            return `[aria="${aria}" txt="${txt}" @${Math.round(r.x)},${Math.round(r.y)}]`
-          })
-          .join(' ')
-      }, [...STUDIO_SELECTORS.modelTurnContainers])
-      this.logStep('turn copy fallback->dom', turnButtonsDump.slice(0, 260), 'warn')
-    } catch {
-      // ignore dump error
+        const lastTurn = turns[turns.length - 1] as HTMLElement | undefined
+        if (!lastTurn) return false
+
+        const turnText = (lastTurn.innerText || lastTurn.textContent || '').trim()
+        const hasBothHissa = /\bHISSA\s*1\b/i.test(turnText) && /\bHISSA\s*2\b/i.test(turnText)
+        if (hasBothHissa) {
+          return false
+        }
+
+        const hasSafetyRatingsAttr = Boolean(
+          lastTurn.querySelector('[aria-label="Safety Ratings" i], [aria-label*="Safety Ratings" i]'),
+        )
+        const hasProhibitedText =
+          /\bProhibited\s+content\b|\bblocked\s+due\s+to\s+safety\b|\bPROHIBITED_CONTENT\b/i.test(
+            turnText,
+          )
+
+        return (hasSafetyRatingsAttr || hasProhibitedText) && !/\bHISSA\s*1\b/i.test(turnText)
+      }, [...turnSelectors])
+      .catch(() => false)
+  }
+
+  /**
+   * FIX 6 (before fetch): Confirm the last model turn is truly finished:
+   * - Stop button / spinner is not visible
+   * - Turn footer shows either a run duration (e.g. "6m31.5s", "12.4s") or thumb_up / thumb_down feedback icons.
+   * If not yet visible, waits in 3s intervals up to `maxWaitMs` (default 20s).
+   */
+  private async waitUntilTurnTrulyFinished(page: Page, maxWaitMs = 20_000): Promise<void> {
+    const deadline = Date.now() + maxWaitMs
+    const turnSelectors = STUDIO_SELECTORS.modelTurnContainers
+
+    while (Date.now() < deadline) {
+      if (await this.checkLastTurnProhibited(page)) {
+        throw new Error('POLICY_BLOCKED: Gemini prohibited content')
+      }
+
+      const stopLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.stopButton, 80)
+      const spinnerVisible = await this.isThinkingOrRunningSpinnerVisible(page)
+
+      const footerReady = await page
+        .evaluate((turnSels) => {
+          let turns: Element[] = []
+          for (const sel of turnSels) {
+            if (sel.includes(':has-text(')) continue
+            try {
+              const found = Array.from(document.querySelectorAll(sel))
+              if (found.length > 0) {
+                turns = found
+                break
+              }
+            } catch {
+              // ignore
+            }
+          }
+          const lastTurn = turns[turns.length - 1] as HTMLElement | undefined
+          if (!lastTurn) return false
+
+          const rawText = (lastTurn.innerText || lastTurn.textContent || '').trim()
+          const hasDuration = /\b\d+m\s*\d+(?:\.\d+)?s\b|\b\d+\.\d+s\b/i.test(rawText)
+          const hasThumbText = /\bthumb_up\b|\bthumb_down\b/i.test(rawText)
+          const hasThumbButton = Boolean(
+            lastTurn.querySelector(
+              'button[aria-label*="Good response" i], button[aria-label*="Bad response" i], button[aria-label*="thumb" i], mat-icon',
+            ),
+          )
+          return hasDuration || hasThumbText || hasThumbButton
+        }, [...turnSelectors])
+        .catch(() => false)
+
+      if (!stopLoc && !spinnerVisible && footerReady) {
+        return
+      }
+
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) break
+      await new Promise((r) => setTimeout(r, Math.min(3000, remaining)))
     }
+  }
+
+  /**
+   * FIX 5: Reject bad clipboard text (prompt echo, thinking header, or missing HISSA 1).
+   */
+  private isRejectedClipboardText(txt: string): boolean {
+    const t = (txt || '').trim()
+    if (!t) return true
+    if (isPromptEchoText(t)) return true
+    if (/^(?:you\s+are\s+a\s+forensic\s+video\s+analyst|initiating\s+video\s+analysis|thinking\b|thoughts\b)/i.test(t)) {
+      return true
+    }
+    if (!/\bHISSA\s*1\b/i.test(t)) {
+      return true
+    }
+    return false
+  }
+
+  /**
+   * Fetch the final answer from the latest model turn:
+   * - First checks for Prohibited content (`POLICY_BLOCKED: Gemini prohibited content`).
+   * - Confirms the turn footer is finished (up to 20s wait in 3s steps).
+   * - Uses fixed DOM extraction (`extractFinalAnswerWithoutThoughts` + `cleanStudioAnswerText`) as the PRIMARY path.
+   * - Only falls back to clipboard if DOM failed, and rejects any clipboard text that looks like the prompt, thoughts, or lacks HISSA 1.
+   */
+  private async fetchStudioResultFromTurnOrFallback(
+    page: Page,
+  ): Promise<{ text: string; source: 'clipboard' | 'dom' }> {
+    // FIX 4: Check Prohibited content on the last model turn BEFORE any fetch/copy
+    if (await this.checkLastTurnProhibited(page)) {
+      throw new Error('POLICY_BLOCKED: Gemini prohibited content')
+    }
+
+    // FIX 6: Ensure turn is truly finished (Stop/spinner gone + duration or thumb_up/thumb_down visible, max 20s)
+    await this.waitUntilTurnTrulyFinished(page, 20_000)
+
+    // Re-check Prohibited content in case it appeared as the turn finished
+    if (await this.checkLastTurnProhibited(page)) {
+      throw new Error('POLICY_BLOCKED: Gemini prohibited content')
+    }
+
+    // 1. Primary path (race-free across parallel Xvfb workers): read directly from this worker's DOM turn!
+    const domDirectText = await this.extractFinalAnswerWithoutThoughts(page)
+    if (
+      domDirectText &&
+      !isPromptEchoText(domDirectText) &&
+      /HISSA\s*1\b/i.test(domDirectText) &&
+      /HISSA\s*2\b/i.test(domDirectText)
+    ) {
+      return { text: domDirectText, source: 'dom' }
+    }
+
+    // 2. Fallback: Use shared X11 clipboard guarded by a global mutex + sentinel + strict prompt/thinking rejection
+    return withClipboardLock(async () => {
+      const fetchDeadline = Date.now() + 15_000
+
+      if (this.context) {
+        await this.context
+          .grantPermissions(['clipboard-read', 'clipboard-write'], {
+            origin: 'https://aistudio.google.com',
+          })
+          .catch(() => {})
+      }
+
+      const writeSentinel = async (): Promise<string> => {
+        const sentinel = `__CMT_SENTINEL_${Date.now()}_${Math.random().toString(36).slice(2, 7)}__`
+        await page
+          .evaluate(async (s) => {
+            try {
+              await navigator.clipboard.writeText(s)
+            } catch {
+              // ignore
+            }
+          }, sentinel)
+          .catch(() => {})
+        return sentinel
+      }
+
+      const readClipboardUntilChanged = async (sentinel: string, maxWaitMs = 3000): Promise<string | null> => {
+        const waitEnd = Math.min(fetchDeadline, Date.now() + maxWaitMs)
+        while (Date.now() < waitEnd) {
+          const txt = await page
+            .evaluate(async () => {
+              try {
+                return await navigator.clipboard.readText()
+              } catch {
+                return ''
+              }
+            })
+            .catch(() => '')
+          if (txt && txt !== sentinel && !txt.startsWith('__CMT_SENTINEL_')) {
+            return txt.trim()
+          }
+          await new Promise((r) => setTimeout(r, 100))
+        }
+        return null
+      }
+
+      const clickCopyAsTextInOpenMenu = async (): Promise<string | null> => {
+        for (const itemSel of STUDIO_SELECTORS.copyAsTextMenuItem) {
+          try {
+            const itemLoc = page.locator(itemSel).first()
+            if ((await itemLoc.count()) > 0 && (await itemLoc.isVisible().catch(() => false))) {
+              const itemText = ((await itemLoc.innerText().catch(() => '')) || '').trim()
+              // Strict safety: ONLY click "Copy as text", never "Copy as markdown", "Delete", or "Branch from here"
+              if (/copy\s+as\s+text/i.test(itemText) && !/markdown|delete|branch/i.test(itemText)) {
+                const sentinel = await writeSentinel()
+                await itemLoc.click({ timeout: 1500 })
+                const copied = await readClipboardUntilChanged(sentinel, 3000)
+                if (copied) return copied
+              }
+            }
+          } catch {
+            // try next selector
+          }
+        }
+        return null
+      }
+
+      // Find the last model turn Locator
+      let lastTurnLoc: ReturnType<Page['locator']> | null = null
+      for (const tSel of STUDIO_SELECTORS.modelTurnContainers) {
+        try {
+          const allTurns = page.locator(tSel)
+          const cnt = await allTurns.count()
+          if (cnt > 0) {
+            lastTurnLoc = allTurns.nth(cnt - 1)
+            break
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      // Fallback (a): UI flow using DOM locators scoped strictly inside lastTurn (max 3 tries)
+      if (lastTurnLoc) {
+        for (let copyTry = 1; copyTry <= 3 && Date.now() < fetchDeadline; copyTry++) {
+          try {
+            await lastTurnLoc.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {})
+            const turnBox = await lastTurnLoc.boundingBox().catch(() => null)
+            if (turnBox && turnBox.width > 40 && turnBox.height > 20) {
+              // Click near the center of the last model turn to reveal its turn options toolbar
+              const clickX = Math.round(turnBox.x + turnBox.width * 0.5)
+              const clickY = Math.round(
+                Math.max(85, Math.min(VIEWPORT.height - 60, turnBox.y + Math.min(turnBox.height * 0.5, 220))),
+              )
+              await page.mouse.click(clickX, clickY)
+            } else {
+              await lastTurnLoc.hover({ timeout: 1500 }).catch(() => {})
+            }
+            await new Promise((r) => setTimeout(r, 250))
+
+            // Find the three-dot (more_vert) button strictly inside lastTurnLoc and below the page header
+            let clickedMoreBtn = false
+            for (const btnSel of STUDIO_SELECTORS.turnOptionsButton) {
+              const candidates = lastTurnLoc.locator(btnSel)
+              const cCount = await candidates.count().catch(() => 0)
+              for (let i = 0; i < cCount; i++) {
+                const btn = candidates.nth(i)
+                if (!(await btn.isVisible().catch(() => false))) continue
+                const box = await btn.boundingBox().catch(() => null)
+                // Must be below the top page header bar (y > 68)
+                if (!box || box.y <= 68) continue
+
+                const isInsideTurnAndNotHeader = await btn
+                  .evaluate((el) => {
+                    if (el.closest('header, mat-toolbar, ms-toolbar, ms-header, .toolbar')) return false
+                    return Boolean(el.closest('ms-chat-turn, [data-turn-role="model"], .model-turn'))
+                  })
+                  .catch(() => false)
+
+                if (!isInsideTurnAndNotHeader) continue
+
+                await btn.click({ timeout: 1500 })
+                clickedMoreBtn = true
+                break
+              }
+              if (clickedMoreBtn) break
+            }
+
+            if (clickedMoreBtn) {
+              await new Promise((r) => setTimeout(r, 300))
+              const copied = await clickCopyAsTextInOpenMenu()
+              if (copied) {
+                if (!this.isRejectedClipboardText(copied)) {
+                  return { text: cleanStudioAnswerText(copied), source: 'clipboard' }
+                }
+                this.logStep(
+                  'clipboard text rejected',
+                  `Rejected copied text (${copied.length} chars, starts=${JSON.stringify(copied.slice(0, 60))}) -> falling back to DOM`,
+                  'warn',
+                )
+              }
+              // Wrong menu opened or "Copy as text" not found — press Escape and retry
+              await page.keyboard.press('Escape').catch(() => {})
+              await new Promise((r) => setTimeout(r, 200))
+            }
+          } catch {
+            await page.keyboard.press('Escape').catch(() => {})
+          }
+        }
+      }
+
+      // Fallback (b): Coordinate ratios on VIEWPORT (1366x840)
+      if (Date.now() < fetchDeadline) {
+        try {
+          if (lastTurnLoc) {
+            await lastTurnLoc.scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => {})
+          }
+          const turnClickX = Math.round(0.586 * VIEWPORT.width)
+          const turnClickY = Math.round(0.506 * VIEWPORT.height)
+          await page.mouse.click(turnClickX, turnClickY)
+          await new Promise((r) => setTimeout(r, 250))
+
+          const moreX = Math.round(0.742 * VIEWPORT.width)
+          const moreY = Math.round(0.113 * VIEWPORT.height)
+          // Verify element at (moreX, moreY) is not a top header bar button before clicking
+          const safeToClickMoreAtCoord = await page
+            .evaluate(
+              ({ x, y }) => {
+                const el = document.elementFromPoint(x, y)
+                if (!el) return false
+                if (el.closest('header, mat-toolbar, ms-toolbar, ms-header')) return false
+                return true
+              },
+              { x: moreX, y: moreY },
+            )
+            .catch(() => false)
+
+          if (safeToClickMoreAtCoord) {
+            await page.mouse.click(moreX, moreY)
+            await new Promise((r) => setTimeout(r, 300))
+
+            // First try clicking the "Copy as text" item in the opened overlay via locator
+            const copiedViaOverlay = await clickCopyAsTextInOpenMenu()
+            if (copiedViaOverlay) {
+              if (!this.isRejectedClipboardText(copiedViaOverlay)) {
+                return { text: cleanStudioAnswerText(copiedViaOverlay), source: 'clipboard' }
+              }
+              this.logStep(
+                'clipboard text rejected',
+                `Rejected overlay copied text (${copiedViaOverlay.length} chars) -> falling back to DOM`,
+                'warn',
+              )
+            }
+
+            // Otherwise check if (0.792, 0.227) points to "Copy as text"
+            const copyX = Math.round(0.792 * VIEWPORT.width)
+            const copyY = Math.round(0.227 * VIEWPORT.height)
+            const isCopyAsTextAtCoord = await page
+              .evaluate(
+                ({ x, y }) => {
+                  const el = document.elementFromPoint(x, y) as HTMLElement | null
+                  if (!el) return false
+                  const item = (el.closest('[role="menuitem"], button, .mat-mdc-menu-item') || el) as HTMLElement
+                  const txt = (item.innerText || item.textContent || '').trim()
+                  return /copy\s+as\s+text/i.test(txt) && !/markdown|delete|branch/i.test(txt)
+                },
+                { x: copyX, y: copyY },
+              )
+              .catch(() => false)
+
+            if (isCopyAsTextAtCoord) {
+              const sentinel = await writeSentinel()
+              await page.mouse.click(copyX, copyY)
+              const copied = await readClipboardUntilChanged(sentinel, 3000)
+              if (copied) {
+                if (!this.isRejectedClipboardText(copied)) {
+                  return { text: cleanStudioAnswerText(copied), source: 'clipboard' }
+                }
+                this.logStep(
+                  'clipboard text rejected',
+                  `Rejected coord copied text (${copied.length} chars) -> falling back to DOM`,
+                  'warn',
+                )
+              }
+            }
+            await page.keyboard.press('Escape').catch(() => {})
+          }
+        } catch {
+          await page.keyboard.press('Escape').catch(() => {})
+        }
+      }
+
+      // Debug dump of buttons inside the last turn so selectors can be tuned if UI copy failed
+      try {
+        const turnButtonsDump = await page.evaluate((turnSels) => {
+          let turns: Element[] = []
+          for (const sel of turnSels) {
+            if (sel.includes(':has-text(')) continue
+            try {
+              const found = Array.from(document.querySelectorAll(sel))
+              if (found.length > 0) {
+                turns = found
+                break
+              }
+            } catch {
+              // ignore
+            }
+          }
+          const lastTurn = turns[turns.length - 1]
+          if (!lastTurn) return 'no lastTurn found'
+          const btns = Array.from(lastTurn.querySelectorAll('button, [role="button"]')).slice(0, 12)
+          return btns
+            .map((b) => {
+              const h = b as HTMLElement
+              const r = h.getBoundingClientRect()
+              const aria = h.getAttribute('aria-label') || ''
+              const txt = (h.innerText || h.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 30)
+              return `[aria="${aria}" txt="${txt}" @${Math.round(r.x)},${Math.round(r.y)}]`
+            })
+            .join(' ')
+        }, [...STUDIO_SELECTORS.modelTurnContainers])
+        this.logStep('turn copy fallback->dom', turnButtonsDump.slice(0, 260), 'warn')
+      } catch {
+        // ignore dump error
+      }
 
       // Fallback (c): DOM extraction without thoughts
       const domText = await this.extractFinalAnswerWithoutThoughts(page)
@@ -3785,8 +4015,9 @@ export class StudioBrowserController {
             await new Promise((r) => setTimeout(r, 1000))
 
             await this.ensurePage(username)
-            const existingPages = this.context ? [...this.context.pages()] : []
-            const freshPage = await this.context!.newPage()
+            const activeCtx = this.context as BrowserContext | null
+            const existingPages = activeCtx ? [...activeCtx.pages()] : []
+            const freshPage = await activeCtx!.newPage()
             for (const oldP of existingPages) {
               if (oldP !== freshPage && !oldP.isClosed()) {
                 await oldP.close().catch(() => {})
@@ -4068,7 +4299,11 @@ export class StudioBrowserController {
         currentStage = 'run/execute'
         // Attach network response listener BEFORE pressing Run so we capture exact GenerateContent status + body on 403/errors
         // and track GenerateContent/StreamGenerateContent request completion for the completion gate.
-        let capturedRunError: { status: number; url: string; body: string } | null = null
+        let capturedRunError: { status: number; url: string; body: string } | null = null as {
+          status: number
+          url: string
+          body: string
+        } | null
         let genContentSeenCount = 0
         let genContentInFlight = 0
         const onRunResponse = async (res: PlaywrightResponse) => {
@@ -4278,6 +4513,10 @@ export class StudioBrowserController {
 
             if (elapsed >= 2) {
               const spinnerVisible = await this.isThinkingOrRunningSpinnerVisible(page)
+              if (!stopVisible && !spinnerVisible && (await this.checkLastTurnProhibited(page))) {
+                throw new Error('POLICY_BLOCKED: Gemini prohibited content')
+              }
+
               const candidateText = await this.extractFinalAnswerWithoutThoughts(page)
 
               if (!hissa2FirstSeenLogged && /HISSA\s*2\b/i.test(candidateText)) {
@@ -4382,21 +4621,20 @@ export class StudioBrowserController {
           continue
         }
 
-        // CHANGE 3 & CHANGE 4 & CHANGE 5:
-        // If a transient internal-error banner broke the loop, or after done/timeout, fetch and validate immediately.
-        // On timeout (doneIndicator === null), still attempt one fetch + validate in case the answer finished on screen.
+        // Fetch and validate answer (with Fix 6: 10s wait + single re-fetch if validation is INCOMPLETE)
         currentStage = 'run/validate'
         let validationReason = transientBannerReason || ''
         let fetchedSource: 'clipboard' | 'dom' = 'dom'
         let fetchedRawText = ''
         let validation: StudioValidationResult | null = null
 
-        if (!transientBannerReason) {
+        const fetchShiftAndValidateOnce = async (): Promise<void> => {
           const fetched = await this.fetchStudioResultFromTurnOrFallback(page)
           fetchedSource = fetched.source
-          let answerText = fetched.text || lastCandidateText
+          let answerText = cleanStudioAnswerText(fetched.text || lastCandidateText)
           fetchedRawText = answerText
           let clipDurationExceeded = false
+          validation = null
 
           if (windowClip && answerText) {
             const maxMovieEnd = maxMovieEndSecInHissa2(answerText)
@@ -4411,6 +4649,7 @@ export class StudioBrowserController {
               )
             } else {
               answerText = shiftMovieTimestampsInHissa2(answerText, windowClip.clipStartFrame)
+              fetchedRawText = answerText
             }
           }
 
@@ -4434,10 +4673,27 @@ export class StudioBrowserController {
               rawAnswer = answerText
             }
           }
+        }
 
-          if (validation) {
-            if (validation.ok) {
-              rawAnswer = validation.cleanedText
+        if (!transientBannerReason) {
+          await fetchShiftAndValidateOnce()
+
+          // FIX 6 (after fetch): If validation failed with an INCOMPLETE reason, wait 10s once and re-fetch + re-validate
+          const firstVal = validation as StudioValidationResult | null
+          if (firstVal && !firstVal.ok && INCOMPLETE_REASONS.has(firstVal.reason)) {
+            this.logStep(
+              'incomplete post-fetch -> 10s re-fetch',
+              `${jobLabel}: validation=${firstVal.reason} -> waiting 10s and re-fetching once before retry`,
+              'warn',
+            )
+            await new Promise((r) => setTimeout(r, 10_000))
+            await fetchShiftAndValidateOnce()
+          }
+
+          const finalVal = validation as StudioValidationResult | null
+          if (finalVal) {
+            if (finalVal.ok) {
+              rawAnswer = finalVal.cleanedText
 
               // Parallel Window Scan extra strict checks (Section 5):
               // 1) HISSA 1 scene count == HISSA 2 entry count
@@ -4445,7 +4701,7 @@ export class StudioBrowserController {
               if (parallelMode) {
                 const parsedEntries = extractHissa1And2EntriesFromResponse(rawAnswer)
                 const h1Count = parsedEntries.hissa1Entries.length
-                const h2Count = validation.stats.totalValidHissa2Lines
+                const h2Count = finalVal.stats.totalValidHissa2Lines
                 if (h1Count > 0 && h1Count !== h2Count) {
                   rawAnswer = ''
                   validationReason = `hissa1_hissa2_count_mismatch (HISSA 1=${h1Count}, HISSA 2=${h2Count})`
@@ -4465,37 +4721,42 @@ export class StudioBrowserController {
               }
 
               if (rawAnswer) {
-                if (validation.stats.softWarning) {
-                  this.logStep('result coverage note', validation.stats.softWarning, 'warn')
+                if (finalVal.stats.softWarning) {
+                  this.logStep('result coverage note', finalVal.stats.softWarning, 'warn')
                 }
                 const matchNote =
-                  validation.stats.matchLineCount > 0
-                    ? `${validation.stats.matchLineCount} matches`
+                  finalVal.stats.matchLineCount > 0
+                    ? `${finalVal.stats.matchLineCount} matches`
                     : '0 matches'
                 this.logStep(
                   'SUCCESS [validate]',
-                  `result check OK (HISSA 1 + HISSA 2, ${validation.stats.totalValidHissa2Lines} lines: ${matchNote}, ${validation.stats.notFoundLineCount} notFound, source=${fetchedSource})`,
+                  `result check OK (HISSA 1 + HISSA 2, ${finalVal.stats.totalValidHissa2Lines} lines: ${matchNote}, ${finalVal.stats.notFoundLineCount} notFound, source=${fetchedSource})`,
                   'success',
                 )
                 onLog?.(
                   'success',
-                  `SUCCESS [validate] ${jobLabel}: valid result (${validation.stats.totalValidHissa2Lines} lines: ${matchNote}, ${validation.stats.notFoundLineCount} not found, source=${fetchedSource})`,
+                  `SUCCESS [validate] ${jobLabel}: valid result (${finalVal.stats.totalValidHissa2Lines} lines: ${matchNote}, ${finalVal.stats.notFoundLineCount} not found, source=${fetchedSource})`,
                 )
               }
             } else {
               validationReason =
-                !doneIndicator && validation.reason === 'empty' ? 'timeout_10m' : validation.reason
+                !doneIndicator && finalVal.reason === 'empty' ? 'timeout_10m' : finalVal.reason
             }
           }
         }
 
         if (!rawAnswer) {
+          const prohibitedDetected = await this.checkLastTurnProhibited(page)
+          if (prohibitedDetected) {
+            throw new Error('POLICY_BLOCKED: Gemini prohibited content')
+          }
           invalidResultRetries += 1
           const badReason = validationReason || 'empty'
-          const newlineCount = (fetchedRawText.match(/\n/g) || []).length
-          const first300 = JSON.stringify(fetchedRawText.slice(0, 300))
-          const last400 = JSON.stringify(fetchedRawText.slice(-400))
-          const badDiagMsg = `BAD_RESULT_DIAG [reason=${badReason}] fetchedSource=${fetchedSource} length=${fetchedRawText.length} newlines=${newlineCount} first300=${first300} last400=${last400}`
+          const cleanedDiagText = cleanStudioAnswerText(fetchedRawText)
+          const newlineCount = (cleanedDiagText.match(/\n/g) || []).length
+          const first300 = JSON.stringify(cleanedDiagText.slice(0, 300))
+          const last400 = JSON.stringify(cleanedDiagText.slice(-400))
+          const badDiagMsg = `BAD_RESULT_DIAG [reason=${badReason}] fetchedSource=${fetchedSource} prohibited=${prohibitedDetected} rawLength=${fetchedRawText.length} cleanedLength=${cleanedDiagText.length} newlines=${newlineCount} first300=${first300} last400=${last400}`
           this.logStep('BAD result diagnostic', badDiagMsg, 'warn')
           onLog?.('warn', `${badDiagMsg} on ${jobLabel}`)
           this.logStep(

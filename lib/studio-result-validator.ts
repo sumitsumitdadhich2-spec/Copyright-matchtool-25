@@ -34,6 +34,119 @@ const SPECIFIC_ERROR_PHRASES: readonly string[] = [
   'model is overloaded',
 ]
 
+const PROMPT_ECHO_PHRASES: readonly string[] = [
+  'sirf hissa 1 aur hissa 2 do',
+  'you are a forensic video analyst',
+  'you are an automated visual frame-level',
+  'watch video 1 from start to finish and break it into',
+  '1:1 same-duration mapping (sabse important rule)',
+  'har matched line ka format:',
+]
+
+/**
+ * Check whether text is actually our prompt (or starts with our prompt/thinking header without answer).
+ */
+export function isPromptEchoText(text: string): boolean {
+  const lower = (text || '').toLowerCase()
+  for (const phrase of PROMPT_ECHO_PHRASES) {
+    if (lower.includes(phrase)) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * Clean DOM / clipboard noise from an AI Studio model turn response:
+ * 1. Strip leading UI icon tokens ("edit", "more_vert", "content_copy", "flag", "auto_awesome").
+ * 2. Strip any thinking leak / preamble before "HISSA 1".
+ * 3. Strip Grounding with Google Search footer blocks ("Sources help...", "Google Search Suggestions...", "Learn more") after HISSA 2.
+ * 4. Strip trailing UI tokens ("thumb_up", "thumb_down", "thumb_upthumb_down", "more_vert", "edit") and turn duration tokens (e.g. "6m31.5s", "12.4s").
+ * 5. Ensure line breaks exist around HISSA 1 / HISSA 2 headings and before each HISSA 1 / HISSA 2 entry even if DOM extraction flattened lines.
+ */
+export function cleanStudioAnswerText(text: string): string {
+  if (typeof text !== 'string' || !text) return ''
+  let s = text.replace(/\r\n/g, '\n').trim()
+  if (!s) return ''
+
+  // Strip standalone UI icon lines anywhere in the text
+  s = s.replace(/^[ \t]*(?:edit|more_vert|content_copy|flag|auto_awesome)[ \t]*$/gim, '')
+
+  // Strip leading UI icon words at the very beginning
+  s = s.replace(/^(?:\s*(?:edit|more_vert|content_copy|flag|auto_awesome)\b\s*)+/i, '').trim()
+
+  // Strip everything before "HISSA 1" (unless it's a prompt echo, which validator catches separately)
+  const hissa1Match = /HISSA\s*1\b/i.exec(s)
+  if (hissa1Match && !isPromptEchoText(s)) {
+    s = s.slice(hissa1Match.index).trim()
+  }
+
+  // Strip Grounding / Google Search Suggestions block after HISSA 2
+  const hissa2Check = /HISSA\s*2\b/i.exec(s)
+  if (hissa2Check) {
+    const beforeH2 = s.slice(0, hissa2Check.index)
+    let fromH2 = s.slice(hissa2Check.index)
+
+    fromH2 = fromH2.replace(
+      /(?:\n|\s)*(?:Sources\s+help\b|Google\s+Search\s+Suggestions\b|Display\s+of\s+Search\s+Suggestions\s+is\s+required\b)[\s\S]*$/i,
+      '',
+    )
+    fromH2 = fromH2.replace(/\n[ \t]*Sources[ \t]*\n[\s\S]*$/i, '')
+
+    // Strip trailing UI feedback icons and turn duration tokens (e.g. "thumb_up", "thumb_down", "6m31.5s", "12.4s")
+    fromH2 = fromH2.replace(
+      /(?:[\s\n]+(?:thumb_upthumb_down|thumb_up|thumb_down|more_vert|edit|content_copy|flag|\d+m\s*\d+(?:\.\d+)?s|\d+(?:\.\d+)?s))+\s*$/gi,
+      '',
+    )
+    // Also handle glued trailing tokens right after "(123-456 frames)" or "NOT FOUND..."
+    fromH2 = fromH2.replace(
+      /(\bframes\)|\bNOT[\s_]*FOUND[^\n]*?)(?:thumb_upthumb_down|thumb_up|thumb_down|\d+m\s*\d+(?:\.\d+)?s|\d+\.\d+s)+[ \t]*$/i,
+      '$1',
+    )
+
+    s = (beforeH2 + fromH2).trim()
+  } else {
+    s = s.replace(
+      /(?:[\s\n]+(?:thumb_upthumb_down|thumb_up|thumb_down|more_vert|edit|content_copy|flag|\d+m\s*\d+(?:\.\d+)?s|\d+(?:\.\d+)?s))+\s*$/gi,
+      '',
+    ).trim()
+  }
+
+  // Ensure line breaks around HISSA 1 / HISSA 2 headings and entries when text was flattened
+  // 1) Newline before HISSA 2 section (and its optional === border)
+  s = s.replace(/([^\n])\s*(={3,}\s*HISSA\s*2\b)/gi, '$1\n$2')
+  s = s.replace(/([^\n=])\s*(HISSA\s*2\b)/gi, '$1\n$2')
+
+  // 2) Newline right after HISSA 1 heading (e.g. "HISSA 1 — SHORT VIDEO TIME MAP ===" followed by timestamp)
+  s = s.replace(
+    /(HISSA\s*1\b(?:\s*[-—–:]\s*(?:SHORT\s+VIDEO\s+TIME\s+MAP|SHORT\s+VIDEO\s+SCENE\s+MAP|SHORT\s+VIDEO\s+MAP|SHORT\s+MAP))?[=*#\s]*)(?=(?:\d+:)?\d{1,2}:\d{2})/gi,
+    '$1\n',
+  )
+
+  // 3) Newline right after HISSA 2 heading (e.g. "HISSA 2 — MOVIE MAP TIME ===" followed by "Short")
+  s = s.replace(
+    /(HISSA\s*2\b(?:\s*[-—–:]\s*(?:MOVIE\s+MAP\s+TIME|MOVIE\s+TIME\s+MAP|MOVIE\s+LOCATION\s+HUNT|MOVIE\s+MAP))?[=*#\s]*)(?=\bShort\b|(?:\d+:)?\d{1,2}:\d{2})/gi,
+    '$1\n',
+  )
+
+  // 4) Newline before each HISSA 1 timestamp segment: "mm:ss.mmm - mm:ss.mmm (start-end frames):"
+  s = s.replace(
+    /([^\n])\s+((?:\d+:)?\d{1,2}:\d{2}\.\d{3}\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}\.\d{3}\s*\(\d+\s*-\s*\d+\s*frames\)\s*:)/gi,
+    '$1\n$2',
+  )
+
+  // 5) Newline before each HISSA 2 "Short mm:ss.mmm - mm:ss.mmm -->" entry
+  s = s.replace(
+    /([^\n])\s+(Short[:\s]+(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-->|->|—>|=>|→))/gi,
+    '$1\n$2',
+  )
+
+  // Collapse 3+ consecutive newlines to 2
+  s = s.replace(/\n{3,}/g, '\n\n').trim()
+
+  return s
+}
+
 /** Parse "h:mm:ss(.mmm)" / "mm:ss(.mmm)" into seconds. */
 function parseClockSec(ts: string): number | null {
   const t = ts.trim()
@@ -113,7 +226,7 @@ function isTailTruncated(normalizedHissa2: string): boolean {
 /**
  * Pure, synchronous validator for AI Studio chunk-map answers.
  * Runs immediately after fetching the answer (zero sleep/await).
- * Normalizes text to tolerate wrapped lines, multi-line entries, and annotations.
+ * Normalizes text to tolerate wrapped lines, flattened DOM text (0 newlines), multi-line entries, and UI/grounding noise.
  */
 export function validateStudioAnswer(
   text: string,
@@ -140,6 +253,16 @@ export function validateStudioAnswer(
     }
   }
 
+  // Reject prompt echo (e.g. if clipboard copied the user prompt instead of model turn)
+  if (isPromptEchoText(trimmed)) {
+    return {
+      ok: false,
+      reason: 'prompt_echo',
+      cleanedText: '',
+      stats: emptyStats,
+    }
+  }
+
   // Check 3: Specific internal/error phrases (checked early so short error messages report the exact phrase)
   const lower = trimmed.toLowerCase()
   for (const phrase of SPECIFIC_ERROR_PHRASES) {
@@ -153,8 +276,10 @@ export function validateStudioAnswer(
     }
   }
 
+  const preCleaned = cleanStudioAnswerText(trimmed)
+
   // Check 1: Too short (< 100 chars)
-  if (trimmed.length < 100) {
+  if (preCleaned.length < 100) {
     return {
       ok: false,
       reason: 'empty',
@@ -164,8 +289,8 @@ export function validateStudioAnswer(
   }
 
   // Check 2: Both "HISSA 1" and "HISSA 2" must be present, and HISSA 1 must appear before HISSA 2
-  const hissa1Match = /HISSA\s*1\b/i.exec(trimmed)
-  const hissa2Match = /HISSA\s*2\b/i.exec(trimmed)
+  const hissa1Match = /HISSA\s*1\b/i.exec(preCleaned)
+  const hissa2Match = /HISSA\s*2\b/i.exec(preCleaned)
   if (!hissa1Match || !hissa2Match || hissa1Match.index >= hissa2Match.index) {
     return {
       ok: false,
@@ -176,10 +301,12 @@ export function validateStudioAnswer(
   }
 
   // Check 6: Strip any thinking leak / preamble before "HISSA 1"
-  const cleanedText = trimmed.slice(hissa1Match.index).trim()
+  const cleanedText = preCleaned.slice(hissa1Match.index).trim()
 
-  // Extract HISSA 2 body (everything after the HISSA 2 heading line)
-  const hissa2InCleaned = /HISSA\s*2\b[^\n]*\n?/i.exec(cleanedText)
+  // Extract HISSA 2 body in a newline-independent way:
+  // Match only the HISSA 2 heading (and optional subtitle like "— MOVIE MAP TIME"), stopping before the first "Short" or timestamp token
+  const hissa2InCleaned =
+    /HISSA\s*2\b(?:(?!\bShort\b|\b(?:\d+:)?\d{1,2}:\d{2})[^\r\n])*\r?\n?/i.exec(cleanedText)
   const hissa2Body = hissa2InCleaned
     ? cleanedText.slice(hissa2InCleaned.index + hissa2InCleaned[0].length).trim()
     : ''
