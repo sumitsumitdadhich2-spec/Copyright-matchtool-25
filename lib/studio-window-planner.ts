@@ -723,6 +723,7 @@ export interface ParallelMergedReport {
   totalWindows: number
   completedWindows: number
   failedWindows: number
+  prohibitedWindows: number
   totalShortSegments: number
   foundCount: number
   notFoundCount: number
@@ -885,9 +886,11 @@ export function mergeParallelWindowResults(params: {
 
   let completedWindows = 0
   let failedWindows = 0
+  let prohibitedWindows = 0
 
   for (const w of params.windows) {
     if (w.status === 'DONE') completedWindows++
+    else if (w.status === 'PROHIBITED') prohibitedWindows++
     else if (w.status === 'FAILED') failedWindows++
 
     if (!w.rawResponseText) continue
@@ -1096,7 +1099,7 @@ export function mergeParallelWindowResults(params: {
 
   const formattedTxt = [
     `# PARALLEL WINDOW SCAN MERGED REPORT`,
-    `# Windows: ${completedWindows}/${params.windows.length} DONE (${failedWindows} FAILED)`,
+    `# Windows: ${completedWindows}/${params.windows.length} DONE (${failedWindows} FAILED, ${prohibitedWindows} PROHIBITED)`,
     `# Segments: ${mergedSegments.length} total | ${foundCount} FOUND | ${notFoundCount} NOT FOUND | ${conflictCount} CONFLICT`,
     ``,
     `HISSA 1`,
@@ -1111,6 +1114,7 @@ export function mergeParallelWindowResults(params: {
     totalWindows: params.windows.length,
     completedWindows,
     failedWindows,
+    prohibitedWindows,
     totalShortSegments: mergedSegments.length,
     foundCount,
     notFoundCount,

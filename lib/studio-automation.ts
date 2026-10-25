@@ -4246,12 +4246,8 @@ export class StudioBrowserController {
                 'warn',
                 `Matched AI Studio error banner on ${jobLabel}: "${errBannerText.slice(0, 200)}"${netDetail}`,
               )
-              if (/(prohibited_content|blocked\s+due\s+to\s+safety)/i.test(errBannerText) && !sanitized) {
-                onLog?.(
-                  'warn',
-                  `Studio flagged content policy on ${jobLabel} — retrying once with sanitized neutral prompt`,
-                )
-                return this.runWindowJob({ ...params, sanitized: true })
+              if (/(prohibited_content|blocked\s+due\s+to\s+safety)/i.test(errBannerText)) {
+                throw new Error(`POLICY_BLOCKED: ${errBannerText.slice(0, 180)}${netDetail}`)
               }
               if (
                 /(token\s+limit|context\s+length|exceeds\s+the\s+maximum\s+number\s+of\s+tokens|input\s+is\s+too\s+long)/i.test(
@@ -4631,15 +4627,18 @@ export class StudioBrowserController {
           )
           throw err
         }
-        const isPolicy = /(prohibited_content|blocked\s+due\s+to\s+safety)/i.test(msg)
-        if (isPolicy && sanitized) {
-          this.logStep(`ERROR [${currentStage}]`, `POLICY_BLOCKED: ${msg}`, 'error')
+        const isPolicy =
+          msg.startsWith('POLICY_BLOCKED:') ||
+          /(prohibited_content|blocked\s+due\s+to\s+safety)/i.test(msg)
+        if (isPolicy) {
+          const policyErr = msg.startsWith('POLICY_BLOCKED:') ? msg : `POLICY_BLOCKED: ${msg}`
+          this.logStep(`ERROR [${currentStage}]`, policyErr, 'error')
           await this.recordFinishedWindowJobAndMaybeRecyclePage(
             username,
             effectiveRecycleInterval,
             onLog,
           )
-          throw new Error(`POLICY_BLOCKED: ${msg}`)
+          throw new Error(policyErr)
         }
 
         const isCrash = this.isBrowserOrTargetCrashError(msg)

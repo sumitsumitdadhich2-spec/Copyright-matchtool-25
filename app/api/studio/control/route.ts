@@ -661,6 +661,19 @@ export async function POST(req: NextRequest) {
           parallelSnapshot: await parallelMgr.getLiveSnapshot(false),
         })
       }
+      case 'retry_prohibited_parallel': {
+        const targetScanId = (body.scanId || '').trim()
+        if (!targetScanId) {
+          return NextResponse.json({ ok: false, error: 'Missing scanId' }, { status: 400 })
+        }
+        const parallelMgr = getStudioParallelManager(targetScanId)
+        const retriedCount = await parallelMgr.retryProhibitedWindows(username)
+        return NextResponse.json({
+          ok: true,
+          retriedCount,
+          parallelSnapshot: await parallelMgr.getLiveSnapshot(false),
+        })
+      }
       case 'parallel_window_action': {
         const targetScanId = (body.scanId || '').trim()
         if (!targetScanId) {

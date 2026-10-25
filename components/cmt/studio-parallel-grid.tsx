@@ -145,6 +145,8 @@ function statusBadgeStyle(status: ParallelWindowStatus | 'IDLE'): string {
       return 'border-purple-500/40 bg-purple-500/15 text-purple-300'
     case 'NEEDS_ATTENTION':
       return 'border-rose-500/60 bg-rose-500/20 text-rose-200 animate-pulse'
+    case 'PROHIBITED':
+      return 'border-orange-500/50 bg-orange-500/20 text-orange-300'
     case 'FAILED':
       return 'border-red-500/40 bg-red-500/15 text-red-300'
     case 'STOPPED':
@@ -341,6 +343,14 @@ export function StudioParallelGrid({
   const elapsedSec = snap?.elapsedSec ?? 0
   const workers = snap?.workers ?? []
   const windows = snap?.windows ?? []
+  const prohibitedWindows = useMemo(
+    () => windows.filter((w) => w.status === 'PROHIBITED'),
+    [windows],
+  )
+  const prohibitedCount = snap?.prohibitedCount ?? prohibitedWindows.length
+  const clipsReady = snap?.clipsReady ?? 0
+  const clipsTotal = snap?.clipsTotal ?? 0
+  const clipsExtracting = Boolean(snap?.clipsExtracting)
   const mergedReport = snap?.mergedReport ?? null
   const slotPool = snap?.slotPool ?? null
   const combinedLogs = snap?.combinedLogs ?? []
@@ -410,6 +420,7 @@ export function StudioParallelGrid({
       (savedMinuteStr !== minuteInput.trim() ||
         doneCount > 0 ||
         failedCount > 0 ||
+        prohibitedCount > 0 ||
         needsAttentionCount > 0)
 
     if (hasExistingState) {
@@ -581,6 +592,10 @@ export function StudioParallelGrid({
             · Queued: <strong className="text-amber-300">{queuedCount}</strong> · Failed:{' '}
             <strong className={failedCount > 0 ? 'text-red-400' : 'text-zinc-400'}>
               {failedCount}
+            </strong>{' '}
+            · Prohibited:{' '}
+            <strong className={prohibitedCount > 0 ? 'text-orange-400' : 'text-zinc-400'}>
+              {prohibitedCount}
             </strong>{' '}
             · Elapsed: <strong className="text-zinc-200">{formatMmSs(elapsedSec)}</strong>
           </span>
@@ -769,6 +784,21 @@ export function StudioParallelGrid({
               Retry failed windows ({failedCount + needsAttentionCount})
             </button>
           )}
+
+          {prohibitedCount > 0 && (
+            <button
+              type="button"
+              disabled={busyAction !== null || !scanId}
+              onClick={() =>
+                postParallelControl({ action: 'retry_prohibited_parallel' }, 'retry_prohibited')
+              }
+              className="inline-flex items-center gap-1 text-[11px] px-2.5 py-1 rounded bg-orange-500/20 text-orange-200 border border-orange-500/40 hover:bg-orange-500/30 disabled:opacity-50"
+              title="Manually retry only PROHIBITED windows (skipped by auto-retry)"
+            >
+              <RotateCcw className="w-3 h-3" />
+              Retry prohibited ({prohibitedCount})
+            </button>
+          )}
         </div>
       </div>
 
@@ -864,6 +894,34 @@ export function StudioParallelGrid({
         {compressing360p && !compressing360p.active && compressing360p.error && (
           <div className="rounded border border-red-500/40 bg-red-950/30 px-3 py-1.5 text-xs text-red-300 font-mono">
             360p Compression Error: {compressing360p.error}
+          </div>
+        )}
+
+        {/* Per-Window Clip Extraction Progress Bar Banner */}
+        {(clipsExtracting || (isRunningOrStarting && clipsTotal > 0)) && (
+          <div className="rounded-lg border border-cyan-500/40 bg-cyan-950/30 px-3 py-2 flex flex-col gap-1.5">
+            <div className="flex items-center justify-between text-xs text-cyan-200 font-mono">
+              <span className="font-semibold">
+                Clips: {clipsReady}/{clipsTotal} (
+                {clipsTotal > 0 ? Math.round((clipsReady / clipsTotal) * 100) : 0}%)
+              </span>
+              <span className="text-[11px] text-cyan-300/80">
+                {clipsReady < clipsTotal
+                  ? 'Extracting frame-exact 24fps window clips (max 2 parallel)...'
+                  : 'All window clips extracted'}
+              </span>
+            </div>
+            <div className="w-full h-2 rounded-full bg-zinc-900 overflow-hidden border border-cyan-500/30">
+              <div
+                className="h-full bg-cyan-400 transition-all duration-300"
+                style={{
+                  width: `${Math.max(
+                    2,
+                    Math.min(100, clipsTotal > 0 ? Math.round((clipsReady / clipsTotal) * 100) : 0),
+                  )}%`,
+                }}
+              />
+            </div>
           </div>
         )}
 
@@ -1197,6 +1255,67 @@ export function StudioParallelGrid({
         </div>
       )}
 
+      {/* Prohibited Windows Compact List */}
+      {prohibitedWindows.length > 0 && (
+        <div className="px-4 pb-3">
+          <div className="rounded-lg border border-orange-500/40 bg-orange-950/20 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-3.5 h-3.5 text-orange-400" />
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-orange-300">
+                  Prohibited windows ({prohibitedWindows.length})
+                </span>
+                <span className="text-[10px] font-mono text-orange-200/80">
+                  Skipped automatically (no auto-retry). Use manual Retry if needed.
+                </span>
+              </div>
+              <button
+                type="button"
+                disabled={busyAction !== null || !scanId}
+                onClick={() =>
+                  postParallelControl({ action: 'retry_prohibited_parallel' }, 'retry_prohibited')
+                }
+                className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded bg-orange-500/20 hover:bg-orange-500/30 text-orange-200 border border-orange-500/40 disabled:opacity-50"
+              >
+                <RotateCcw className="w-3 h-3" />
+                Retry prohibited ({prohibitedWindows.length})
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {prohibitedWindows.map((pw) => (
+                <div
+                  key={pw.id}
+                  className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded border border-orange-500/40 bg-zinc-950/90 text-[10px] font-mono text-orange-200"
+                >
+                  <span>
+                    Window #{pw.windowNumber} ({pw.startFormatted}–{pw.endFormatted})
+                  </span>
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() =>
+                      postParallelControl(
+                        {
+                          action: 'parallel_window_action',
+                          windowId: pw.id,
+                          subAction: 'retry',
+                        },
+                        `prohibited_retry_${pw.id}`,
+                      )
+                    }
+                    className="inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded bg-orange-500/20 hover:bg-orange-500/35 text-orange-200 border border-orange-500/40 text-[9px]"
+                    title={`Retry Window #${pw.windowNumber} (${pw.startFormatted}–${pw.endFormatted})`}
+                  >
+                    <RotateCcw className="w-2.5 h-2.5" />
+                    Retry
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Planned Windows Status Table / Cards */}
       {windows.length > 0 && (
         <div className="px-4 pb-4">
@@ -1243,6 +1362,10 @@ export function StudioParallelGrid({
                   <div className="mt-0.5 text-[10px] font-mono text-zinc-400 truncate">
                     {win.status === 'DONE' ? (
                       <span className="text-emerald-300 font-medium">{win.summaryText}</span>
+                    ) : win.status === 'PROHIBITED' ? (
+                      <span className="text-orange-300 font-medium">
+                        {win.summaryText || 'PROHIBITED CONTENT (skipped, no retry)'}
+                      </span>
                     ) : win.error ? (
                       <span className="text-red-300">{win.error}</span>
                     ) : (
@@ -1335,6 +1458,15 @@ export function StudioParallelGrid({
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-xs font-semibold uppercase tracking-wider text-zinc-200">
                 Merged Final Result (HISSA 1 + HISSA 2)
+              </span>
+              <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                {mergedReport.completedWindows}/{mergedReport.totalWindows} DONE
+              </span>
+              <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-red-500/15 text-red-300 border border-red-500/30">
+                {mergedReport.failedWindows} FAILED
+              </span>
+              <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-orange-500/15 text-orange-300 border border-orange-500/30">
+                {mergedReport.prohibitedWindows ?? prohibitedCount} PROHIBITED
               </span>
               <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
                 {mergedReport.foundCount} FOUND

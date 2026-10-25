@@ -53,6 +53,7 @@ export type ParallelWindowStatus =
   | 'RETRYING'
   | '403_WAIT'
   | 'DONE'
+  | 'PROHIBITED'
   | 'FAILED'
   | 'NEEDS_ATTENTION'
   | 'STOPPED'
@@ -202,8 +203,12 @@ export interface ParallelScanLiveSnapshot {
   doneCount: number
   queuedCount: number
   failedCount: number
+  prohibitedCount: number
   needsAttentionCount: number
   totalWindows: number
+  clipsReady: number
+  clipsTotal: number
+  clipsExtracting: boolean
   ramUsedPercent: number
   freeDiskGb: number
   devShmUsedMb?: number
@@ -251,6 +256,8 @@ const LEGACY_PARALLEL_STATE_MIGRATED_FILE = path.join(DATA_DIR, 'studio-parallel
 const BASE_PROFILE_NAME = 'studio-chrome-profile'
 const MAX_LOG_FILE_BYTES = 50 * 1024 * 1024 // 50 MB rotation cap
 const UI_COMBINED_LOG_LIMIT = 2000
+export const LAUNCH_STAGGER_MS = 20_000
+export const MAX_PARALLEL_CLIP_EXTRACTIONS = 2
 
 export function readSystemRamUsedPercent(): number {
   try {
@@ -508,6 +515,7 @@ function syncWorkerProfileFromBase(slotIndex: number): string {
 function mapStepToWindowStatus(step: string): ParallelWindowStatus {
   const s = (step || '').toLowerCase()
   if (s.includes('needs attention')) return 'NEEDS_ATTENTION'
+  if (s.includes('policy_blocked') || s.includes('prohibited')) return 'PROHIBITED'
   if (s.includes('waiting for upload gate')) return 'WAITING_FOR_UPLOAD_GATE'
   if (s.includes('waiting for ram')) return 'WAITING_FOR_RAM'
   if (s.includes('waiting for worker')) return 'WAITING_FOR_WORKER'
@@ -691,12 +699,11 @@ class GlobalProfileSlotPool {
     if (slot.everLaunched) return 0
     slot.everLaunched = true
     const now = Date.now()
-    const STAGGER_MS = 10_000
-    if (this.lastLaunchAt === 0 || now >= this.lastLaunchAt + STAGGER_MS) {
+    if (this.lastLaunchAt === 0 || now >= this.lastLaunchAt + LAUNCH_STAGGER_MS) {
       this.lastLaunchAt = now
       return 0
     }
-    const nextAt = this.lastLaunchAt + STAGGER_MS
+    const nextAt = this.lastLaunchAt + LAUNCH_STAGGER_MS
     this.lastLaunchAt = nextAt
     return Math.max(0, nextAt - now)
   }
@@ -875,6 +882,11 @@ export class StudioParallelManager {
   private clipCancelToken: CancelToken | null = null
   private windowClipPromises = new Map<string, Promise<WindowClipResult>>()
   private startWindowClipTask?: (w: ParallelWindowState) => Promise<WindowClipResult>
+  private clipsReady = 0
+  private clipsTotal = 0
+  private clipsExtracting = false
+  private clipExtractActiveCount = 0
+  private clipExtractWaitQueue: Array<() => void> = []
 
   constructor(scanId: string) {
     killAllLeftoverChromeProcessesOnceOnStartup()
@@ -1147,6 +1159,7 @@ export class StudioParallelManager {
         const anyWindowRan = raw.windows.some(
           (w) =>
             w.status === 'DONE' ||
+            w.status === 'PROHIBITED' ||
             w.status === 'FAILED' ||
             w.status === 'RETRYING' ||
             (typeof w.attempt === 'number' && w.attempt > 0) ||
@@ -1205,6 +1218,7 @@ export class StudioParallelManager {
       this.windows.some(
         (w) =>
           w.status === 'DONE' ||
+          w.status === 'PROHIBITED' ||
           w.status === 'FAILED' ||
           w.status === 'RETRYING' ||
           (typeof w.attempt === 'number' && w.attempt > 0) ||
@@ -1214,6 +1228,7 @@ export class StudioParallelManager {
     return this.windows.some(
       (w) =>
         w.status === 'DONE' ||
+        w.status === 'PROHIBITED' ||
         w.status === 'QUEUED' ||
         w.status === 'FAILED' ||
         w.status === 'RETRYING' ||
@@ -1548,6 +1563,9 @@ export class StudioParallelManager {
       this.waitingForWorkerSlots = false
       this.resourceWarning = null
       this.resourceSnapshots = []
+      this.clipsReady = 0
+      this.clipsTotal = 0
+      this.clipsExtracting = false
       this.windows = windows.map((w) => ({
         ...w,
         status: 'QUEUED',
@@ -1824,6 +1842,7 @@ export class StudioParallelManager {
         this.windows.some(
           (w) =>
             w.status === 'DONE' ||
+            w.status === 'PROHIBITED' ||
             w.status === 'QUEUED' ||
             w.status === 'FAILED' ||
             w.status === 'RETRYING' ||
@@ -1859,7 +1878,7 @@ export class StudioParallelManager {
         this.finishedAt = null
       } else {
         for (const w of this.windows) {
-          if (w.status !== 'DONE' && w.status !== 'SKIPPED') {
+          if (w.status !== 'DONE' && w.status !== 'PROHIBITED' && w.status !== 'SKIPPED') {
             w.status = 'QUEUED'
             w.workerId = null
             w.stage = 'queued'
@@ -1922,50 +1941,63 @@ export class StudioParallelManager {
           w.summaryText = 'Extracting window clip...'
         }
         const token = this.clipCancelToken ?? undefined
-        const t0 = Date.now()
-        const p = ensureWindowClip(
-          this.scanId,
-          {
-            windowNumber: w.windowNumber,
-            startSec: w.startSec,
-            endSec: w.endSec,
-          },
-          { token },
-        ).then((clipRes) => {
-          const sizeBytes = (() => {
-            try {
-              return fs.statSync(clipRes.clipPath).size
-            } catch {
-              return 0
+
+        const runWithSemaphore = async (): Promise<WindowClipResult> => {
+          await this.acquireClipExtractSlot()
+          try {
+            const t0 = Date.now()
+            const clipRes = await ensureWindowClip(
+              this.scanId,
+              {
+                windowNumber: w.windowNumber,
+                startSec: w.startSec,
+                endSec: w.endSec,
+              },
+              { token },
+            )
+            const sizeBytes = (() => {
+              try {
+                return fs.statSync(clipRes.clipPath).size
+              } catch {
+                return 0
+              }
+            })()
+            const sizeMb = (sizeBytes / (1024 * 1024)).toFixed(1)
+            const extractSec = ((Date.now() - t0) / 1000).toFixed(1)
+            const endFrame = clipRes.clipStartFrame + clipRes.frameCount
+            if (w.status === 'QUEUED' && w.stage === 'Extracting clip...') {
+              if (clipRes.cached) {
+                w.stage = 'Clip ready (cached)'
+                w.summaryText = `Clip ready (cached, ${sizeMb} MB)`
+              } else {
+                w.stage = `Clip ready (extracted, ${sizeMb} MB, ${extractSec} s)`
+                w.summaryText = `Clip ready (extracted, ${sizeMb} MB, ${extractSec} s)`
+              }
             }
-          })()
-          const sizeMb = (sizeBytes / (1024 * 1024)).toFixed(1)
-          const extractSec = ((Date.now() - t0) / 1000).toFixed(1)
-          const endFrame = clipRes.clipStartFrame + clipRes.frameCount
-          if (w.status === 'QUEUED' && w.stage === 'Extracting clip...') {
-            if (clipRes.cached) {
-              w.stage = 'Clip ready (cached)'
-              w.summaryText = `Clip ready (cached, ${sizeMb} MB)`
-            } else {
-              w.stage = `Clip ready (extracted, ${sizeMb} MB, ${extractSec} s)`
-              w.summaryText = `Clip ready (extracted, ${sizeMb} MB, ${extractSec} s)`
+            this.clipsReady = Math.min(this.clipsTotal, this.clipsReady + 1)
+            if (this.clipsReady >= this.clipsTotal) {
+              this.clipsExtracting = false
             }
+            const winRange = `${w.startFormatted}–${w.endFormatted}`
+            this.appendCombinedLog({
+              workerId: 'SYS',
+              windowId: w.id,
+              windowNumber: w.windowNumber,
+              windowRange: winRange,
+              level: 'INFO',
+              step: clipRes.cached ? 'Clip ready (cached)' : 'Clip ready (extracted)',
+              message: clipRes.cached
+                ? `Window #${w.windowNumber} (${winRange}): Clip ready (cached, ${sizeMb} MB, frames ${clipRes.clipStartFrame}-${endFrame}) -> ${path.basename(clipRes.clipPath)}`
+                : `Window #${w.windowNumber} (${winRange}): Clip ready (extracted, ${sizeMb} MB, ${extractSec} s, frames ${clipRes.clipStartFrame}-${endFrame}) -> ${path.basename(clipRes.clipPath)}`,
+            })
+            this.persistStateToDisk()
+            return clipRes
+          } finally {
+            this.releaseClipExtractSlot()
           }
-          const winRange = `${w.startFormatted}–${w.endFormatted}`
-          this.appendCombinedLog({
-            workerId: 'SYS',
-            windowId: w.id,
-            windowNumber: w.windowNumber,
-            windowRange: winRange,
-            level: 'INFO',
-            step: clipRes.cached ? 'Clip ready (cached)' : 'Clip ready (extracted)',
-            message: clipRes.cached
-              ? `Window #${w.windowNumber} (${winRange}): Clip ready (cached, ${sizeMb} MB, frames ${clipRes.clipStartFrame}-${endFrame}) -> ${path.basename(clipRes.clipPath)}`
-              : `Window #${w.windowNumber} (${winRange}): Clip ready (extracted, ${sizeMb} MB, ${extractSec} s, frames ${clipRes.clipStartFrame}-${endFrame}) -> ${path.basename(clipRes.clipPath)}`,
-          })
-          this.persistStateToDisk()
-          return clipRes
-        })
+        }
+
+        const p = runWithSemaphore()
 
         // Prevent unhandled rejection when background extraction fails before a worker awaits it
         p.catch(() => {})
@@ -1996,8 +2028,13 @@ export class StudioParallelManager {
           this.clipCancelToken?.cancel()
           this.clipCancelToken = new CancelToken()
           this.windowClipPromises.clear()
+          this.clipExtractWaitQueue = []
+          this.clipExtractActiveCount = 0
           cleanStaleWindowClipPartials(this.scanId)
         } else {
+          this.clipsReady = 0
+          this.clipsTotal = 0
+          this.clipsExtracting = false
           for (const w of this.windows) {
             if (w.status === 'QUEUED') {
               w.stage = 'queued'
@@ -2025,8 +2062,16 @@ export class StudioParallelManager {
 
         if (this.usingOriginalMovieClips) {
           const orderedWindows = [...this.windows]
-            .filter((w) => w.status !== 'DONE' && w.status !== 'SKIPPED')
-            .sort((a, b) => a.windowNumber - b.windowNumber)
+            .filter(
+              (w) =>
+                w.status !== 'DONE' &&
+                w.status !== 'PROHIBITED' &&
+                w.status !== 'SKIPPED',
+            )
+            .sort((a, b) => a.priorityRank - b.priorityRank || a.windowNumber - b.windowNumber)
+          this.clipsReady = 0
+          this.clipsTotal = orderedWindows.length
+          this.clipsExtracting = orderedWindows.length > 0
           for (const w of orderedWindows) {
             startWindowClipExtractionForWindow(w)
           }
@@ -2167,6 +2212,25 @@ export class StudioParallelManager {
     return this.getMergedReport()
   }
 
+  private async acquireClipExtractSlot(): Promise<void> {
+    if (this.clipExtractActiveCount < MAX_PARALLEL_CLIP_EXTRACTIONS) {
+      this.clipExtractActiveCount += 1
+      return
+    }
+    await new Promise<void>((resolve) => {
+      this.clipExtractWaitQueue.push(resolve)
+    })
+  }
+
+  private releaseClipExtractSlot(): void {
+    const next = this.clipExtractWaitQueue.shift()
+    if (next) {
+      next()
+    } else {
+      this.clipExtractActiveCount = Math.max(0, this.clipExtractActiveCount - 1)
+    }
+  }
+
   /**
    * 5. Atomic, synchronous window claim:
    * Picks the next highest-priority QUEUED / WAITING_FOR_WORKER window and immediately marks
@@ -2238,6 +2302,9 @@ export class StudioParallelManager {
     this.active = false
     this.starting = false
     this.waitingForWorkerSlots = false
+    this.clipsExtracting = false
+    this.clipsReady = 0
+    this.clipsTotal = 0
     this.finishedAt = Date.now()
     if (this.currentRunId) {
       const rEntry = this.runHistory.find((r) => r.runId === this.currentRunId)
@@ -2247,13 +2314,14 @@ export class StudioParallelManager {
     this.persistStateToDisk()
 
     const doneCount = this.windows.filter((w) => w.status === 'DONE').length
+    const prohibitedCount = this.windows.filter((w) => w.status === 'PROHIBITED').length
     const failedCount = this.windows.filter((w) => w.status === 'FAILED').length
     const finalChromeStats = readChromeProcsPerWorker(this.concurrency)
     this.appendCombinedLog({
       workerId: 'SYS',
       level: failedCount > 0 ? 'ERROR' : 'SUCCESS',
       step: 'parallel scan finished',
-      message: `Parallel Window Scan finished for ${this.scanName} (runId=${this.currentRunId || 'n/a'}): ${doneCount}/${this.windows.length} DONE, ${failedCount} FAILED, chromeProcs=${finalChromeStats.totalProcs}`,
+      message: `Parallel Window Scan finished for ${this.scanName} (runId=${this.currentRunId || 'n/a'}): ${doneCount}/${this.windows.length} DONE, ${prohibitedCount} PROHIBITED, ${failedCount} FAILED, chromeProcs=${finalChromeStats.totalProcs}`,
     })
   }
 
@@ -2575,6 +2643,7 @@ export class StudioParallelManager {
           'error',
           `[${workerId}]${shortScanTag} Window #${win.windowNumber} clip extraction failed: ${errMsg}`,
         )
+        this.windowClipPromises.delete(win.id)
         this.persistStateToDisk()
         return
       }
@@ -2688,6 +2757,8 @@ export class StudioParallelManager {
           this.windows.push(stateHalf1, stateHalf2)
         }
         if (this.usingOriginalMovieClips && this.startWindowClipTask) {
+          this.clipsTotal += 2
+          this.clipsExtracting = true
           this.startWindowClipTask(stateHalf1)
           this.startWindowClipTask(stateHalf2)
         }
@@ -2781,6 +2852,23 @@ export class StudioParallelManager {
           step: 'NEEDS ATTENTION',
           message: msg,
         })
+      } else if (
+        msg.startsWith('POLICY_BLOCKED:') ||
+        /(prohibited_content|blocked\s+due\s+to\s+safety)/i.test(msg)
+      ) {
+        win.status = 'PROHIBITED'
+        win.stage = 'prohibited'
+        win.summaryText = 'PROHIBITED CONTENT (skipped, no retry)'
+        win.error = msg
+        this.appendCombinedLog({
+          workerId,
+          windowId: win.id,
+          windowNumber: win.windowNumber,
+          windowRange: windowRangeStr,
+          level: 'ERROR',
+          step: 'window PROHIBITED',
+          message: `Window #${win.windowNumber} (${windowRangeStr}): PROHIBITED CONTENT (skipped, no retry)`,
+        })
       } else {
         win.status = 'FAILED'
         win.stage = 'failed'
@@ -2798,9 +2886,25 @@ export class StudioParallelManager {
       }
       this.persistStateToDisk()
     } finally {
+      if (
+        win.status === 'DONE' ||
+        win.status === 'PROHIBITED' ||
+        win.status === 'FAILED'
+      ) {
+        if (windowClip?.clipPath) {
+          try {
+            if (fs.existsSync(windowClip.clipPath)) {
+              fs.unlinkSync(windowClip.clipPath)
+            }
+          } catch {
+            /* ignore clip unlink error */
+          }
+        }
+        this.windowClipPromises.delete(win.id)
+      }
       ctrl.setStepLogListener(undefined)
       ctrl.setScanContextTag('')
-      // Ensure this worker's Chrome is completely closed and any leftover processes are killed on DONE/FAILED/STOPPED
+      // Ensure this worker's Chrome is completely closed and any leftover processes are killed on DONE/PROHIBITED/FAILED/STOPPED
       await ctrl.closeContext().catch(() => {})
       this.recordResourceSnapshotIfNeeded(true, `Worker ${workerId} Chrome closed (${win.status})`)
     }
@@ -2839,6 +2943,9 @@ export class StudioParallelManager {
     this.paused = false
     this.waitingForWorkerSlots = false
     this.compressing360p = null
+    this.clipsExtracting = false
+    this.clipsReady = 0
+    this.clipsTotal = 0
     this.clipCancelToken?.cancel()
     this.stopResourceSnapshotTimer()
 
@@ -2974,6 +3081,7 @@ export class StudioParallelManager {
     const win = this.windows.find((w) => w.id === windowId)
     if (!win) return
     this.stoppedWindowIds.delete(windowId)
+    this.windowClipPromises.delete(windowId)
     win.status = 'QUEUED'
     win.workerId = null
     win.stage = 'queued (retry)'
@@ -2999,11 +3107,16 @@ export class StudioParallelManager {
         concurrency: this.concurrency,
         resumeExisting: true,
       })
+    } else if (this.usingOriginalMovieClips && this.startWindowClipTask) {
+      this.clipsTotal += 1
+      this.clipsExtracting = this.clipsReady < this.clipsTotal
+      this.startWindowClipTask(win)
     }
   }
 
   public async retryFailedWindows(username?: string) {
     let count = 0
+    const retriedWins: ParallelWindowState[] = []
     for (const w of this.windows) {
       if (
         w.status === 'FAILED' ||
@@ -3011,12 +3124,14 @@ export class StudioParallelManager {
         w.status === 'NEEDS_ATTENTION'
       ) {
         this.stoppedWindowIds.delete(w.id)
+        this.windowClipPromises.delete(w.id)
         w.status = 'QUEUED'
         w.workerId = null
         w.stage = 'queued (retry)'
         w.error = null
         w.summaryText = 'Queued for retry'
         count++
+        retriedWins.push(w)
       }
     }
     this.persistStateToDisk()
@@ -3038,6 +3153,57 @@ export class StudioParallelManager {
         concurrency: this.concurrency,
         resumeExisting: true,
       })
+    } else if (count > 0 && this.usingOriginalMovieClips && this.startWindowClipTask) {
+      this.clipsTotal += count
+      this.clipsExtracting = this.clipsReady < this.clipsTotal
+      for (const w of retriedWins) {
+        this.startWindowClipTask(w)
+      }
+    }
+    return count
+  }
+
+  public async retryProhibitedWindows(username?: string) {
+    let count = 0
+    const retriedWins: ParallelWindowState[] = []
+    for (const w of this.windows) {
+      if (w.status === 'PROHIBITED') {
+        this.stoppedWindowIds.delete(w.id)
+        this.windowClipPromises.delete(w.id)
+        w.status = 'QUEUED'
+        w.workerId = null
+        w.stage = 'queued (retry)'
+        w.error = null
+        w.summaryText = 'Queued for retry'
+        count++
+        retriedWins.push(w)
+      }
+    }
+    this.persistStateToDisk()
+
+    if (count > 0) {
+      this.appendCombinedLog({
+        workerId: 'SYS',
+        level: 'RETRY',
+        step: 'retry prohibited windows',
+        message: `Re-queued ${count} prohibited window(s) for ${this.scanName}`,
+      })
+    }
+
+    if (count > 0 && !this.active && !this.starting) {
+      await this.startParallelScan({
+        username: username || this.username || 'admin',
+        scanId: this.scanId,
+        minuteInput: this.minuteInput,
+        concurrency: this.concurrency,
+        resumeExisting: true,
+      })
+    } else if (count > 0 && this.usingOriginalMovieClips && this.startWindowClipTask) {
+      this.clipsTotal += count
+      this.clipsExtracting = this.clipsReady < this.clipsTotal
+      for (const w of retriedWins) {
+        this.startWindowClipTask(w)
+      }
     }
     return count
   }
@@ -3052,6 +3218,16 @@ export class StudioParallelManager {
       if (!slot.leasedWindowId) continue
       const win = this.windows.find((w) => w.id === slot.leasedWindowId)
       if (win) {
+        if (
+          win.status === 'DONE' ||
+          win.status === 'PROHIBITED' ||
+          win.status === 'FAILED' ||
+          win.status === 'STOPPED' ||
+          win.status === 'SKIPPED' ||
+          win.status === 'NEEDS_ATTENTION'
+        ) {
+          continue
+        }
         const meta = slot.controller.getActiveRunMeta()
         win.modelName = meta.modelName
         win.tokens = meta.tokenCount
@@ -3212,6 +3388,7 @@ export class StudioParallelManager {
     const failedCount = this.windows.filter(
       (w) => w.status === 'FAILED' || w.status === 'STOPPED',
     ).length
+    const prohibitedCount = this.windows.filter((w) => w.status === 'PROHIBITED').length
     const needsAttentionCount = this.windows.filter((w) => w.status === 'NEEDS_ATTENTION').length
     const elapsedSec =
       this.startedAt && (this.active || this.starting)
@@ -3246,8 +3423,12 @@ export class StudioParallelManager {
       doneCount,
       queuedCount,
       failedCount,
+      prohibitedCount,
       needsAttentionCount,
       totalWindows: this.windows.length,
+      clipsReady: this.clipsReady,
+      clipsTotal: this.clipsTotal,
+      clipsExtracting: this.clipsExtracting,
       ramUsedPercent: readSystemRamUsedPercent(),
       freeDiskGb: readFreeDiskGb(),
       devShmUsedMb: readDevShmUsedMb(),
