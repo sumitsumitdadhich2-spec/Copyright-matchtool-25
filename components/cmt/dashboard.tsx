@@ -21,7 +21,7 @@ import {
   Sparkles,
 } from 'lucide-react'
 import type { Scan, MinuteFinderMode } from '@/lib/types'
-import { fetcher } from '@/lib/format'
+import { fetcher, deriveScanStageInfo, formatScanKeyPairBadge } from '@/lib/format'
 import { useAuth } from '@/components/auth/auth-gate'
 import { UsersDialog } from '@/components/auth/users-dialog'
 import { TokenBadge, TokensExhaustedBanner, useTokens } from './token-badge'
@@ -110,7 +110,8 @@ export function Dashboard() {
       ).length
     : 0
 
-  const hasUnverifiedWork = Boolean(scan && (unverifiedGroupCount > 0 || unverifiedMatchCount > 0))
+  const isStudioEngine = scan ? scan.chunkScanEngine !== 'api' : true
+  const hasUnverifiedWork = Boolean(scan && !isStudioEngine && (unverifiedGroupCount > 0 || unverifiedMatchCount > 0))
 
   // Segments-aware: only selected segments with pending/scanning chunks count as resumable work.
   // Cancelled chunks are intentionally skipped (prefiltered / out-of-range / early-stopped) and must not keep Resume enabled.
@@ -134,7 +135,11 @@ export function Dashboard() {
   const stoppingInBackground = Boolean(running && status === 'stopped')
   const canStop = running && !stoppingInBackground
 
-  const verifierOn = scan ? scan.verifierEnabled !== false : settings?.verifierEnabled !== false
+  const verifierOn = isStudioEngine
+    ? false
+    : scan
+      ? scan.verifierEnabled !== false
+      : settings?.verifierEnabled !== false
   const autoModeOn = scan ? scan.autoMode !== false : settings?.autoMode !== false
 
   async function toggleVerifier() {
@@ -253,6 +258,21 @@ export function Dashboard() {
 
         <div className="ml-auto flex flex-wrap items-center gap-2">
           <TokenBadge tokens={tokens} />
+          {scan?.chunkTicket != null && (
+            <span className="flex items-center gap-1 rounded-full border border-primary/40 bg-primary/15 px-2.5 py-1 font-mono text-xs font-bold text-primary">
+              Ticket #{scan.chunkTicket}
+            </span>
+          )}
+          {scan && formatScanKeyPairBadge(scan) && (
+            <span className="flex items-center gap-1 rounded-full border border-indigo-500/40 bg-indigo-500/15 px-2.5 py-1 font-mono text-xs font-semibold text-indigo-300">
+              {formatScanKeyPairBadge(scan)}
+            </span>
+          )}
+          {scan && (
+            <span className="flex items-center gap-1 rounded-full border border-cyan-500/35 bg-cyan-500/10 px-2.5 py-1 text-xs font-medium text-cyan-200">
+              {deriveScanStageInfo(scan).label}
+            </span>
+          )}
           {scan?.chunkQueue && (
             <span
               title={`Chunks ready — waiting in global queue for active chunk scan to finish (Ticket #${scan.chunkQueue.ticket})`}
@@ -334,18 +354,20 @@ export function Dashboard() {
           <button
             type="button"
             onClick={toggleVerifier}
-            disabled={busy}
+            disabled={busy || isStudioEngine}
             className={`btn-press flex items-center gap-2 rounded-lg border px-3.5 py-2 text-sm font-semibold transition-all shadow-sm ${
               verifierOn
                 ? 'border-emerald-500/60 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25 shadow-emerald-950/25'
                 : 'border-zinc-700 bg-zinc-800/90 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'
             }`}
             title={
-              verifierOn
-                ? 'Verifier is ON (automatic 24fps AI check after chunks). Click to turn OFF.'
-                : 'Verifier is OFF (no AI verify after chunks — instant raw matches). Click to turn ON.'
+              isStudioEngine
+                ? 'Studio engine: Normal Verifier is OFF (chunk window result is final).'
+                : verifierOn
+                  ? 'Verifier is ON (automatic 24fps AI check after chunks). Click to turn OFF.'
+                  : 'Verifier is OFF (no AI verify after chunks — instant raw matches). Click to turn ON.'
             }
-            aria-label={`Verifier is currently ${verifierOn ? 'ON' : 'OFF'}. Click to toggle.`}
+            aria-label={`Verifier is currently ${verifierOn ? 'ON' : 'OFF'}.`}
           >
             {verifierOn ? (
               <ShieldCheck className="size-4 text-emerald-400" aria-hidden />
@@ -358,7 +380,7 @@ export function Dashboard() {
                 verifierOn ? 'bg-emerald-500 text-emerald-950' : 'bg-zinc-700 text-zinc-200'
               }`}
             >
-              {verifierOn ? 'ON' : 'OFF'}
+              {isStudioEngine ? 'OFF (chunk result final)' : verifierOn ? 'ON' : 'OFF'}
             </span>
           </button>
           <button

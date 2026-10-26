@@ -64,7 +64,12 @@ import {
 import { applyGroupMatches, bestRejectedCandidate, groupMatchOrigin, originTag, sameShortSegment } from './candidate-pick'
 import { computeShortCoverage, coverageLine } from './short-coverage'
 import { globalGeminiCoordinator, CandidateLane } from './global-gemini-coordinator'
-import { globalChunkScanCoordinator, registerSchedulerChunkChecker } from './chunk-scan-coordinator'
+import {
+  globalChunkScanCoordinator,
+  registerSchedulerChunkChecker,
+  releaseScanKeyPair,
+  skipScanTicket,
+} from './chunk-scan-coordinator'
 import { computeEffectiveMaxInputTokens, loadStudioUserConfig } from './studio-settings'
 import { DEFAULT_STUDIO_MODEL_NAME, getEffectiveModel } from './studio-model-state'
 import {
@@ -75,6 +80,7 @@ import {
   type StudioScanJobPlan,
 } from './studio-window-planner'
 import { studioController } from './studio-automation'
+import { getStudioParallelManager } from './studio-parallel-manager'
 import { prepareStudioMovie360pAndDrive, ensureStudioShortReady } from './media'
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -269,7 +275,7 @@ class Scheduler {
     const scan = getScan(scanId)
     if (!scan) return { ok: false, error: 'Scan not found' }
     const studioCfg = await loadStudioUserConfig(scan.ownerUsername || 'admin')
-    const engine = scan.chunkScanEngine || studioCfg.chunkScanEngine || 'api'
+    const engine = scan.chunkScanEngine || studioCfg.chunkScanEngine || 'studio'
     scan.chunkScanEngine = engine
     const apiKeys = userApiKeys ?? []
     if (engine === 'api' && apiKeys.length === 0) {
@@ -381,9 +387,11 @@ class Scheduler {
 
     if (pendingChunks === 0 && !hasVerifyWork) return { ok: false, error: 'No pending chunks or unverified candidates to scan.' }
 
-    // Ensure verifierEnabled is ON so that normal candidate verification + rescan
-    // always runs automatically after chunk scanning completes (as well as on Resume).
-    if (scan.verifierEnabled === false) {
+    // For Studio engine, Normal Verifier is strictly OFF (chunk window result is final).
+    // Only legacy API engine auto-enables normal verifier.
+    if (engine === 'studio') {
+      scan.verifierEnabled = false
+    } else if (scan.verifierEnabled === false) {
       scan.verifierEnabled = true
       addLog(
         scan,
@@ -564,10 +572,14 @@ class Scheduler {
   }
 
   stop(scanId: string): { ok: boolean; error?: string } {
-    globalChunkScanCoordinator.releaseChunkScanLock(scanId, true)
-    globalChunkScanCoordinator.removeFromQueue(scanId)
+    skipScanTicket(scanId, 'Scan stopped by user')
     globalOrchestrator.stop()
     studioController.requestStop({ scanId })
+    try {
+      getStudioParallelManager(scanId).stopAll()
+    } catch {
+      /* ignore */
+    }
     const job = this.jobs.get(scanId)
     if (!job) return { ok: false, error: 'Scan is not running' }
     job.stopping = true
@@ -1320,8 +1332,12 @@ class Scheduler {
     const segments = scan.shortSegments || []
     const multi = segments.length > 1
 
-    // 1. Wait until all chunks of this scan are cut before starting chunk scan!
-    if (scan.chunkingProgress !== undefined && (scan.chunkingProgress < 100 || scan.status === 'chunking')) {
+    // 1. Wait until all chunks of this scan are cut before starting chunk scan (for API engine; Studio engine uses movie.mp4 directly)!
+    if (
+      scan.chunkScanEngine !== 'studio' &&
+      scan.chunkingProgress !== undefined &&
+      (scan.chunkingProgress < 100 || scan.status === 'chunking')
+    ) {
       addLog(scan, 'info', `Waiting for movie chunking to finish (100%) before chunk scan... (currently ${scan.chunkingProgress}%)`)
       while (!job.stopping) {
         const fresh = getScan(scan.id)
@@ -1435,7 +1451,7 @@ class Scheduler {
         if (!job.stopping) scan.status = 'scanning'
         const owner = scan.ownerUsername || 'admin'
         const studioCfg = await loadStudioUserConfig(owner)
-        const engine = scan.chunkScanEngine || studioCfg.chunkScanEngine || 'api'
+        const engine = scan.chunkScanEngine || studioCfg.chunkScanEngine || 'studio'
         scan.chunkScanEngine = engine
 
         if (engine === 'studio') {
@@ -1508,18 +1524,46 @@ class Scheduler {
       }
 
       // =========================================================================
-      // ALL CHUNKS COMPLETE: Automatically run Normal Verifier followed by Rescan Phase
+      // ALL CHUNKS COMPLETE: Immediately release chunk scan lock so the next scan
+      // in the ticket queue starts right away (without waiting for verifier/rescan/export)!
       // =========================================================================
       job.seg = null
       job.chunkPhaseDone = true
+      scan.chunkWindowsDone = true
+      if (releaseChunkLock) {
+        releaseChunkLock()
+        releaseChunkLock = null
+      }
+      globalChunkScanCoordinator.releaseChunkScanLock(scan.id, true)
 
-      // Ensure normal verifier is enabled automatically after chunk scan (when API keys exist)
+      // Studio engine: Normal Verifier is strictly OFF (chunk window result is final).
+      if (scan.chunkScanEngine === 'studio') {
+        scan.verifierEnabled = false
+        scan.candidateGroups = []
+        for (const m of scan.matches || []) {
+          m.verified = true
+        }
+        for (const seg of segments) {
+          for (const m of seg.matches || []) {
+            m.verified = true
+          }
+        }
+        addLog(
+          scan,
+          'success',
+          `Studio chunk windows scan complete (${scan.matches.length} final match(es)) — Normal Verifier OFF (chunk result final).`,
+        )
+        this.mark(job)
+        break
+      }
+
+      // Legacy API engine: Ensure normal verifier is enabled automatically after chunk scan (when API keys exist)
       if (job.lanes.length === 0) {
         scan.verifierEnabled = false
         addLog(
           scan,
           'warn',
-          'No Gemini API keys configured for Verifier — keeping Studio candidates as unverified matches.',
+          'No Gemini API keys configured for Verifier — keeping candidates as unverified matches.',
         )
       } else if (scan.verifierEnabled === false) {
         scan.verifierEnabled = true
@@ -1624,25 +1668,34 @@ class Scheduler {
       }
     }
 
-    // Settle any superseded groups and synchronize scan.matches (confirmed groups applied last so they always win)
-    const groups = scan.candidateGroups || []
-    for (const g of groups) {
-      if (g.status === 'confirmed' || g.userPick) continue
-      const winner = this.confirmedCovering(scan, g)
-      if (winner) {
-        this.supersedeGroup(job, g, winner)
+    if (scan.chunkScanEngine !== 'studio') {
+      // Settle any superseded groups and synchronize scan.matches (confirmed groups applied last so they always win)
+      const groups = scan.candidateGroups || []
+      for (const g of groups) {
+        if (g.status === 'confirmed' || g.userPick) continue
+        const winner = this.confirmedCovering(scan, g)
+        if (winner) {
+          this.supersedeGroup(job, g, winner)
+        }
+      }
+      const nonConfirmed = groups.filter((g) => g.status !== 'confirmed' && !g.userPick)
+      const confirmed = groups.filter((g) => g.status === 'confirmed' || Boolean(g.userPick))
+      for (const g of [...nonConfirmed, ...confirmed]) {
+        applyGroupMatches(scan, g)
       }
     }
-    const nonConfirmed = groups.filter((g) => g.status !== 'confirmed' && !g.userPick)
-    const confirmed = groups.filter((g) => g.status === 'confirmed' || Boolean(g.userPick))
-    for (const g of [...nonConfirmed, ...confirmed]) {
-      applyGroupMatches(scan, g)
-    }
+    const groups = scan.candidateGroups || []
 
-    const leftover = groups.filter((g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning')
-    const chunksLeft = segments
-      .filter((s) => s.selected !== false)
-      .some((s) => s.chunks.some((c) => c.status === 'pending' || c.status === 'scanning'))
+    const leftover =
+      scan.chunkScanEngine === 'studio'
+        ? []
+        : groups.filter((g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning')
+    const chunksLeft =
+      scan.chunkScanEngine === 'studio'
+        ? false
+        : segments
+            .filter((s) => s.selected !== false)
+            .some((s) => s.chunks.some((c) => c.status === 'pending' || c.status === 'scanning'))
 
     // Quota ran out mid-scan/mid-verification: keep the scan resumable instead of finishing.
     if (leftover.length > 0 || chunksLeft) {
@@ -1697,6 +1750,130 @@ class Scheduler {
     const { scan } = job
     const owner = scan.ownerUsername || 'admin'
     const studioCfg = await loadStudioUserConfig(owner)
+    const mediaDir = scanMediaDir(scan.id)
+    const rawMoviePath = path.join(mediaDir, 'movie.mp4')
+    const movie360Path = path.join(mediaDir, 'movie_360p.mp4')
+    const shortMp4Path = path.join(mediaDir, 'short.mp4')
+
+    // Automatic Studio Parallel Windows pipeline when media exists on disk
+    if (fs.existsSync(shortMp4Path) && (fs.existsSync(rawMoviePath) || fs.existsSync(movie360Path))) {
+      // Derive minute input from studioMinuteInput, geminiPrescan.appliedMinutes, or selected segments
+      let minuteInput = (scan.studioMinuteInput || '').trim()
+      if (!minuteInput && Array.isArray(scan.geminiPrescan?.appliedMinutes) && scan.geminiPrescan!.appliedMinutes!.length > 0) {
+        const sorted = Array.from(new Set(scan.geminiPrescan!.appliedMinutes!)).sort((a, b) => a - b)
+        const parts: string[] = []
+        let rStart = sorted[0]
+        let rPrev = sorted[0]
+        for (let i = 1; i < sorted.length; i++) {
+          if (sorted[i] === rPrev + 1) {
+            rPrev = sorted[i]
+          } else {
+            parts.push(rStart === rPrev ? `${rStart}` : `${rStart}-${rPrev}`)
+            rStart = sorted[i]
+            rPrev = sorted[i]
+          }
+        }
+        parts.push(rStart === rPrev ? `${rStart}` : `${rStart}-${rPrev}`)
+        minuteInput = parts.join(', ')
+      }
+      if (!minuteInput) {
+        const minsSet = new Set<number>()
+        for (const seg of targetSegments) {
+          if (Array.isArray(seg.movieMinutes) && seg.movieMinutes.length > 0) {
+            for (const m of seg.movieMinutes) minsSet.add(m)
+          } else {
+            for (const c of seg.chunks) {
+              if (c.status === 'pending' || c.status === 'scanning') {
+                minsSet.add(c.index + 1)
+              }
+            }
+          }
+        }
+        if (minsSet.size > 0) {
+          const sorted = Array.from(minsSet).sort((a, b) => a - b)
+          const parts: string[] = []
+          let rStart = sorted[0]
+          let rPrev = sorted[0]
+          for (let i = 1; i < sorted.length; i++) {
+            if (sorted[i] === rPrev + 1) {
+              rPrev = sorted[i]
+            } else {
+              parts.push(rStart === rPrev ? `${rStart}` : `${rStart}-${rPrev}`)
+              rStart = sorted[i]
+              rPrev = sorted[i]
+            }
+          }
+          parts.push(rStart === rPrev ? `${rStart}` : `${rStart}-${rPrev}`)
+          minuteInput = parts.join(', ')
+        } else if (scan.movieDuration && scan.movieDuration > 0) {
+          minuteInput = `1-${Math.max(1, Math.ceil(scan.movieDuration / 60))}`
+        }
+      }
+
+      if (minuteInput) {
+        const parallelMgr = getStudioParallelManager(scan.id)
+        await parallelMgr.startParallelScan({
+          username: owner,
+          scanId: scan.id,
+          minuteInput,
+          minuteInputSource: scan.studioMinuteInputSource || 'auto',
+          concurrency: scan.studioParallelConcurrency ?? undefined,
+          shortDurationSec: scan.shortDuration || 150,
+          movieDurationSec: (scan.movieTrimEnd ?? scan.movieDuration) || undefined,
+          resumeExisting: job.resume,
+          onLog: (lvl, msg) => {
+            addLog(scan, lvl, msg)
+            this.mark(job)
+          },
+          onWindowMatches: async (_winState, matches) => {
+            for (const m of matches) {
+              const absIdx = deriveChunkIndexForMovieTime(scan, m.movieStart)
+              const withChunk: ChunkMatch = { ...m, chunkIndex: absIdx, verified: true }
+              const isDupGlobal = scan.matches.some(
+                (ex) =>
+                  Math.abs(ex.shortStart - withChunk.shortStart) < 1.2 &&
+                  Math.abs(ex.movieStart - withChunk.movieStart) < 2.0,
+              )
+              if (!isDupGlobal) {
+                scan.matches.push(withChunk)
+              }
+              for (const seg of scan.shortSegments || []) {
+                const clipped = clipMatchToShortSegment(withChunk, seg.start, seg.end, scan)
+                if (!clipped) continue
+                seg.matches = seg.matches || []
+                const isDupSeg = seg.matches.some(
+                  (ex: ChunkMatch) =>
+                    Math.abs(ex.shortStart - clipped.shortStart) < 1.2 &&
+                    Math.abs(ex.movieStart - clipped.movieStart) < 2.0,
+                )
+                if (!isDupSeg) {
+                  seg.matches.push({ ...clipped, verified: true })
+                }
+              }
+            }
+            this.mark(job)
+          },
+        })
+        await parallelMgr.waitForCompletion()
+
+        // Sync finalized scan state from store (written by parallelMgr.finalizeScanRecordOnCompletion)
+        const finalized = getScan(scan.id)
+        if (finalized) {
+          scan.matches = finalized.matches
+          scan.shortSegments = finalized.shortSegments
+          scan.chunks = finalized.chunks
+          scan.candidateGroups = []
+          scan.verifierEnabled = false
+          scan.chunkWindowsDone = true
+          scan.pipelineStage = finalized.pipelineStage
+          scan.waitingForTicket = null
+          scan.waitingForScanTitle = null
+          if (finalized.report) scan.report = finalized.report
+        }
+        return
+      }
+    }
+
     const effectiveMaxInputTokens = computeEffectiveMaxInputTokens(
       studioCfg.studioMaxOutputTokens,
       studioCfg.studioMaxInputTokens,
@@ -1718,8 +1895,6 @@ class Scheduler {
       if (job.stopping || studioController.isStopping(stopScope)) return
 
       // 1. Ensure movie_360p.mp4 is compressed locally
-      const mediaDir = scanMediaDir(scan.id)
-      const movie360Path = path.join(mediaDir, 'movie_360p.mp4')
       if (
         !scan.movie360p ||
         scan.movie360p.status !== 'ready' ||
@@ -1734,11 +1909,8 @@ class Scheduler {
         }
       }
 
-      // 2. Ensure short video source (YouTube URL if present, else local file <= 390 MB)
-      let shortReady: { localPath: string } | null = null
-      if (!scan.shortYoutubeUrl) {
-        shortReady = await ensureStudioShortReady(scan.id, owner)
-      }
+      // 2. Ensure short video source (local file <= 390 MB)
+      const shortReady = await ensureStudioShortReady(scan.id, owner)
 
       // 3. Build window plan: group short segments into <=3m parts, union approved movieMinutes into <=5m blocks
       const plannedJobs: StudioScanJobPlan[] = buildStudioScanPlan(scan, targetSegments, {
@@ -1807,7 +1979,6 @@ class Scheduler {
             maxOutputTokens: studioCfg.studioMaxOutputTokens,
             maxInputTokens: studioCfg.studioMaxInputTokens,
             pageRecycleInterval: studioCfg.studioPageRecycleInterval,
-            shortYoutubeUrl: scan.shortYoutubeUrl,
             shortLocalPath: shortReady?.localPath || path.join(mediaDir, 'short.mp4'),
             shortStartSec: shortPart.startSec,
             shortEndSec: shortPart.endSec,
@@ -3912,9 +4083,24 @@ class Scheduler {
       void cleanupOrphanedGeminiFiles(lane.apiKey, 24 * 60 * 60_000)
     }
     if (job.saverTimer) clearInterval(job.saverTimer)
+    if (
+      job.scan.status === 'done' ||
+      job.scan.status === 'stopped' ||
+      job.scan.status === 'error'
+    ) {
+      job.scan.pipelineStage =
+        job.scan.status === 'done'
+          ? 'done'
+          : job.scan.status === 'stopped'
+            ? 'stopped'
+            : 'error'
+      job.scan.waitingForTicket = null
+      job.scan.waitingForScanTitle = null
+      releaseScanKeyPair(job.scan.id)
+    }
     saveScan(job.scan)
     this.jobs.delete(job.scan.id)
-    globalChunkScanCoordinator.releaseChunkScanLock(job.scan.id)
+    globalChunkScanCoordinator.releaseChunkScanLock(job.scan.id, true)
   }
 
   /** Merge a chunk's parsed matches into the scan-level list. Replaces ONLY this

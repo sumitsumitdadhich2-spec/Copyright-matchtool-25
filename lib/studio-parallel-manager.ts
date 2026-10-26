@@ -3,7 +3,7 @@ import os from 'os'
 import path from 'path'
 import { execFileSync } from 'child_process'
 import { DATA_DIR, MEDIA_DIR } from './paths'
-import { getScan, saveScan } from './store'
+import { addLog, getScan, saveScan } from './store'
 import {
   StudioBrowserController,
   globalStudioUploadGate,
@@ -28,6 +28,8 @@ import {
 } from './studio-window-clips'
 import {
   buildParallelWindowsFromMinuteInput,
+  clipMatchToShortSegment,
+  deriveChunkIndexForMovieTime,
   mergeParallelWindowResults,
   splitParallelWindowInHalf,
   type ParallelMergedReport,
@@ -43,6 +45,14 @@ import {
   DEFAULT_STUDIO_MODEL_NAME,
   getEffectiveModel,
 } from './studio-model-state'
+import {
+  ensureScanChunkTicket,
+  globalChunkScanCoordinator,
+  registerParallelWindowCompletionChecker,
+  releaseScanKeyPair,
+  skipScanTicket,
+} from './chunk-scan-coordinator'
+import { computeShortCoverage } from './short-coverage'
 import type { ChunkMatch, Scan } from './types'
 
 export type ParallelWindowStatus =
@@ -2204,6 +2214,9 @@ export class StudioParallelManager {
       this.active = false
       this.stopResourceSnapshotTimer()
       const msg = err instanceof Error ? err.message : String(err)
+      if (this.scanId && this.scanId !== 'default') {
+        skipScanTicket(this.scanId, `Parallel Scan start failed: ${msg}`)
+      }
       this.appendCombinedLog({
         workerId: 'SYS',
         level: 'ERROR',
@@ -2281,57 +2294,363 @@ export class StudioParallelManager {
     }
   }
 
-  private async runWorkerPoolLoop(): Promise<void> {
-    const workerCount = this.concurrency
-    const workerPromises: Promise<void>[] = []
+  /**
+   * Finalize the Scan record in store as soon as all Studio parallel windows settle:
+   * - Normal Verifier is OFF (`scan.verifierEnabled = false`)
+   * - Window scan stitched matches become final `scan.matches` (`verified: true`)
+   * - `scan.status = 'done'`, `scan.report` built immediately (`partial: undefined`)
+   * - API key-pair slot is freed (`releaseScanKeyPair`)
+   */
+  private finalizeScanRecordOnCompletion() {
+    if (!this.scanId || this.scanId === 'default') return
+    try {
+      const scan = getScan(this.scanId)
+      if (!scan) return
 
-    for (let laneIdx = 1; laneIdx <= workerCount; laneIdx++) {
-      workerPromises.push(this.runSingleWorkerLane(laneIdx))
-    }
+      const mergedReport = this.getMergedReport()
+      const finalMatches: ChunkMatch[] = []
+      const defaultModel =
+        this.windows.find((w) => w.modelName)?.modelName || DEFAULT_STUDIO_MODEL_NAME
 
-    await Promise.allSettled(workerPromises)
-    this.stopResourceSnapshotTimer()
-    await globalProfileSlotPool.closeAndReleaseAllSlotsForScan(this.scanId)
-    // If no other scan is actively leasing slots, ensure all w01..w20 profiles have 0 leftover Chrome processes
-    if (globalProfileSlotPool.getSummary(this.maxTotalPoolSlots).inUseSlots === 0) {
-      const info = inspectChromeProcesses()
-      if (info.totalCount > 0) {
-        const cleanupPromises: Promise<unknown>[] = []
-        for (const wKey of Object.keys(info.perWorkerCount ?? {})) {
-          if ((info.perWorkerCount?.[wKey] || 0) > 0) {
-            const num = wKey.replace(/^W/i, '').padStart(2, '0')
-            cleanupPromises.push(
-              killWorkerChromeProcessesByProfileDir(`${BASE_PROFILE_NAME}-w${num}`),
-            )
+      if (mergedReport && mergedReport.segments.length > 0) {
+        for (const seg of mergedReport.segments) {
+          if (
+            (seg.status === 'FOUND' || seg.status === 'CONFLICT') &&
+            seg.primaryMovieStartSec !== null &&
+            seg.primaryMovieEndSec !== null &&
+            seg.primaryMovieEndSec > seg.primaryMovieStartSec
+          ) {
+            const cIdx = deriveChunkIndexForMovieTime(scan, seg.primaryMovieStartSec)
+            finalMatches.push({
+              chunkIndex: cIdx,
+              shortStart: Number(seg.shortStartSec.toFixed(3)),
+              shortEnd: Number(seg.shortEndSec.toFixed(3)),
+              movieStart: Number(seg.primaryMovieStartSec.toFixed(3)),
+              movieEnd: Number(seg.primaryMovieEndSec.toFixed(3)),
+              description: seg.description || 'Matched scene',
+              model: defaultModel,
+              verified: true,
+              origin: 'chunk',
+            })
           }
         }
-        await Promise.allSettled(cleanupPromises)
+      }
+
+      // Also include any direct window matches not already represented in finalMatches
+      for (const w of this.windows) {
+        if (w.status !== 'DONE' || !Array.isArray(w.matches)) continue
+        for (const m of w.matches) {
+          const cIdx = deriveChunkIndexForMovieTime(scan, m.movieStart)
+          const isDup = finalMatches.some(
+            (ex) =>
+              Math.abs(ex.shortStart - m.shortStart) < 1.2 &&
+              Math.abs(ex.movieStart - m.movieStart) < 2.0,
+          )
+          if (!isDup) {
+            finalMatches.push({
+              ...m,
+              chunkIndex: cIdx,
+              model: m.model || w.modelName || defaultModel,
+              verified: true,
+              origin: m.origin || 'chunk',
+            })
+          }
+        }
+      }
+
+      finalMatches.sort((a, b) => a.shortStart - b.shortStart || a.movieStart - b.movieStart)
+      scan.matches = finalMatches
+      scan.verifierEnabled = false
+      scan.candidateGroups = []
+
+      // Update per-minute shortSegments & chunks so ChunkResultsPanel, ReportPanel, ComparePanel, and RenderPanel are 100% ready
+      const trimStart = scan.movieTrimStart ?? 0
+      const maxChunk = Math.max(0, (scan.chunkCount || 1) - 1)
+      if (!Array.isArray(scan.shortSegments) || scan.shortSegments.length === 0) {
+        const shortDur = scan.shortDuration || this.shortDurationSec || 60
+        const segCount = Math.max(1, Math.ceil(shortDur / 60))
+        scan.shortSegments = Array.from({ length: segCount }, (_, i) => ({
+          index: i,
+          start: i * 60,
+          end: Math.min((i + 1) * 60, shortDur),
+          status: 'done' as const,
+          chunks: Array.from({ length: scan.chunkCount || 1 }, (__, ci) => ({
+            index: ci,
+            status: 'cancelled' as const,
+            attempts: 0,
+          })),
+        }))
+      }
+
+      for (const seg of scan.shortSegments) {
+        if (!Array.isArray(seg.chunks) || seg.chunks.length < (scan.chunkCount || 0)) {
+          seg.chunks = Array.from({ length: scan.chunkCount || 0 }, (_, ci) => ({
+            index: ci,
+            status: 'cancelled' as const,
+            attempts: 0,
+          }))
+        }
+        seg.matches = []
+        for (const m of finalMatches) {
+          const clipped = clipMatchToShortSegment(m, seg.start, seg.end, scan)
+          if (clipped) {
+            seg.matches.push({ ...clipped, verified: true })
+          }
+        }
+        for (const c of seg.chunks) {
+          if (c.status === 'pending' || c.status === 'scanning') {
+            c.status = 'cancelled'
+          }
+        }
+      }
+
+      // Map each window's status and raw output onto covered 60s chunks
+      for (const w of this.windows) {
+        const cStart = Math.max(0, Math.floor((w.startSec - trimStart) / 60))
+        const cEnd = Math.min(maxChunk, Math.floor(Math.max(0, w.endSec - 0.001 - trimStart) / 60))
+        for (const seg of scan.shortSegments) {
+          if (seg.selected === false) continue
+          for (let ci = cStart; ci <= cEnd; ci++) {
+            const ch = seg.chunks[ci]
+            if (!ch) continue
+            const segMatchesForChunk = (seg.matches || []).filter((m) => m.chunkIndex === ci)
+            ch.matches = segMatchesForChunk
+            ch.model = w.modelName || defaultModel
+            ch.attempts = Math.max(1, w.attempt || 1)
+            if (w.status === 'DONE') {
+              ch.status = segMatchesForChunk.length > 0 ? 'match' : 'no_match'
+              if (w.rawResponseText) {
+                ch.rawOutputs = [
+                  {
+                    model: w.modelName || defaultModel,
+                    t: w.finishedAt || Date.now(),
+                    text: w.rawResponseText.slice(0, 20_000),
+                    status: 'success',
+                  },
+                ]
+              }
+            } else if (w.status === 'PROHIBITED') {
+              ch.status = 'policy_blocked'
+              ch.error = w.error || 'PROHIBITED CONTENT (skipped, no retry)'
+            } else if (w.status === 'FAILED') {
+              ch.status = 'failed'
+              ch.error = w.error || 'Window failed'
+            }
+          }
+        }
+      }
+
+      for (const seg of scan.shortSegments) {
+        seg.status = this.stoppingAll ? 'pending' : 'done'
+      }
+      if (scan.shortSegments.length > 0) {
+        const curSeg =
+          scan.shortSegments[scan.currentShortSegment ?? 0] || scan.shortSegments[0]
+        if (curSeg) scan.chunks = curSeg.chunks
+      }
+
+      const now = Date.now()
+      const doneWins = this.windows.filter((w) => w.status === 'DONE').length
+      const failedWins = this.windows.filter((w) => w.status === 'FAILED').length
+      const modelsUsed = Array.from(
+        new Set(this.windows.map((w) => w.modelName).filter(Boolean)),
+      )
+      if (modelsUsed.length === 0) modelsUsed.push( DEFAULT_STUDIO_MODEL_NAME )
+
+      if (this.stoppingAll) {
+        scan.status = 'stopped'
+        scan.pipelineStage = 'stopped'
+        scan.waitingForTicket = null
+        scan.waitingForScanTitle = null
+      } else {
+        scan.chunkWindowsDone = true
+        scan.status = 'done'
+        scan.pipelineStage = 'done'
+        scan.waitingForTicket = null
+        scan.waitingForScanTitle = null
+        scan.finishedAt = now
+      }
+
+      scan.report = {
+        totalScanTimeMs: Math.max(0, (scan.finishedAt || now) - (scan.startedAt || this.startedAt || now)),
+        chunksScanned: doneWins,
+        chunksFailed: failedWins,
+        chunksPending: 0,
+        partial: this.stoppingAll ? true : undefined,
+        modelsUsed,
+        matches: scan.matches,
+        groupsTotal: 0,
+        groupsConfirmed: scan.matches.length,
+        groupsRejected: 0,
+        groupsUnverified: 0,
+        groupsPending: 0,
+        matchesRejectedKept: 0,
+        originCounts: { chunk: scan.matches.length },
+        coverage: computeShortCoverage(scan),
+        prefilterMode: scan.geminiPrescan?.appliedMinutes?.length ? 'gemini' : 'full',
+      }
+
+      addLog(
+        scan,
+        this.stoppingAll ? 'warn' : 'success',
+        this.stoppingAll
+          ? `Studio parallel chunk scan stopped (${doneWins}/${this.windows.length} windows done, ${scan.matches.length} matches ready).`
+          : `Studio parallel chunk scan complete (${doneWins}/${this.windows.length} windows done): ${scan.matches.length} final match(es) — Normal Verifier OFF (chunk result final). Report & Export ready!`,
+      )
+      releaseScanKeyPair(this.scanId)
+      saveScan(scan, { immediate: true })
+    } catch (err) {
+      console.error('[StudioParallelManager] finalizeScanRecordOnCompletion error:', err)
+    }
+  }
+
+  private async runWorkerPoolLoop(): Promise<void> {
+    let releaseChunkLock: (() => void) | null = null
+    try {
+      // 1. Acquire strict ticket lock in globalChunkScanCoordinator before launching any Chrome worker
+      if (this.scanId && this.scanId !== 'default') {
+        let loggedTicketWait = false
+        releaseChunkLock = await globalChunkScanCoordinator.acquireChunkScanLock({
+          scanId: this.scanId,
+          scanTitle: this.scanName || this.scanId,
+          onWait: (msg, pos, ticket) => {
+            this.waitingForWorkerSlots = true
+            for (const w of this.windows) {
+              if (w.status === 'QUEUED') {
+                w.stage = msg
+                w.summaryText = `Waiting in Chunk Queue #${pos} (Ticket #${ticket})`
+              }
+            }
+            if (!loggedTicketWait) {
+              loggedTicketWait = true
+              this.appendCombinedLog({
+                workerId: 'SYS',
+                level: 'INFO',
+                step: 'ticket queue wait',
+                message: msg,
+              })
+              this.onLogCallback?.('info', msg)
+            }
+            this.persistStateToDisk()
+          },
+          isStopping: () => this.stoppingAll,
+        })
+      }
+
+      if (this.stoppingAll) return
+
+      // 2. Ensure previous scan's Chrome slots in globalProfileSlotPool are 100% released before launching workers
+      while (!this.stoppingAll) {
+        const poolSnap = globalProfileSlotPool.getSummary(this.maxTotalPoolSlots)
+        const otherScanUsingSlots = poolSnap.byScan.some(
+          (entry) => entry.scanId !== this.scanId && entry.count > 0,
+        )
+        if (!otherScanUsingSlots) break
+        this.waitingForWorkerSlots = true
+        await new Promise((r) => setTimeout(r, 250))
+      }
+
+      if (this.stoppingAll) return
+      this.waitingForWorkerSlots = false
+
+      if (this.scanId && this.scanId !== 'default') {
+        const s = getScan(this.scanId)
+        if (s) {
+          s.status = 'scanning'
+          s.pipelineStage = 'chunk_scanning'
+          s.waitingForTicket = null
+          s.waitingForScanTitle = null
+          if (!s.startedAt) s.startedAt = Date.now()
+          saveScan(s)
+        }
+      }
+
+      const workerCount = this.concurrency
+      const workerPromises: Promise<void>[] = []
+
+      for (let laneIdx = 1; laneIdx <= workerCount; laneIdx++) {
+        workerPromises.push(this.runSingleWorkerLane(laneIdx))
+      }
+
+      await Promise.allSettled(workerPromises)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (!this.stoppingAll && !/stopped/i.test(msg)) {
+        this.appendCombinedLog({
+          workerId: 'SYS',
+          level: 'ERROR',
+          step: 'worker pool error',
+          message: `Parallel worker pool error: ${msg}`,
+        })
+      }
+    } finally {
+      this.stopResourceSnapshotTimer()
+      // CRITICAL: Release all Chrome windows/slots in globalProfileSlotPool FIRST before releasing the chunk lock!
+      await globalProfileSlotPool.closeAndReleaseAllSlotsForScan(this.scanId)
+      if (globalProfileSlotPool.getSummary(this.maxTotalPoolSlots).inUseSlots === 0) {
+        const info = inspectChromeProcesses()
+        if (info.totalCount > 0) {
+          const cleanupPromises: Promise<unknown>[] = []
+          for (const wKey of Object.keys(info.perWorkerCount ?? {})) {
+            if ((info.perWorkerCount?.[wKey] || 0) > 0) {
+              const num = wKey.replace(/^W/i, '').padStart(2, '0')
+              cleanupPromises.push(
+                killWorkerChromeProcessesByProfileDir(`${BASE_PROFILE_NAME}-w${num}`),
+              )
+            }
+          }
+          await Promise.allSettled(cleanupPromises)
+        }
+      }
+
+      this.active = false
+      this.starting = false
+      this.waitingForWorkerSlots = false
+      this.clipsExtracting = false
+      this.clipsReady = 0
+      this.clipsTotal = 0
+      this.finishedAt = Date.now()
+      if (this.currentRunId) {
+        const rEntry = this.runHistory.find((r) => r.runId === this.currentRunId)
+        if (rEntry) rEntry.finishedAt = this.finishedAt
+      }
+      this.recordResourceSnapshotIfNeeded(true, 'Parallel scan finished')
+      this.persistStateToDisk()
+
+      const doneCount = this.windows.filter((w) => w.status === 'DONE').length
+      const prohibitedCount = this.windows.filter((w) => w.status === 'PROHIBITED').length
+      const failedCount = this.windows.filter((w) => w.status === 'FAILED').length
+      const finalChromeStats = readChromeProcsPerWorker(this.concurrency)
+      this.appendCombinedLog({
+        workerId: 'SYS',
+        level: failedCount > 0 ? 'ERROR' : 'SUCCESS',
+        step: 'parallel scan finished',
+        message: `Parallel Window Scan finished for ${this.scanName} (runId=${this.currentRunId || 'n/a'}): ${doneCount}/${this.windows.length} DONE, ${prohibitedCount} PROHIBITED, ${failedCount} FAILED, chromeProcs=${finalChromeStats.totalProcs}`,
+      })
+
+      // Finalize scan record (status='done', report built, verifier OFF, key pair released)
+      this.finalizeScanRecordOnCompletion()
+
+      // Immediately release chunk scan lock so the next ticket in queue starts with zero delay!
+      if (releaseChunkLock) {
+        try {
+          releaseChunkLock()
+        } catch {
+          /* ignore */
+        }
+      }
+      if (this.scanId && this.scanId !== 'default') {
+        if (this.stoppingAll) {
+          skipScanTicket(this.scanId, 'Parallel scan stopped by user')
+        } else {
+          globalChunkScanCoordinator.releaseChunkScanLock(
+            this.scanId,
+            true,
+            `All ${this.windows.length} Studio parallel windows completed`,
+          )
+        }
       }
     }
-    this.active = false
-    this.starting = false
-    this.waitingForWorkerSlots = false
-    this.clipsExtracting = false
-    this.clipsReady = 0
-    this.clipsTotal = 0
-    this.finishedAt = Date.now()
-    if (this.currentRunId) {
-      const rEntry = this.runHistory.find((r) => r.runId === this.currentRunId)
-      if (rEntry) rEntry.finishedAt = this.finishedAt
-    }
-    this.recordResourceSnapshotIfNeeded(true, 'Parallel scan finished')
-    this.persistStateToDisk()
-
-    const doneCount = this.windows.filter((w) => w.status === 'DONE').length
-    const prohibitedCount = this.windows.filter((w) => w.status === 'PROHIBITED').length
-    const failedCount = this.windows.filter((w) => w.status === 'FAILED').length
-    const finalChromeStats = readChromeProcsPerWorker(this.concurrency)
-    this.appendCombinedLog({
-      workerId: 'SYS',
-      level: failedCount > 0 ? 'ERROR' : 'SUCCESS',
-      step: 'parallel scan finished',
-      message: `Parallel Window Scan finished for ${this.scanName} (runId=${this.currentRunId || 'n/a'}): ${doneCount}/${this.windows.length} DONE, ${prohibitedCount} PROHIBITED, ${failedCount} FAILED, chromeProcs=${finalChromeStats.totalProcs}`,
-    })
   }
 
   private async runSingleWorkerLane(laneIndex: number): Promise<void> {
@@ -3003,6 +3322,9 @@ export class StudioParallelManager {
       if (rEntry) rEntry.finishedAt = this.finishedAt
     }
     this.persistStateToDisk()
+    if (this.scanId && this.scanId !== 'default') {
+      skipScanTicket(this.scanId, 'Stopped all parallel windows')
+    }
 
     this.appendCombinedLog({
       workerId: 'SYS',
@@ -3548,5 +3870,30 @@ export function stopAndDeleteStudioParallelManager(scanId: string): void {
     /* ignore */
   }
 }
+
+registerParallelWindowCompletionChecker((scanId: string) => {
+  const map = getManagersMap()
+  const mgr = map.get(scanId)
+  if (!mgr) return null
+  const snapWins = (mgr as unknown as { windows: ParallelWindowState[]; active: boolean; starting: boolean }).windows
+  const isActive = (mgr as unknown as { active: boolean }).active
+  const isStarting = (mgr as unknown as { starting: boolean }).starting
+  if (!Array.isArray(snapWins) || snapWins.length === 0) {
+    return isActive || isStarting ? { done: false } : null
+  }
+  const allTerminal = snapWins.every(
+    (w) =>
+      w.status === 'DONE' ||
+      w.status === 'FAILED' ||
+      w.status === 'PROHIBITED' ||
+      w.status === 'SKIPPED' ||
+      w.status === 'STOPPED',
+  )
+  return {
+    done: allTerminal,
+    reason: allTerminal ? 'All parallel windows reached terminal state' : undefined,
+  }
+})
+
 
 export const studioParallelManager = getStudioParallelManager('default')

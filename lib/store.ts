@@ -433,6 +433,7 @@ export function newScan(ownerUsername?: string): Scan {
     id,
     createdAt: Date.now(),
     ownerUsername,
+    chunkScanEngine: 'studio',
     status: 'created',
     shortName: null,
     movieName: null,
@@ -451,8 +452,9 @@ export function newScan(ownerUsername?: string): Scan {
     error: null,
     report: null,
     modelStates: {},
-    verifierEnabled: true,
+    verifierEnabled: false,
     autoMode: true,
+    pipelineStage: 'upload',
   }
   saveScan(scan)
   return scan
@@ -555,6 +557,14 @@ export function listScans(): ScanSummary[] {
       movieDuration: s.movieDuration,
       matchCount: (s.matches || []).length,
       finishedAt: s.finishedAt,
+      chunkTicket: s.chunkTicket,
+      keySlot: s.keySlot,
+      keyPair: s.keyPair,
+      pipelineStage: s.pipelineStage,
+      waitingForTicket: s.waitingForTicket ?? s.chunkQueue?.ticket ?? null,
+      waitingForScanTitle: s.waitingForScanTitle ?? s.chunkQueue?.activeScanTitle ?? null,
+      geminiPrescanStatus: s.geminiPrescan?.status ?? null,
+      chunkScanEngine: s.chunkScanEngine,
     })
   }
   return out.sort((a, b) => b.createdAt - a.createdAt)

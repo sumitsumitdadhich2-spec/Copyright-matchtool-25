@@ -32,7 +32,12 @@ import { applyApprovedMinutes } from './minute-ranges'
 import { mergeRanges, missingRanges as sharedMissingRanges } from './short-coverage'
 import { scheduler } from './scheduler'
 import { globalGeminiCoordinator } from './global-gemini-coordinator'
-import { globalChunkScanCoordinator } from './chunk-scan-coordinator'
+import {
+  globalChunkScanCoordinator,
+  ensureScanTicketAndKeyPair,
+  selectScanKeyPairWithFallback,
+  skipScanTicket,
+} from './chunk-scan-coordinator'
 import { deductTokens, refundTokens, SCAN_TOKEN_COST } from './tokens'
 import type {
   Scan,
@@ -171,6 +176,19 @@ function persist(id: string, ctrl: Ctrl, patch?: Partial<GeminiPrescanState>) {
   const s = getScan(id)
   if (!s) return
   s.geminiPrescan = ctrl.state
+  if (
+    ctrl.state.status === 'preparing' ||
+    ctrl.state.status === 'uploading' ||
+    ctrl.state.status === 'scanning'
+  ) {
+    s.pipelineStage = 'minute_finder'
+  } else if (ctrl.state.status === 'backup') {
+    s.pipelineStage = 'backup_finder'
+  } else if (ctrl.state.status === 'error') {
+    if (s.status !== 'done' && s.status !== 'scanning') {
+      s.pipelineStage = ctrl.state.error?.toLowerCase().includes('stopped') ? 'stopped' : 'error'
+    }
+  }
   saveScan(s)
 }
 
@@ -209,6 +227,8 @@ export function startGeminiMinuteFinder(
   if (userApiKeys.length === 0) {
     return { ok: false, error: 'Gemini API key nahi hai — Settings me apni key add karo.' }
   }
+
+  const alloc = ensureScanTicketAndKeyPair(scanId)
 
   const isNewDay = checkDailyReset()
   if (isNewDay) {
@@ -299,13 +319,14 @@ export function startGeminiMinuteFinder(
   log(
     scanId,
     'info',
-    `Gemini Minute Finder ${mode === 'start' ? 'start' : mode}: movie copy → upload (per key) → 20-min windows @ 10fps/1fps (${CHUNK_MODEL_POOL.map((m) => m.id).join(' + ')} × ${userApiKeys.length} key(s)) → backup pass for missing parts (high fps) → minute list → chunk scan`,
+    `Gemini Minute Finder ${mode === 'start' ? 'start' : mode} [Ticket #${alloc.ticket} · Slot ${alloc.keySlot} — Keys ${alloc.keyPair[0]} & ${alloc.keyPair[1]}]: movie copy → upload (per key) → 20-min windows @ 10fps/1fps (${CHUNK_MODEL_POOL.map((m) => m.id).join(' + ')}) → backup pass for missing parts (high fps) → minute list → chunk scan`,
   )
 
   void run(scanId, ctrl, userApiKeys, user)
     .catch((err) => {
       const msg = err instanceof Error ? err.message : String(err)
       persist(scanId, ctrl, { status: 'error', error: msg, finishedAt: Date.now(), progress: undefined })
+      skipScanTicket(scanId, `Minute finder error: ${msg}`)
       log(scanId, 'error', `Minute finder error: ${msg} — manual Full scan (Start) available hai`)
     })
     .finally(() => {
@@ -315,8 +336,7 @@ export function startGeminiMinuteFinder(
 }
 
 export function stopGeminiMinuteFinder(scanId: string): { ok: boolean; error?: string } {
-  globalChunkScanCoordinator.releaseChunkScanLock(scanId, true)
-  globalChunkScanCoordinator.removeFromQueue(scanId)
+  skipScanTicket(scanId, 'Minute finder stopped by user')
   const ctrl = ctrls.get(scanId)
   if (!ctrl) return { ok: false, error: 'Minute finder is not running' }
   ctrl.stopping = true
@@ -332,8 +352,7 @@ export function stopGeminiMinuteFinder(scanId: string): { ok: boolean; error?: s
  * finder's own `scheduler.start` / state writes. Resolves `true` when idle.
  */
 export async function stopAndWaitMinuteFinder(scanId: string, reason: string, timeoutMs = 15_000): Promise<boolean> {
-  globalChunkScanCoordinator.releaseChunkScanLock(scanId, true)
-  globalChunkScanCoordinator.removeFromQueue(scanId)
+  skipScanTicket(scanId, `Minute finder stopped: ${reason}`)
   const ctrl = ctrls.get(scanId)
   if (!ctrl) return true
   if (!ctrl.stopping) {
@@ -510,45 +529,18 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
     }
   })
 
-  // PRIORITY DEDICATED KEYS (Key 1 & Key 2 Priority):
-  // Key 1 and Key 2 are strictly prioritized for Window Finder and Backup Pass.
-  // If Key 1 has remaining quota today, select Key 1.
-  // If Key 2 has remaining quota today, select Key 2.
-  // If either Key 1 or Key 2 has exhausted all its models, do NOT upload movie to it!
-  // Instead, dynamically pick the key from Key 3+ with the highest remaining quota today.
-  const targetCandidates: typeof allKeysWithQuota = []
-  const key1 = allKeysWithQuota.find((k) => k.keyIdx === 1)
-  const key2 = allKeysWithQuota.find((k) => k.keyIdx === 2)
-  const otherKeys = allKeysWithQuota.filter((k) => k.keyIdx > 2).sort((a, b) => b.totalRemaining - a.totalRemaining)
-
-  if (key1 && key1.totalRemaining > 0) {
-    targetCandidates.push(key1)
-  }
-  if (key2 && key2.totalRemaining > 0) {
-    targetCandidates.push(key2)
-  }
-
-  // If Key 1 or Key 2 has 0 quota left, fill up to 2 keys using the best remaining key(s)
-  for (const ok of otherKeys) {
-    if (targetCandidates.length >= 2) break
-    if (ok.totalRemaining > 0 && !targetCandidates.some((x) => x.keyId === ok.keyId)) {
-      targetCandidates.push(ok)
-    }
-  }
-
-  // Fallback if all keys are at 0 counter quota:
-  if (targetCandidates.length === 0) {
-    if (key1) targetCandidates.push(key1)
-    if (key2) targetCandidates.push(key2)
-  }
-
-  const pool = targetCandidates.slice(0, 2)
+  // PER-SCAN DEDICATED 2-KEY PAIR ALLOCATION (Slot N -> Keys [2N-1, 2N]):
+  // Scan #1 gets Slot 1 (Keys 1 & 2), Scan #2 gets Slot 2 (Keys 3 & 4), Scan #3 gets Slot 3 (Keys 5 & 6), etc.
+  // If a key in this scan's assigned pair is quota-exhausted (0 remaining), falls back to the highest-quota
+  // key that is NOT in another active scan's assigned keyPair.
+  const keySelection = selectScanKeyPairWithFallback(id, allKeysWithQuota)
+  const pool = keySelection.selected.slice(0, 2)
   log(
     id,
     'info',
-    `[Gemini Minute Finder] Dedicated keys: ${pool
+    `[Gemini Minute Finder] Slot ${keySelection.keySlot} — Keys ${keySelection.keyPair[0]} & ${keySelection.keyPair[1]} assigned (active keys: ${pool
       .map((k) => `Key ${k.keyIdx} (${k.totalRemaining} reqs quota remaining)`)
-      .join(', ')} — max 2 keys to eliminate redundant 12m processing`,
+      .join(', ')}) — max 2 keys per scan`,
   )
 
   persist(id, ctrl, { status: 'uploading', progress: `Uploading to Gemini (0/${pool.length} keys)...` })
@@ -1635,6 +1627,12 @@ async function waitForChunking(id: string, ctrl: Ctrl): Promise<void> {
     const segPct = s.shortSegmentingProgress ?? 100
     const chunkingDone = s.status !== 'chunking' && chunkPct >= 100 && s.chunkCount > 0
     const segmentingDone = segPct >= 100
+    const isStudio = s.chunkScanEngine !== 'api'
+
+    if (isStudio && segmentingDone && s.status !== 'chunking') {
+      log(id, 'success', `Short segments aur movie ready hain (Studio parallel window mode). Chunk windows scan start ho raha hai!`)
+      return
+    }
 
     if (chunkingDone && segmentingDone) {
       const chunksDir = path.join(scanMediaDir(id), 'chunks')

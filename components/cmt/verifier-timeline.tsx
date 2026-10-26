@@ -319,6 +319,25 @@ export function VerifierTimeline({ scan }: { scan: Scan }) {
     }
   }
 
+  if (scan.chunkScanEngine !== 'api') {
+    return (
+      <section aria-label="Verifier timeline" className="panel border-border/60 bg-card/50">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5">
+            <ShieldCheck className="size-4 text-zinc-400" aria-hidden />
+            <h2 className="text-sm font-semibold">Verifier</h2>
+          </div>
+          <span className="rounded-full border border-zinc-700 bg-zinc-800/90 px-2.5 py-0.5 font-mono text-[11px] font-semibold text-zinc-300">
+            OFF (chunk result final)
+          </span>
+        </div>
+        <p className="mt-1.5 text-xs text-muted-foreground">
+          Studio parallel chunk windows scan result is final — Normal Verifier & rescan are skipped so Report & Export panels are ready immediately.
+        </p>
+      </section>
+    )
+  }
+
   if (scan.chunkCount === 0 && (!scan.matches || scan.matches.length === 0)) {
     return (
       <section aria-label="Verifier timeline" className="panel">

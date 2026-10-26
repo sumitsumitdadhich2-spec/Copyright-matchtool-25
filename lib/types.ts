@@ -43,6 +43,7 @@ export interface ChunkMatch {
   batchModel?: string
   batchTimestamp?: number
   rescanRequired?: boolean
+  description?: string
 }
 
 export interface ChunkTokenUsage {
@@ -102,6 +103,8 @@ export interface ChunkState {
   /** cancelled by the EARLY-STOP system (all matches found + fast-confirmed) —
    *  not revived on Resume unless its minute's matches get rejected */
   skippedEarlyStop?: boolean
+  error?: string
+  lastError?: string
 }
 
 export type ShortSegmentStatus = 'pending' | 'scanning' | 'verifying' | 'done'
@@ -118,6 +121,7 @@ export interface ShortSegmentState {
   status: ShortSegmentStatus
   /** per-movie-chunk states for THIS short segment (source of truth) */
   chunks: ChunkState[]
+  matches?: ChunkMatch[]
   /** user minute selection: false = skipped by the scheduler (default true) */
   selected?: boolean
   /** PER-MINUTE movie search range (ABSOLUTE original-movie seconds).
@@ -966,6 +970,21 @@ export interface Scan {
     activeScanTitle?: string | null
     enqueuedAt: number
   }
+  /** Persistent ticket number (1, 2, 3...) for strict chunk windows scan ordering */
+  chunkTicket?: number
+  /** Allocated API key-pair slot number (1, 2, 3...) for minute finder + backup finder */
+  keySlot?: number
+  /** Allocated 1-based API key pair [2*slot - 1, 2*slot], e.g. [1, 2], [3, 4], [5, 6] */
+  keyPair?: [number, number]
+  /** True once this scan's key-pair slot has been freed after scan completion/stop/error */
+  keySlotReleased?: boolean
+  /** True once this scan's chunk windows have all reached terminal status */
+  chunkWindowsDone?: boolean
+  /** High-level pipeline stage for UI display */
+  pipelineStage?: 'upload' | 'minute_finder' | 'backup_finder' | 'waiting_chunk_ticket' | 'chunk_scanning' | 'done' | 'stopped' | 'error'
+  /** When waiting in the chunk windows ticket queue, which ticket/scan is currently ahead */
+  waitingForTicket?: number | null
+  waitingForScanTitle?: string | null
   /** GAP BACKUP PASS (post-verification): never-found short parts re-searched in every window */
   gapBackup?: GapBackupState
   /** MISSING SCENE SCANNER: user-triggered targeted search for selected missing short scenes */
@@ -995,4 +1014,13 @@ export interface ScanSummary {
   movieDuration: number | null
   matchCount: number
   finishedAt: number | null
+  chunkTicket?: number
+  keySlot?: number
+  keyPair?: [number, number]
+  pipelineStage?: Scan['pipelineStage']
+  waitingForTicket?: number | null
+  waitingForScanTitle?: string | null
+  geminiPrescanStatus?: GeminiPrescanStatus | null
+  chunkScanEngine?: ChunkScanEngine
 }
+

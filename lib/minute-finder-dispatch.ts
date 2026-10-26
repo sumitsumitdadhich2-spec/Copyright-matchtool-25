@@ -4,6 +4,7 @@ import { getScan, saveScan, addLog } from './store'
 import { getAllUserApiKeys, getUserTwelveLabsKey, getUserMinuteFinderMode } from './user-keys'
 import { startMergePipeline, pipelineReady, isPipelineRunning } from './merge-pipeline'
 import { startGeminiMinuteFinder, isMinuteFinderRunning, stopAndWaitMinuteFinder } from './gemini-minute-finder'
+import { ensureScanTicketAndKeyPair } from './chunk-scan-coordinator'
 import type { MinuteFinderMode } from './types'
 
 export interface DispatchUser {
@@ -26,6 +27,7 @@ export interface DispatchUser {
 export async function dispatchMinuteFinder(scanId: string, user: DispatchUser | null): Promise<MinuteFinderMode | null> {
   const scan = getScan(scanId)
   if (!scan || !pipelineReady(scan)) return null
+  ensureScanTicketAndKeyPair(scanId)
   if (!user) return null
 
   const mode = await getUserMinuteFinderMode(user.username)

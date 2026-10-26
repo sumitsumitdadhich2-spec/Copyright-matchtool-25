@@ -133,8 +133,8 @@ export const DEFAULT_STUDIO_UPLOAD_GATE = 2
 export const DEFAULT_STUDIO_MINUTE_INPUT =
   '7,8,9,10,14,15,16,17,19,20,21,25-41,48-54,56,57,58,63-67,71-100'
 
-const DEFAULT_STUDIO_CONFIG: StudioUserConfig = {
-  chunkScanEngine: 'api',
+export const DEFAULT_STUDIO_CONFIG: StudioUserConfig = {
+  chunkScanEngine: 'studio',
   studioModelName: DEFAULT_STUDIO_MODEL_NAME,
   studioThinkingLevel: DEFAULT_STUDIO_THINKING_LEVEL,
   studioMaxOutputTokens: 65536,
@@ -214,7 +214,7 @@ export async function loadStudioUserConfig(username: string): Promise<StudioUser
   return {
     ...DEFAULT_STUDIO_CONFIG,
     ...(raw || {}),
-    chunkScanEngine: raw?.chunkScanEngine === 'studio' ? 'studio' : 'api',
+    chunkScanEngine: raw?.chunkScanEngine === 'api' ? 'api' : 'studio',
     studioModelName: resolvedModelName,
     studioThinkingLevel,
     studioMaxOutputTokens,

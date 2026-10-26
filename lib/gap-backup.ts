@@ -253,19 +253,38 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
       ? GAP_FINDER_AVAILABLE_MODELS.filter((m) => selectedModels.includes(m.id))
       : CHUNK_MODEL_POOL.map((m) => GAP_FINDER_AVAILABLE_MODELS.find((g) => g.id === m.id) || { id: m.id, name: m.id, rpd: m.rpd, rpm: m.rpm, description: '' })
 
-    const allLanes: GapLane[] = apiKeys.flatMap((key, keyIndex) =>
-      chosenModels.map((model) => ({
-        key,
-        keyIndex,
-        model,
-        ai: getClient(key),
+    const allKeysWithQuota = apiKeys.map((key, idx) => {
+      const totalRemaining = chosenModels.reduce(
+        (sum, m) => sum + Math.max(0, m.rpd - getModelUsage(m.id, key)),
+        0,
+      )
+      return {
+        keyIdx: idx + 1,
+        apiKey: key,
         keyId: apiKeyHash(key),
+        totalRemaining,
+      }
+    })
+    const keySelection = selectScanKeyPairWithFallback(scan.id, allKeysWithQuota)
+    const selectedKeyEntries = keySelection.selected.slice(0, 2)
+
+    const allLanes: GapLane[] = selectedKeyEntries.flatMap((entry) =>
+      chosenModels.map((model) => ({
+        key: entry.apiKey,
+        keyIndex: entry.keyIdx - 1,
+        model,
+        ai: getClient(entry.apiKey),
+        keyId: entry.keyId,
         cooldownUntil: 0,
         dead: false,
       }))
     )
 
-    log(scan, 'info', `[Missing Scene Finder] Running with ${chosenModels.length} selected model(s): ${chosenModels.map((m) => m.name || m.id).join(', ')} across ${apiKeys.length} key(s)`)
+    log(
+      scan,
+      'info',
+      `[Missing Scene Finder] Slot ${keySelection.keySlot} — Keys ${keySelection.keyPair[0]} & ${keySelection.keyPair[1]} (active: ${selectedKeyEntries.map((k) => `Key ${k.keyIdx}`).join(', ')}) across ${chosenModels.length} model(s): ${chosenModels.map((m) => m.name || m.id).join(', ')}`,
+    )
 
     const pickLane = (): GapLane | null => {
       const now = Date.now()

@@ -4,7 +4,7 @@ import { useState } from 'react'
 import useSWR from 'swr'
 import { History, Plus, Trash2, Loader2, Pencil, Check, X } from 'lucide-react'
 import type { ScanSummary } from '@/lib/types'
-import { fetcher, fmtTime } from '@/lib/format'
+import { fetcher, fmtTime, deriveScanStageInfo, formatScanKeyPairBadge } from '@/lib/format'
 
 const STATUS_CLS: Record<string, string> = {
   done: 'bg-success/15 text-success',
@@ -206,6 +206,37 @@ export function HistoryPanel({ activeId, onSelect, onNew }: { activeId: string |
                       {s.background?.state === 'queued' ? `queued${s.background.position ? ` #${s.background.position}` : ''}` : s.background?.state === 'running' ? 'background' : s.status}
                     </span>
                   </div>
+                  {(() => {
+                    const stageInfo = deriveScanStageInfo(s)
+                    const keyBadge = formatScanKeyPairBadge(s)
+                    const stageColor =
+                      stageInfo.stage === 'done'
+                        ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                        : stageInfo.stage === 'chunk_waiting_ticket'
+                          ? 'border-amber-500/40 bg-amber-500/15 text-amber-300'
+                          : stageInfo.stage === 'chunk_scanning' || stageInfo.stage === 'minute_finder' || stageInfo.stage === 'backup_finder'
+                            ? 'border-cyan-500/40 bg-cyan-500/15 text-cyan-300'
+                            : stageInfo.stage === 'error'
+                              ? 'border-rose-500/40 bg-rose-500/15 text-rose-300'
+                              : 'border-border bg-muted/60 text-muted-foreground'
+                    return (
+                      <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[10px]">
+                        {s.chunkTicket != null && (
+                          <span className="rounded border border-primary/40 bg-primary/15 px-1.5 py-0.5 font-mono font-bold text-primary">
+                            Ticket #{s.chunkTicket}
+                          </span>
+                        )}
+                        {keyBadge && (
+                          <span className="rounded border border-indigo-500/40 bg-indigo-500/15 px-1.5 py-0.5 font-mono font-semibold text-indigo-300">
+                            {keyBadge}
+                          </span>
+                        )}
+                        <span className={`rounded border px-1.5 py-0.5 font-medium break-words ${stageColor}`}>
+                          {stageInfo.label}
+                        </span>
+                      </div>
+                    )
+                  })()}
                   <div className="mt-1 flex flex-wrap gap-2 text-muted-foreground text-[11px]">
                     <span>{new Date(s.createdAt).toLocaleString()}</span>
                     {s.movieDuration ? <span className="font-mono">{fmtTime(s.movieDuration)}</span> : null}

@@ -266,43 +266,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
     })()
   }
 
-  const [ytUrl, setYtUrl] = useState('')
-  const [ytDownloading, setYtDownloading] = useState(false)
   const [syncingDrive, setSyncingDrive] = useState(false)
-
-  async function downloadYoutubeShort() {
-    const trimmed = ytUrl.trim()
-    if (!trimmed) return
-    const tempKey = `${scanIdRef.current ?? 'new'}/short`
-    setYtDownloading(true)
-    setErrors((prev) => {
-      const next = { ...prev }
-      delete next[tempKey]
-      return next
-    })
-    try {
-      const id = await ensureScan()
-      const res = await fetch(`/api/scans/${id}/youtube`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: trimmed }),
-      })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to download YouTube Short via yt-dlp')
-      }
-      setYtUrl('')
-      await Promise.all([mutateCache(`/api/scans/${id}`), mutateCache('/api/scans')])
-      refresh()
-    } catch (err) {
-      setErrors((prev) => ({
-        ...prev,
-        [tempKey]: err instanceof Error ? err.message : String(err),
-      }))
-    } finally {
-      setYtDownloading(false)
-    }
-  }
 
   async function triggerStudioMovieSync() {
     if (!scan?.id) return
@@ -375,59 +339,16 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
             duration={shortServer ? scan?.shortDuration : shortLocal?.duration}
             size={shortServer ? scan?.shortSize : shortLocal?.size}
             progress={shortJob?.progress ?? null}
-            disabled={shortJob !== null || shortServer || ytDownloading}
+            disabled={shortJob !== null || shortServer}
             onFile={(f) => uploadFile('short', f)}
             onCancel={() => cancelUpload('short')}
             extraInfo={[
               reused[shortKey] ? 'Already on server — linked instantly, nothing uploaded' : null,
-              scan?.shortYoutubeUrl ? `YouTube URL linked (${scan.shortYoutubeUrl})` : null,
               scan?.shortSegments && scan.shortSegments.length > 1 ? `${scan.shortSegments.length} minutes — scanned minute-by-minute` : null,
             ]
               .filter(Boolean)
               .join(' · ') || undefined}
           />
-          {/* Requirement 3: YouTube link of the short (downloaded via yt-dlp + attached directly in Studio) */}
-          <div className="rounded-lg border border-border/80 bg-card/70 p-2.5 space-y-1.5">
-            <div className="flex items-center justify-between text-[11px]">
-              <span className="font-medium text-foreground">YouTube link of the short (optional, for Studio &amp; yt-dlp)</span>
-              {scan?.shortYoutubeUrl && (
-                <span className="font-mono text-emerald-400 truncate max-w-[200px]" title={scan.shortYoutubeUrl}>
-                  ✓ Linked
-                </span>
-              )}
-            </div>
-            <div className="flex gap-1.5">
-              <input
-                type="url"
-                value={ytUrl}
-                onChange={(e) => setYtUrl(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') void downloadYoutubeShort()
-                }}
-                disabled={ytDownloading || shortJob !== null}
-                placeholder={
-                  scan?.shortYoutubeUrl ||
-                  'https://www.youtube.com/shorts/... (downloads via yt-dlp & attaches in Studio)'
-                }
-                className="min-w-0 flex-1 rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring"
-              />
-              <button
-                type="button"
-                onClick={() => void downloadYoutubeShort()}
-                disabled={ytDownloading || !ytUrl.trim() || shortJob !== null}
-                className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-40"
-              >
-                {ytDownloading ? (
-                  <>
-                    <Loader2 className="size-3.5 animate-spin" />
-                    yt-dlp...
-                  </>
-                ) : (
-                  'Fetch Short'
-                )}
-              </button>
-            </div>
-          </div>
         </div>
 
         <div className="flex flex-col gap-2">

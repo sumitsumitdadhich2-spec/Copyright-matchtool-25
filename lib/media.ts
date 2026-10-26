@@ -682,8 +682,11 @@ export async function finalizeUploadedMedia(
     const isAuto = scan.autoMode !== false
     const owner = scan.ownerUsername || 'admin'
     const studioCfg = await loadStudioUserConfig(owner)
-    const engine = scan.chunkScanEngine || studioCfg.chunkScanEngine || 'api'
+    const engine = scan.chunkScanEngine || studioCfg.chunkScanEngine || 'studio'
     scan.chunkScanEngine = engine
+    if (engine === 'studio') {
+      scan.verifierEnabled = false
+    }
 
     // Immediately trigger lightweight web preview generation in background for ultra-fast UI playback
     const dest = localMediaPath(id, 'movie')
@@ -700,18 +703,14 @@ export async function finalizeUploadedMedia(
       scan.chunkingProgress = 0
 
       if (engine === 'studio') {
-        scan.movie360p = {
-          status: 'compressing',
-          progress: 0,
-          updatedAt: Date.now(),
-        }
+        scan.status = 'ready'
+        scan.chunkingProgress = 100
         addLog(
           scan,
           'info',
-          `Movie uploaded: ${name} (${fmtDur(duration)}) — Gemini Studio mode active: compressing once to movie_360p.mp4 (24fps CFR, <= 390 MB, local direct upload to AI Studio)`,
+          `Movie uploaded: ${name} (${fmtDur(duration)}) — Gemini Studio parallel window mode active (${count} logical 1-min slots; per-window clips extracted on demand)`,
         )
         saveScan(scan, { immediate: true })
-        void prepareStudioMovie360pAndDrive(id, dest, duration, owner)
       } else {
         addLog(
           scan,

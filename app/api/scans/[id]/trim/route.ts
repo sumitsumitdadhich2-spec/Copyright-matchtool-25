@@ -44,8 +44,11 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const session = await getSession()
   const owner = session?.username || scan.ownerUsername || 'admin'
   const studioCfg = await loadStudioUserConfig(owner)
-  const engine = scan.chunkScanEngine || studioCfg.chunkScanEngine || 'api'
+  const engine = scan.chunkScanEngine || studioCfg.chunkScanEngine || 'studio'
   scan.chunkScanEngine = engine
+  if (engine === 'studio') {
+    scan.verifierEnabled = false
+  }
 
   const rangeDur = end - start
   const count = Math.ceil(rangeDur / CHUNK_SECONDS)
@@ -60,13 +63,13 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   }
   scan.matches = []
   scan.candidateGroups = []
-  scan.status = 'chunking'
-  scan.chunkingProgress = 0
+  scan.status = engine === 'studio' ? 'ready' : 'chunking'
+  scan.chunkingProgress = engine === 'studio' ? 100 : 0
   addLog(
     scan,
     'info',
     engine === 'studio'
-      ? `Trim confirmed (${isFull ? `FULL movie ${fmtDur(dur)}` : `${fmtDur(start)} → ${fmtDur(end)}`}) — Gemini Studio mode: preparing movie_360p.mp4 (local direct upload, ${count} logical 1-min slots)`
+      ? `Trim confirmed (${isFull ? `FULL movie ${fmtDur(dur)}` : `${fmtDur(start)} → ${fmtDur(end)}`}) — Gemini Studio parallel window mode (${count} logical 1-min slots)`
       : isFull
         ? `Trim confirmed: FULL movie (${fmtDur(dur)}) — cutting into ${count} one-minute chunks`
         : `Trim confirmed: ${fmtDur(start)} → ${fmtDur(end)} (${fmtDur(rangeDur)}) — cutting ONLY this range into ${count} chunk(s); reported movie timestamps stay absolute to the original`,
@@ -90,7 +93,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const dest = path.join(mediaDir, 'movie.mp4')
 
   if (engine === 'studio') {
-    void prepareStudioMovie360pAndDrive(id, dest, dur, owner)
+    // Per-window clips are extracted on demand by StudioParallelManager
   } else {
     // Chunk in the background; the client polls chunkingProgress.
     void (async () => {

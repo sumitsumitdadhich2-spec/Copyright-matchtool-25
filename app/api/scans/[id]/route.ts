@@ -52,6 +52,8 @@ export async function DELETE(_req: Request, ctx: { params: Promise<{ id: string 
   }
 
   // Stop queued/running scan work, minute finder, parallel studio workers, and renders before removing files.
+  const { skipScanTicket } = await import('@/lib/chunk-scan-coordinator')
+  skipScanTicket(id, 'Scan deleted by user')
   await stopBackgroundScan(id)
   if (scheduler.isRunning(id)) scheduler.stop(id)
   if (isMinuteFinderRunning(id)) stopGeminiMinuteFinder(id)

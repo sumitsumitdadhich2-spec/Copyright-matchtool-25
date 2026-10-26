@@ -2871,8 +2871,7 @@ export class StudioBrowserController {
 
     const uploadedBasename =
       driveFileName ||
-      (localFilePath ? path.basename(localFilePath) : '') ||
-      (youtubeUrl ? 'youtube' : '')
+      (localFilePath ? path.basename(localFilePath) : '')
 
     // Combined locator: videoMediaChipsCss + videoMediaChipsPw + fallback chip locator ([data-cmt-fallback-chip="true"])
     const combinedChipSelector = [
@@ -2888,44 +2887,7 @@ export class StudioBrowserController {
     const removeBefore = await removeMediaBtnLocator.count().catch(() => 0)
     const headerTokensBefore = await this.readHeaderTokenCountSilent(page)
 
-    if (youtubeUrl) {
-      // Option 1: Try Insert (+) -> YouTube URL modal, or direct paste into prompt input
-      let attachedViaMenu = false
-      const insertBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.insertMediaButton, 2500)
-      if (insertBtn) {
-        await insertBtn.click()
-        await new Promise((r) => setTimeout(r, 350))
-        const ytOpt = await findFirstVisibleLocator(page, STUDIO_SELECTORS.insertMenuYoutubeOption, 1500)
-        if (ytOpt) {
-          await ytOpt.click()
-          await new Promise((r) => setTimeout(r, 400))
-          const ytInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.youtubeModalInput, 2000)
-          if (ytInput) {
-            await ytInput.fill(youtubeUrl)
-            const confirmBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.youtubeModalConfirm, 1500)
-            if (confirmBtn) await confirmBtn.click()
-            else await ytInput.press('Enter')
-            attachedViaMenu = true
-          }
-        } else {
-          await page.keyboard.press('Escape')
-        }
-      }
-
-      if (!attachedViaMenu) {
-        // Fallback: paste the YouTube URL directly into the prompt textarea (AI Studio auto-converts YouTube URLs to video chips)
-        const promptInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.promptInput, 3000)
-        if (promptInput) {
-          await promptInput.click()
-          await page.evaluate((url) => {
-            const dt = new DataTransfer()
-            dt.setData('text/plain', url)
-            document.activeElement?.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true }))
-          }, youtubeUrl)
-          await new Promise((r) => setTimeout(r, 1000))
-        }
-      }
-    } else if (driveFileName) {
+    if (driveFileName) {
       // Attach from Google Drive picker by file name (Insert -> Drive -> search driveFileName -> Select)
       let attachedFromDrive = false
       const insertBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.insertMediaButton, 3000)
@@ -2991,7 +2953,7 @@ export class StudioBrowserController {
     // button[aria-label="Remove media" i] count increased OR header token count increased)
     // AND wait until the chip finishes "Loading..." so its gear button ("Edit video options") is ready.
     // A local 390 MB upload can take longer than 90s, so use a 5-minute (300_000ms) deadline for local file uploads.
-    const isLocalFileUpload = Boolean(!youtubeUrl && !driveFileName && localFilePath)
+    const isLocalFileUpload = Boolean(!driveFileName && localFilePath)
     const waitTimeoutMs = isLocalFileUpload ? 300_000 : 90_000
     const uploadWaitStartedAt = Date.now()
     const waitDeadline = uploadWaitStartedAt + waitTimeoutMs
