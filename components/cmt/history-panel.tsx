@@ -212,11 +212,11 @@ export function HistoryPanel({ activeId, onSelect, onNew }: { activeId: string |
                     const stageColor =
                       stageInfo.stage === 'done'
                         ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
-                        : stageInfo.stage === 'chunk_waiting_ticket'
+                        : stageInfo.stage === 'waiting_chunk_ticket'
                           ? 'border-amber-500/40 bg-amber-500/15 text-amber-300'
-                          : stageInfo.stage === 'chunk_scanning' || stageInfo.stage === 'minute_finder' || stageInfo.stage === 'backup_finder'
+                          : stageInfo.stage === 'chunk_scanning' || stageInfo.stage === 'minute_finder' || stageInfo.stage === 'backup_finder' || stageInfo.stage === 'clips_extract'
                             ? 'border-cyan-500/40 bg-cyan-500/15 text-cyan-300'
-                            : stageInfo.stage === 'error'
+                            : s.status === 'error'
                               ? 'border-rose-500/40 bg-rose-500/15 text-rose-300'
                               : 'border-border bg-muted/60 text-muted-foreground'
                     return (

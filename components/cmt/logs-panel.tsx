@@ -268,15 +268,6 @@ export function LogsPanel({ scan }: { scan: Scan }) {
       }
     }
 
-    if (scan.status === 'chunking') {
-      return {
-        active: true,
-        text: `Splitting Movie: ${scan.chunkingProgress ?? 0}% chunks ready`,
-        color: 'text-blue-400',
-        badge: 'Chunking',
-      }
-    }
-
     if (scan.status === 'scanning' || scan.status === 'verifying') {
       return {
         active: true,

@@ -154,7 +154,7 @@ export async function PUT(req: Request) {
       return Number.isFinite(n) && n > 0 ? Math.max(50_000, Math.min(1_048_576, Math.floor(n))) : null
     }
     await saveStudioUserConfig(session.username, {
-      ...(st.chunkScanEngine !== undefined ? { chunkScanEngine: st.chunkScanEngine === 'studio' ? 'studio' : 'api' } : {}),
+      chunkScanEngine: 'studio',
       ...(typeof st.studioModelName === 'string' ? { studioModelName: st.studioModelName.trim() } : {}),
       ...(st.studioThinkingLevel !== undefined
         ? { studioThinkingLevel: normalizeStudioThinkingLevel(st.studioThinkingLevel) }
@@ -184,9 +184,8 @@ export async function PUT(req: Request) {
   }
 
   if (body.chunkScanEngine !== undefined) {
-    const engine = body.chunkScanEngine === 'studio' ? 'studio' : 'api'
-    await saveStudioUserConfig(session.username, { chunkScanEngine: engine })
-    return NextResponse.json({ ok: true, chunkScanEngine: engine })
+    await saveStudioUserConfig(session.username, { chunkScanEngine: 'studio' })
+    return NextResponse.json({ ok: true, chunkScanEngine: 'studio' })
   }
 
   if (body.autoMode !== undefined) {
@@ -254,7 +253,7 @@ export async function POST(req: Request) {
       return Number.isFinite(n) && n > 0 ? Math.max(50_000, Math.min(1_048_576, Math.floor(n))) : null
     }
     await saveStudioUserConfig(username, {
-      ...(st.chunkScanEngine !== undefined ? { chunkScanEngine: st.chunkScanEngine === 'studio' ? 'studio' : 'api' } : {}),
+      chunkScanEngine: 'studio',
       ...(typeof st.studioModelName === 'string' ? { studioModelName: st.studioModelName.trim() } : {}),
       ...(st.studioThinkingLevel !== undefined
         ? { studioThinkingLevel: normalizeStudioThinkingLevel(st.studioThinkingLevel) }

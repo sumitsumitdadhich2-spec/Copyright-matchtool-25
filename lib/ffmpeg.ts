@@ -1239,9 +1239,13 @@ export async function compressVideoForStudio360p(params: {
           partialFile,
         ],
         {
-          durationSec: dur,
-          onProgress: (p) =>
-            onProgress?.(Math.min(99, Math.round(progressOffset + p * progressScale))),
+          onStderr: (chunk) => {
+            const { time } = parseProgressLine(chunk)
+            if (time !== null && dur > 0) {
+              const p = Math.min(1, Math.max(0, time / dur)) * 100
+              onProgress?.(Math.min(99, Math.round(progressOffset + p * progressScale)))
+            }
+          },
           label: `studio-${targetRes}`,
           owner,
         },

@@ -29,7 +29,6 @@ interface Props {
 }
 
 export function StudioSettingsSection({ studio, onRefresh }: Props) {
-  const [engine, setEngine] = useState<'api' | 'studio'>(studio?.chunkScanEngine ?? 'api')
   const [modelName, setModelName] = useState(studio?.studioModelName ?? 'Argon')
   const [thinkingLevel, setThinkingLevel] = useState<StudioThinkingLevel>(
     studio?.studioThinkingLevel ?? 'high',
@@ -74,7 +73,6 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
 
   useEffect(() => {
     if (!studio) return
-    setEngine(studio.chunkScanEngine)
     setModelName(studio.studioModelName || 'Argon')
     setThinkingLevel(studio.studioThinkingLevel || 'high')
     setMaxOutputTokens(studio.studioMaxOutputTokens)
@@ -90,7 +88,6 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
     )
     setAttachMovieFromDrive(Boolean(studio.studioAttachMovieFromDrive ?? false))
   }, [
-    studio?.chunkScanEngine,
     studio?.studioModelName,
     studio?.studioThinkingLevel,
     studio?.studioMaxOutputTokens,
@@ -115,22 +112,6 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
     return () => window.removeEventListener('message', handler)
   }, [onRefresh])
 
-  async function switchEngine(nextEngine: 'api' | 'studio') {
-    setEngine(nextEngine)
-    setError(null)
-    const res = await fetch('/api/settings', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chunkScanEngine: nextEngine }),
-    })
-    if (!res.ok) {
-      const j = await res.json().catch(() => ({}))
-      setError(j.error || 'Failed to switch chunk scan engine')
-      return
-    }
-    onRefresh()
-  }
-
   async function saveStudioParams() {
     setSavingConfig(true)
     setError(null)
@@ -144,7 +125,6 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         studio: {
-          chunkScanEngine: engine,
           studioModelName: modelName,
           studioThinkingLevel: thinkingLevel,
           studioMaxOutputTokens: Number(maxOutputTokens),
@@ -305,45 +285,8 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
 
   return (
     <div className="mb-6 rounded-xl border border-primary/30 bg-primary/5 p-4 space-y-4">
-      {/* 1. Chunk Scan Engine Selector */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <Cpu className="size-4 text-primary" />
-          <div>
-            <h2 className="text-sm font-semibold">Chunk scan engine</h2>
-            <p className="text-xs text-muted-foreground">
-              Choose how movie chunks are sent to Gemini (Verifier, Minute Finder & Render stay A-to-Z identical).
-            </p>
-          </div>
-        </div>
-        <div className="inline-flex rounded-lg border border-border bg-background p-1">
-          <button
-            type="button"
-            onClick={() => switchEngine('api')}
-            className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-              engine === 'api'
-                ? 'bg-primary text-primary-foreground shadow-sm'
-                : 'text-muted-foreground hover:text-foreground'
-            }`}
-          >
-            API (old)
-          </button>
-          <button
-            type="button"
-            onClick={() => switchEngine('studio')}
-            className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-              engine === 'studio'
-                ? 'bg-emerald-600 text-white shadow-sm'
-                : 'text-muted-foreground hover:text-foreground'
-            }`}
-          >
-            Gemini Studio (cookies)
-          </button>
-        </div>
-      </div>
-
-      {/* 2. Studio Settings (Cookies, Test Login, Model/Window Config, Google Drive OAuth) */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 pt-2 border-t border-border/60">
+      {/* Studio Settings (Cookies, Test Login, Model/Window Config, Google Drive OAuth) */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* Left column: Google Cookies + Test Login + Google Drive OAuth */}
         <div className="space-y-3">
           <div className="rounded-lg border border-border bg-card/80 p-3 space-y-2.5">

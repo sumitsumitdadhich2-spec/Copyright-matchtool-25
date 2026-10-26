@@ -2857,7 +2857,6 @@ export class StudioBrowserController {
     page: Page,
     params: {
       label: 'short' | 'movie'
-      youtubeUrl?: string | null
       driveFileName?: string | null
       localFilePath?: string | null
       startSec: number
@@ -2866,7 +2865,7 @@ export class StudioBrowserController {
       scope?: { scanId?: string | null; username?: string | null }
     },
   ) {
-    const { label, youtubeUrl, driveFileName, localFilePath, startSec, endSec, fps, scope } = params
+    const { label, driveFileName, localFilePath, startSec, endSec, fps, scope } = params
     await this.waitIfPausedOrThrowIfStopped(scope)
 
     const uploadedBasename =
@@ -4207,7 +4206,6 @@ export class StudioBrowserController {
     maxOutputTokens: number
     maxInputTokens?: number | null
     pageRecycleInterval?: number
-    shortYoutubeUrl?: string | null
     shortDriveFileName?: string | null
     shortLocalPath?: string | null
     shortStartSec: number
@@ -4245,7 +4243,6 @@ export class StudioBrowserController {
       jobLabel,
       modelName,
       maxOutputTokens,
-      shortYoutubeUrl,
       shortDriveFileName,
       shortLocalPath,
       shortStartSec,
@@ -4580,7 +4577,6 @@ export class StudioBrowserController {
           currentStage = 'setup/attach_short'
           await this.attachVideoAndConfigureRange(page, {
             label: 'short',
-            youtubeUrl: shortYoutubeUrl,
             driveFileName: shortDriveFileName,
             localFilePath: shortLocalPath,
             startSec: shortStartSec,

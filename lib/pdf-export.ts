@@ -79,7 +79,7 @@ export async function downloadScanLogsPdf(scan: Scan, options?: PdfExportOptions
   // Scan Status Badge on top-right of header bar
   const statusStr = (scan.status || 'unknown').toUpperCase()
   let statusBg: [number, number, number] = [71, 85, 105]
-  if (scan.status === 'completed') statusBg = [22, 163, 74]
+  if (scan.status === 'done' || (scan.status as string) === 'completed') statusBg = [22, 163, 74]
   else if (scan.status === 'stopped') statusBg = [217, 119, 6]
   else if (scan.status === 'scanning' || scan.status === 'verifying') statusBg = [37, 99, 235]
   else if (scan.status === 'error') statusBg = [220, 38, 38]
@@ -259,7 +259,7 @@ export async function downloadScanLogsPdf(scan: Scan, options?: PdfExportOptions
   }
 
   // --- FOOTER ON ALL PAGES ---
-  const totalPages = doc.internal.getNumberOfPages()
+  const totalPages = doc.getNumberOfPages()
   for (let page = 1; page <= totalPages; page++) {
     doc.setPage(page)
 

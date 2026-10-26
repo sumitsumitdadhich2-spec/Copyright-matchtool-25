@@ -214,7 +214,7 @@ export async function loadStudioUserConfig(username: string): Promise<StudioUser
   return {
     ...DEFAULT_STUDIO_CONFIG,
     ...(raw || {}),
-    chunkScanEngine: raw?.chunkScanEngine === 'api' ? 'api' : 'studio',
+    chunkScanEngine: 'studio',
     studioModelName: resolvedModelName,
     studioThinkingLevel,
     studioMaxOutputTokens,
@@ -261,6 +261,7 @@ export async function saveStudioUserConfig(
   const next: StudioUserConfig = {
     ...current,
     ...patch,
+    chunkScanEngine: 'studio',
     updatedAt: Date.now(),
   }
   await writeJSONRecord(recordKey(username), next)

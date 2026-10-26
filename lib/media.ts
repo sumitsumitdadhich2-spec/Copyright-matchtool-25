@@ -229,7 +229,7 @@ export async function findAndReuseMovieChunks(
   const candidates = listScans()
     .filter((s) => s.id !== targetId && s.movieName === movieName)
     .map((s) => getScan(s.id))
-    .filter((s): s is Scan => Boolean(s) && s.movieSize === movieSize)
+    .filter((s): s is Scan => s !== null && s.movieSize === movieSize)
 
   for (const cand of candidates) {
     const candStart = cand.movieTrimStart ?? 0
@@ -314,7 +314,7 @@ export async function findAndReusePrescanMovie(
   const candidates = listScans()
     .filter((s) => s.id !== targetId && s.movieName === movieName)
     .map((s) => getScan(s.id))
-    .filter((s): s is Scan => Boolean(s) && s.movieSize === movieSize)
+    .filter((s): s is Scan => s !== null && s.movieSize === movieSize)
 
   const targetCopy = path.join(scanMediaDir(targetId), 'prescan-movie.mp4')
 
@@ -380,7 +380,7 @@ export function findReusableGeminiMovieUpload(
   const candidates = listScans()
     .filter((s) => s.id !== excludeId && s.movieName === movieName)
     .map((s) => getScan(s.id))
-    .filter((s): s is Scan => Boolean(s) && s.movieSize === movieSize)
+    .filter((s): s is Scan => s !== null && s.movieSize === movieSize)
 
   for (const cand of candidates) {
     const candStart = cand.movieTrimStart ?? 0
@@ -612,8 +612,8 @@ export async function finalizeUploadedMedia(
 
   if (kind === 'short') {
     // The ORIGINAL short is NEVER overwritten: preview, verifier clips and the
-    // render pipeline use it at full quality. Scanning uses separate re-encoded
-    // 1-minute segment files cut in the background.
+    // render pipeline use it at full quality. Logical 1-minute segment metadata
+    // is stored for results/UI without cutting physical 1-minute files in segments/.
     scan.shortName = name
     scan.shortSize = size
     scan.shortDuration = duration
@@ -626,166 +626,43 @@ export async function finalizeUploadedMedia(
       chunks: [],
     }))
     scan.currentShortSegment = 0
-    scan.shortSegmentingProgress = 0
+    scan.shortSegmentingProgress = 100
     addLog(
       scan,
       'info',
-      segCount > 1
-        ? `Short video uploaded: ${name} (${fmtDur(duration)}) — scanned minute-by-minute (${segCount} segments), original preserved`
-        : `Short video uploaded: ${name} (${fmtDur(duration)}) — original preserved, scan copy cut in background`,
+      `Short video uploaded: ${name} (${fmtDur(duration)}) — ${segCount} logical segment(s) ready, original preserved`,
     )
     saveScan(scan, { immediate: true })
 
     // Immediately trigger lightweight web preview generation in background for ultra-fast UI playback
     triggerFastPreview(id, dest, mediaDir, 'short')
-
-    // Background: cut 24 fps / 640px scan segments — original untouched.
-    const segDir = path.join(mediaDir, 'segments')
-    void (async () => {
-      try {
-        cleanupSegments(segDir)
-        const actual = await chunkShort(dest, segDir, duration, (pct) => {
-          const s = getScan(id)
-          if (s) {
-            s.shortSegmentingProgress = pct
-            saveScan(s)
-          }
-        }, { owner: id })
-        const s = getScan(id)
-        if (s) {
-          s.shortSegmentingProgress = 100
-          if (actual !== s.shortSegments?.length) {
-            s.shortSegments = Array.from({ length: actual }, (_, i) => ({
-              index: i,
-              start: i * CHUNK_SECONDS,
-              end: Math.min((i + 1) * CHUNK_SECONDS, duration),
-              status: 'pending' as const,
-              chunks: [],
-            }))
-          }
-          addLog(s, 'success', `Short scan segments ready: ${actual} × 1-minute file(s) at 24 fps`)
-          saveScan(s)
-        }
-      } catch (err) {
-        const s = getScan(id)
-        if (s) {
-          s.shortSegmentingProgress = 100
-          addLog(s, 'warn', `Short segment cutting failed (segments will be re-cut on demand during the scan): ${err instanceof Error ? err.message : String(err)}`)
-          saveScan(s)
-        }
-      }
-    })()
   } else {
     scan.movieName = name
     scan.movieSize = size
     scan.movieDuration = duration
-    const isAuto = scan.autoMode !== false
     const owner = scan.ownerUsername || 'admin'
-    const studioCfg = await loadStudioUserConfig(owner)
-    const engine = scan.chunkScanEngine || studioCfg.chunkScanEngine || 'studio'
-    scan.chunkScanEngine = engine
-    if (engine === 'studio') {
-      scan.verifierEnabled = false
-    }
+    await loadStudioUserConfig(owner)
+    scan.chunkScanEngine = 'studio'
+    scan.verifierEnabled = false
 
     // Immediately trigger lightweight web preview generation in background for ultra-fast UI playback
     const dest = localMediaPath(id, 'movie')
     triggerFastPreview(id, dest, mediaDir)
 
-    if (isAuto) {
-      scan.awaitingTrim = false
-      scan.movieTrimStart = undefined
-      scan.movieTrimEnd = undefined
-      const count = Math.max(1, Math.ceil(duration / CHUNK_SECONDS))
-      scan.chunkCount = count
-      scan.chunks = Array.from({ length: count }, (_, i) => ({ index: i, status: 'pending' as const, attempts: 0 }))
-      scan.status = 'chunking'
-      scan.chunkingProgress = 0
-
-      if (engine === 'studio') {
-        scan.status = 'ready'
-        scan.chunkingProgress = 100
-        addLog(
-          scan,
-          'info',
-          `Movie uploaded: ${name} (${fmtDur(duration)}) — Gemini Studio parallel window mode active (${count} logical 1-min slots; per-window clips extracted on demand)`,
-        )
-        saveScan(scan, { immediate: true })
-      } else {
-        addLog(
-          scan,
-          'info',
-          `Movie uploaded: ${name} (${fmtDur(duration)}) — Auto mode ON: full movie auto-selected (${count} chunks), cutting in background`,
-        )
-        saveScan(scan, { immediate: true })
-
-        // Background chunking for full movie (API engine)
-        void (async () => {
-          try {
-            const reused = await findAndReuseMovieChunks(id, scan.movieName || '', scan.movieSize || 0, 0, duration, count)
-            if (reused.ok) {
-              const s = getScan(id)
-              if (s) {
-                s.chunkCount = reused.count
-                s.chunks = Array.from({ length: reused.count }, (_, i) => ({ index: i, status: 'pending' as const, attempts: 0 }))
-                s.status = 'ready'
-                s.chunkingProgress = 100
-                addLog(s, 'success', `Reused ${reused.count} 1-min movie chunks from previous scan (no re-cutting needed)`)
-                saveScan(s)
-              }
-              return
-            }
-            const actual = await chunkMovie(
-              dest,
-              path.join(mediaDir, 'chunks'),
-              duration,
-              (pct) => {
-                const s = getScan(id)
-                if (s) {
-                  s.chunkingProgress = pct
-                  saveScan(s)
-                }
-              },
-              0,
-              duration,
-              { owner: id },
-            )
-            const s = getScan(id)
-            if (s) {
-              s.chunkCount = actual
-              s.chunks = Array.from({ length: actual }, (_, i) => ({ index: i, status: 'pending' as const, attempts: 0 }))
-              s.status = 'ready'
-              s.chunkingProgress = 100
-              addLog(s, 'success', `Movie chunking complete: ${actual} 1-minute chunk(s) created`)
-              saveScan(s)
-            }
-          } catch (err) {
-            const s = getScan(id)
-            if (s) {
-              s.status = 'error'
-              s.error = `Chunking failed: ${err instanceof Error ? err.message : String(err)}`
-              addLog(s, 'error', s.error)
-              saveScan(s)
-            }
-          }
-        })()
-      }
-    } else {
-      // Chunking WAITS for the trim confirmation — the user can select just the
-      // range that holds their scene (saves API quota) or confirm the full movie.
-      scan.chunkCount = 0
-      scan.chunks = []
-      scan.awaitingTrim = true
-      scan.movieTrimStart = undefined
-      scan.movieTrimEnd = undefined
-      scan.status = 'created'
-      scan.chunkingProgress = 0
-      addLog(
-        scan,
-        'info',
-        `Movie uploaded: ${name} (${fmtDur(duration)}) — select a trim range (optional) and confirm to start preparation`,
-      )
-    }
+    scan.awaitingTrim = false
+    scan.movieTrimStart = undefined
+    scan.movieTrimEnd = undefined
+    const count = Math.max(1, Math.ceil(duration / CHUNK_SECONDS))
+    scan.chunkCount = count
+    scan.chunks = Array.from({ length: count }, (_, i) => ({ index: i, status: 'pending' as const, attempts: 0 }))
+    scan.status = 'ready'
+    scan.chunkingProgress = 100
+    addLog(
+      scan,
+      'info',
+      `Movie uploaded: ${name} (${fmtDur(duration)}) — Gemini Studio parallel window mode active (${count} logical 1-min slots; per-window clips extracted on demand)`,
+    )
+    saveScan(scan, { immediate: true })
   }
 
   saveScan(scan, { immediate: true })
@@ -1186,7 +1063,7 @@ export async function ensureStudioMovieUploadedToDriveIfNeeded(
       if (!fs.existsSync(out360pPath) || fs.statSync(out360pPath).size <= 0) {
         return null
       }
-      const owner = username || scan?.owner || 'admin'
+      const owner = username || scan?.ownerUsername || 'admin'
       const driveTokens = await loadUserDriveTokens(owner)
       if (!driveTokens?.refresh_token) {
         return null

@@ -609,7 +609,7 @@ function ExpandedCandidateDrawer({
             <CandidateDetailCard key={c.id || `${c.chunkIndex}-${idx}`} scan={scan} g={group} c={c} index={idx} />
           ))
         ) : (
-          <SingleFallbackCandidateCard scan={scan} m={m} />
+          <SingleFallbackCandidateCard scan={scan} match={m} />
         )}
       </div>
     </div>

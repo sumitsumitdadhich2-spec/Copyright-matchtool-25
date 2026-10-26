@@ -44,6 +44,9 @@ export interface ChunkMatch {
   batchTimestamp?: number
   rescanRequired?: boolean
   description?: string
+  confidence?: number
+  reason?: string
+  verifierModel?: string
 }
 
 export interface ChunkTokenUsage {
@@ -105,6 +108,8 @@ export interface ChunkState {
   skippedEarlyStop?: boolean
   error?: string
   lastError?: string
+  assignedKey?: number
+  assignedModel?: string
 }
 
 export type ShortSegmentStatus = 'pending' | 'scanning' | 'verifying' | 'done'
@@ -337,6 +342,7 @@ export type RescanState = 'none' | 'pending' | 'rescanning' | 'found' | 'not_fou
 
 /** One movie-window candidate for a short segment (one parsed chunk match). */
 export interface CandidateEntry {
+  id?: string
   /** short video window for this specific candidate (if different from group window) */
   shortStart?: number
   shortEnd?: number
@@ -347,6 +353,7 @@ export interface CandidateEntry {
   /** model that produced this candidate during the chunk phase */
   model: string
   confidence?: number
+  reason?: string
   /** verifier verdict for this exact window */
   verdict: CandidateVerdict
   verifierModel?: string
@@ -359,6 +366,7 @@ export interface CandidateEntry {
   /** verifier verdict for the rescan-found window */
   rescanVerdict?: CandidateVerdict
   rescanReason?: string
+  rescanModel?: string
 }
 
 export type CandidateGroupStatus =
@@ -528,6 +536,8 @@ export interface GeminiPrescanWindow {
   attempts?: number
   /** Set to true when this window encountered a policy violation and completed its 1 sanitized retry */
   policyRetried?: boolean
+  hits?: unknown[]
+  hissa3?: string
 }
 
 export interface GeminiUploadProgressInfo {
@@ -782,6 +792,7 @@ export type OrchestratorPhase =
   | 'burst_secondary'
   | 'choke_tertiary'
   | 'burst_tertiary'
+  | 'choke_canary'
   | 'recovery_watch'
   | 'completed'
 
@@ -804,7 +815,7 @@ export interface OrchestratorKeySlotState {
 export interface OrchestratorModelHealth {
   modelId: string
   role: 'primary' | 'secondary' | 'tertiary' | 'canary'
-  status: 'healthy' | 'degrading' | 'critical' | 'stopped' | 'probing'
+  status: 'healthy' | 'degrading' | 'critical' | 'stopped' | 'probing' | 'exhausted'
   lastChokeAt?: number
   lastChokeLatencyMs?: number
   lastChokeOutcome?: 'success' | '503' | '429' | 'timeout'
@@ -834,6 +845,15 @@ export interface OrchestratorLiveState {
   estimatedTimeRemainingSec: number | null
   lastMessage: string
   lastUpdated: number
+}
+
+export interface OrchestratorLogEvent {
+  timestamp: number
+  type: 'info' | 'warn' | 'error' | 'choke' | 'burst' | '503' | '429' | 'timeout' | 'recovery' | 'success' | 'failover'
+  slot?: number
+  model?: string
+  chunkIndex?: number
+  message: string
 }
 
 export interface ScanReport {
@@ -897,9 +917,7 @@ export interface Scan {
   chunkScanEngine?: ChunkScanEngine
   /** 360p (or 288p) CFR movie compression + Google Drive "CMT" upload state for Studio engine */
   movie360p?: Movie360pState
-  /** Optional YouTube URL of the short video (downloaded with yt-dlp and pasted directly into AI Studio) */
-  shortYoutubeUrl?: string | null
-  /** Optional Google Drive file ID & name if the short was uploaded to Drive instead of YouTube */
+  /** Optional Google Drive file ID & name if the short was uploaded to Drive */
   shortDriveFileId?: string | null
   shortDriveFileName?: string | null
   /** Per-scan movie minute input list/ranges for Parallel Window Scan */
@@ -981,7 +999,7 @@ export interface Scan {
   /** True once this scan's chunk windows have all reached terminal status */
   chunkWindowsDone?: boolean
   /** High-level pipeline stage for UI display */
-  pipelineStage?: 'upload' | 'minute_finder' | 'backup_finder' | 'waiting_chunk_ticket' | 'chunk_scanning' | 'done' | 'stopped' | 'error'
+  pipelineStage?: 'upload' | 'minute_finder' | 'backup_finder' | 'clips_extract' | 'waiting_chunk_ticket' | 'chunk_scanning' | 'done' | 'stopped' | 'error'
   /** When waiting in the chunk windows ticket queue, which ticket/scan is currently ahead */
   waitingForTicket?: number | null
   waitingForScanTitle?: string | null

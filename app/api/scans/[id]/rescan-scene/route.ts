@@ -87,9 +87,8 @@ export async function POST(
 
     // 2. Select API keys and models
     const userKeys = await getAllUserApiKeys(session.username)
-    const scanKeys = scan.apiKeys || []
     const envKey = process.env.GEMINI_API_KEY || ''
-    const allKeys = Array.from(new Set([...userKeys, ...scanKeys, envKey].filter(Boolean)))
+    const allKeys = Array.from(new Set([...userKeys, envKey].filter(Boolean)))
 
     if (allKeys.length === 0) {
       return NextResponse.json({ ok: false, error: 'No Gemini API keys configured' }, { status: 400 })
@@ -189,6 +188,7 @@ export async function POST(
           reason: prevMatch.reason || 'Previous match',
           model: prevMatch.model,
           verdict: prevMatch.verified ? 'same' : 'different',
+          rescan: 'none',
         })
       }
     }

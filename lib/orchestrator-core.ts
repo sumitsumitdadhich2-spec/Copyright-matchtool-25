@@ -1281,7 +1281,7 @@ export class ChunkScanOrchestrator {
       let result = { ok: true, is503: false, is429: false, isTimeout: false, error: '' }
 
       if (this.chunkExecutor) {
-        result = await this.chunkExecutor(
+        const execRes = await this.chunkExecutor(
           chunk.index,
           slot,
           apiKey,
@@ -1290,6 +1290,13 @@ export class ChunkScanOrchestrator {
           abortCtrl.signal,
           chunk.segIndex ?? 0,
         )
+        result = {
+          ok: Boolean(execRes.ok),
+          is503: Boolean(execRes.is503),
+          is429: Boolean(execRes.is429),
+          isTimeout: Boolean(execRes.isTimeout),
+          error: execRes.error || '',
+        }
       } else {
         // Default simulated work / live call placeholder
         await new Promise((resolve) => setTimeout(resolve, 1000))

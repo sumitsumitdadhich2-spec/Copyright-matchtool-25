@@ -124,7 +124,7 @@ function getWaitingExplanation({
     }
   }
 
-  const isScanning = scan.status === 'running' || scan.status === 'scanning' || scan.status === 'verifying'
+  const isScanning = (scan.status as string) === 'running' || scan.status === 'scanning' || scan.status === 'verifying'
 
   if (seg?.selected === false) {
     return {

@@ -464,6 +464,9 @@ export function getScan(id: string): Scan | null {
   const scan = readJSON<Scan | null>(scanFile(id), null)
   if (!scan) return null
 
+  scan.chunkScanEngine = 'studio'
+  scan.verifierEnabled = false
+
   if (!Array.isArray(scan.chunks)) scan.chunks = []
   if (!Array.isArray(scan.matches)) scan.matches = []
   if (!Array.isArray(scan.candidateGroups)) scan.candidateGroups = []
@@ -564,7 +567,7 @@ export function listScans(): ScanSummary[] {
       waitingForTicket: s.waitingForTicket ?? s.chunkQueue?.ticket ?? null,
       waitingForScanTitle: s.waitingForScanTitle ?? s.chunkQueue?.activeScanTitle ?? null,
       geminiPrescanStatus: s.geminiPrescan?.status ?? null,
-      chunkScanEngine: s.chunkScanEngine,
+      chunkScanEngine: 'studio',
     })
   }
   return out.sort((a, b) => b.createdAt - a.createdAt)

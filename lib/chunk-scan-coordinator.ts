@@ -608,36 +608,6 @@ class ChunkScanCoordinator {
       }
     }
 
-    // For legacy API engine scans: check if all selected segments' chunks are in terminal state
-    if (scan.chunkScanEngine === 'api') {
-      const segments = (scan.shortSegments || []).filter((s) => s.selected !== false)
-      if (segments.length > 0) {
-        let totalActiveChunks = 0
-        let finishedChunks = 0
-        for (const seg of segments) {
-          for (const c of seg.chunks || []) {
-            if (c.status === 'skipped') continue
-            totalActiveChunks++
-            if (
-              c.status === 'match' ||
-              c.status === 'no_match' ||
-              c.status === 'failed' ||
-              c.status === 'cancelled' ||
-              c.status === 'policy_blocked'
-            ) {
-              finishedChunks++
-            }
-          }
-        }
-        if (totalActiveChunks > 0 && finishedChunks >= totalActiveChunks) {
-          return {
-            shouldRelease: true,
-            reason: `All ${finishedChunks}/${totalActiveChunks} chunks finished`,
-          }
-        }
-      }
-    }
-
     return { shouldRelease: false, reason: 'Chunks still in progress' }
   }
 

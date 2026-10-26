@@ -62,9 +62,10 @@ async function runWorker(scanId: string) {
 
   try {
     const keys = await getAllUserApiKeys(scan.ownerUsername)
-    const studioCfg = await loadStudioUserConfig(scan.ownerUsername)
-    const engine = scan.chunkScanEngine || studioCfg.chunkScanEngine || 'api'
-    if (engine === 'api' && keys.length === 0) throw new Error('No Gemini API key configured for this account.')
+    await loadStudioUserConfig(scan.ownerUsername)
+    scan.chunkScanEngine = 'studio'
+    scan.verifierEnabled = false
+    saveScan(scan)
     const tlKey = await getUserTwelveLabsKey(scan.ownerUsername)
     const result = await scheduler.start(scanId, Boolean(scan.background?.resume), keys, tlKey)
     if (!result.ok) throw new Error(result.error || 'Could not start background scan')

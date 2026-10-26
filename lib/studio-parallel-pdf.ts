@@ -792,7 +792,7 @@ export async function buildParallelScanPdfBuffer(params: {
   // ==========================================================================
   // FOOTER WITH PAGE NUMBERS ON ALL PAGES
   // ==========================================================================
-  const totalPages = doc.internal.getNumberOfPages()
+  const totalPages = doc.getNumberOfPages()
   for (let p = 1; p <= totalPages; p++) {
     doc.setPage(p)
     doc.setDrawColor(203, 213, 225)

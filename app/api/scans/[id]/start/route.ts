@@ -26,29 +26,10 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     // no body
   }
 
-  if (scan.verifierEnabled === false) {
-    scan.verifierEnabled = true
-    saveScan(scan)
-  }
-  try {
-    await setUserVerifierEnabled(session.username, true)
-  } catch {
-    // ignore
-  }
-
-  const studioCfg = await loadStudioUserConfig(session.username)
-  const engine = scan.chunkScanEngine || studioCfg.chunkScanEngine || 'api'
-  scan.chunkScanEngine = engine
+  await loadStudioUserConfig(session.username)
+  scan.chunkScanEngine = 'studio'
+  scan.verifierEnabled = false
   saveScan(scan)
-
-  // PER-USER KEYS: every API scan runs ONLY on the logged-in user's own keys
-  const userApiKeys = await getAllUserApiKeys(session.username)
-  if (engine === 'api' && userApiKeys.length === 0) {
-    return NextResponse.json(
-      { error: 'No Gemini API key configured for YOUR account. Add your key in Settings first (or switch Chunk scan engine to Gemini Studio).' },
-      { status: 400 },
-    )
-  }
 
   // TOKENS: 1 fresh scan = 100 tokens. Resume is free (already paid).
   // Admin (shiva) has unlimited tokens and never gets charged.

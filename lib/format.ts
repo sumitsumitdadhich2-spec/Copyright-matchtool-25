@@ -27,10 +27,10 @@ export function fmtDuration(ms: number): string {
 export const fetcher = (url: string) => fetch(url).then((r) => r.json())
 
 export interface ScanStageInfo {
-  stage: 'upload' | 'minute_finder' | 'backup_finder' | 'waiting_chunk_ticket' | 'chunk_scanning' | 'done'
+  stage: 'upload' | 'minute_finder' | 'backup_finder' | 'clips_extract' | 'waiting_chunk_ticket' | 'chunk_scanning' | 'done'
   label: string
   steps: Array<{
-    key: 'upload' | 'minute_finder' | 'backup_finder' | 'waiting_chunk_ticket' | 'chunk_scanning' | 'done'
+    key: 'upload' | 'minute_finder' | 'backup_finder' | 'clips_extract' | 'waiting_chunk_ticket' | 'chunk_scanning' | 'done'
     label: string
     active: boolean
     completed: boolean
@@ -57,7 +57,7 @@ export function formatScanKeyPairBadge(
 
 export function deriveScanStageInfo(scan: Scan | ScanSummary): ScanStageInfo {
   const fullScan = 'geminiPrescan' in scan ? scan : null
-  const prescanStatus = fullScan ? fullScan.geminiPrescan?.status : scan.geminiPrescanStatus
+  const prescanStatus = fullScan ? fullScan.geminiPrescan?.status : (scan as ScanSummary).geminiPrescanStatus
   const ticket = scan.chunkTicket
   const waitTicket = scan.waitingForTicket ?? fullScan?.chunkQueue?.ticket
   const waitTitle =
@@ -75,6 +75,8 @@ export function deriveScanStageInfo(scan: Scan | ScanSummary): ScanStageInfo {
     Boolean(scan.waitingForScanTitle || scan.waitingForTicket || fullScan?.chunkQueue)
   ) {
     stage = 'waiting_chunk_ticket'
+  } else if (scan.pipelineStage === 'clips_extract') {
+    stage = 'clips_extract'
   } else if (
     scan.pipelineStage === 'chunk_scanning' ||
     scan.status === 'scanning' ||
@@ -94,8 +96,7 @@ export function deriveScanStageInfo(scan: Scan | ScanSummary): ScanStageInfo {
     prescanStatus === 'preparing' ||
     prescanStatus === 'uploading' ||
     prescanStatus === 'scanning' ||
-    prescanStatus === 'starting_scan' ||
-    (Boolean(scan.shortName && scan.movieName) && scan.status === 'chunking')
+    prescanStatus === 'starting_scan'
   ) {
     stage = 'minute_finder'
   } else {
@@ -108,11 +109,12 @@ export function deriveScanStageInfo(scan: Scan | ScanSummary): ScanStageInfo {
     { key: 'upload', label: 'Upload' },
     { key: 'minute_finder', label: 'Minute finder' },
     { key: 'backup_finder', label: 'Backup finder' },
+    { key: 'clips_extract', label: 'Clips extract' },
     {
       key: 'waiting_chunk_ticket',
       label: stage === 'waiting_chunk_ticket' ? waitLabel : 'Chunk windows ke liye wait',
     },
-    { key: 'chunk_scanning', label: 'Chunk windows scanning' },
+    { key: 'chunk_scanning', label: 'Chunk windows' },
     { key: 'done', label: 'Done' },
   ]
 

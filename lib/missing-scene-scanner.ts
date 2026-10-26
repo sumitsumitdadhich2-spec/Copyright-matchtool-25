@@ -127,11 +127,12 @@ async function runMissingSceneScanner(
   selectedScenes: Array<{ start: number; end: number; id?: string }>,
   windowIndices?: number[],
 ) {
-  const scan = getScan(scanId)
-  if (!scan) return
+  const loadedScan = getScan(scanId)
+  if (!loadedScan) return
+  const scan: Scan = loadedScan
 
   const mediaDir = scanMediaDir(scanId)
-  const chunksDir = path.join(mediaDir, 'chunks')
+  const chunksDir = path.join(mediaDir, 'clips')
   fs.mkdirSync(chunksDir, { recursive: true })
 
   const shortFile = localMediaPath(scanId, 'short')
@@ -279,8 +280,15 @@ async function runMissingSceneScanner(
         } else {
           state.progress = 'Preparing optimized movie copy for Gemini window scan...'
           saveScan(scan)
-          const prep = await preparePrescanMovieCopy(movieFile, mediaDir, trimStart, trimEnd)
-          movieCopyPath = prep.path
+          await preparePrescanMovieCopy(
+            movieFile,
+            movieCopyPath,
+            scan.movieDuration || trimEnd,
+            trimStart,
+            trimEnd,
+            () => {},
+            { scanId },
+          )
         }
       }
 
@@ -983,7 +991,7 @@ export function reviewMissingSceneCandidate(
       const mEnd = mStart + Math.max(1, hit.shortEnd - hit.shortStart)
       cand = {
         id: candidateId,
-        sceneId: hit.sceneId,
+        sceneId: hit.sceneId || `scene-${hit.movieMinute}`,
         shortStart: hit.shortStart,
         shortEnd: hit.shortEnd,
         movieMinute: hit.movieMinute,
@@ -1029,6 +1037,7 @@ export function reviewMissingSceneCandidate(
         status: 'confirmed',
         confirmedIndex: 0,
         confirmedViaRescan: false,
+        attempts: 0,
         origin: 'gap-backup',
         candidates: [
           {

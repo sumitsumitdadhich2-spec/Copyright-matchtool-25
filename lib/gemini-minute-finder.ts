@@ -319,7 +319,7 @@ export function startGeminiMinuteFinder(
   log(
     scanId,
     'info',
-    `Gemini Minute Finder ${mode === 'start' ? 'start' : mode} [Ticket #${alloc.ticket} · Slot ${alloc.keySlot} — Keys ${alloc.keyPair[0]} & ${alloc.keyPair[1]}]: movie copy → upload (per key) → 20-min windows @ 10fps/1fps (${CHUNK_MODEL_POOL.map((m) => m.id).join(' + ')}) → backup pass for missing parts (high fps) → minute list → chunk scan`,
+    `Gemini Minute Finder ${mode === 'start' ? 'start' : mode} [Ticket #${alloc.chunkTicket} · Slot ${alloc.keySlot} — Keys ${alloc.keyPair[0]} & ${alloc.keyPair[1]}]: movie copy → upload (per key) → 20-min windows @ 10fps/1fps (${CHUNK_MODEL_POOL.map((m) => m.id).join(' + ')}) → backup pass for missing parts (high fps) → minute list → chunk scan`,
   )
 
   void run(scanId, ctrl, userApiKeys, user)
@@ -680,15 +680,14 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
     saveScan(scan, { immediate: true })
   }
 
-  // The chunk scan needs the 1-minute movie chunks — wait for chunking to finish.
   await waitForChunking(id, ctrl)
   if (ctrl.stopping) return
 
   // GLOBAL CHUNK SCAN LOCK & ORDERED QUEUE:
-  // Har scan ka window scan aur backup window scan freely complete ho jata hai aur chunks cut ho jate hain.
-  // Lekin chunk scan phase shuru karne se pehle, global level par sirf 1 scan ka chunk scan chalta hai.
+  // Har scan ka window scan aur backup window scan freely complete ho jata hai.
+  // Lekin chunk windows scan phase shuru karne se pehle, global level par sirf 1 scan ka chunk scan chalta hai.
   // Har 1 second background me check karta rahega aur order (ticket) me lock karega.
-  log(id, 'info', 'All chunks cut & window scan complete. Checking global chunk scan lock before starting chunk scan...')
+  log(id, 'info', 'Window minute scan & backup scan complete. Checking global chunk scan lock before starting chunk windows scan...')
   const releaseChunkLock = await globalChunkScanCoordinator.acquireChunkScanLock({
     scanId: id,
     scanTitle: getScan(id)?.shortName || id,
@@ -1611,55 +1610,18 @@ function buildSuggestions(state: GeminiPrescanState, trimStart: number, trimEnd:
   return [...byMinute.values()].sort((a, b) => a.minute - b.minute)
 }
 
-/** The chunk scan needs movie chunks — wait for the background ffmpeg workers to finish cutting chunks/segments. */
-async function waitForChunking(id: string, ctrl: Ctrl): Promise<void> {
-  const deadline = Date.now() + CHUNKING_WAIT_MS
-  let lastLogTime = 0
-  let lastNotedPct = -1
-
-  while (Date.now() < deadline) {
-    if (ctrl.stopping) return
-    const s = getScan(id)
-    if (!s) throw new Error('Scan missing')
-    if (s.status === 'error') throw new Error(s.error || 'Chunking failed')
-
-    const chunkPct = s.chunkingProgress ?? 0
-    const segPct = s.shortSegmentingProgress ?? 100
-    const chunkingDone = s.status !== 'chunking' && chunkPct >= 100 && s.chunkCount > 0
-    const segmentingDone = segPct >= 100
-    const isStudio = s.chunkScanEngine !== 'api'
-
-    if (isStudio && segmentingDone && s.status !== 'chunking') {
-      log(id, 'success', `Short segments aur movie ready hain (Studio parallel window mode). Chunk windows scan start ho raha hai!`)
-      return
-    }
-
-    if (chunkingDone && segmentingDone) {
-      const chunksDir = path.join(scanMediaDir(id), 'chunks')
-      const chunksExist = fs.existsSync(chunksDir) && fs.readdirSync(chunksDir).some((f) => f.startsWith('chunk-') && f.endsWith('.mp4'))
-      if (chunksExist) {
-        log(id, 'success', `FFmpeg workers free — movie chunks (${s.chunkCount}) aur short segments ready hain. Chunk scan start ho raha hai!`)
-        return
-      }
-    }
-
-    const now = Date.now()
-    if (lastNotedPct === -1 || Math.abs(chunkPct - lastNotedPct) >= 10 || now - lastLogTime > 15_000) {
-      lastNotedPct = chunkPct
-      lastLogTime = now
-      log(
-        id,
-        'info',
-        `Minute finder done — chunk scan shuru karne ke liye ffmpeg workers free hone ka wait kar rahe hain (movie chunks: ${chunkPct}%, short: ${segPct}%). Workers har second check ho rahe hain...`,
-      )
-    }
-
-    persist(id, ctrl, {
-      progress: `Minutes ready — waiting for ffmpeg chunks to finish cutting (movie: ${chunkPct}%, short: ${segPct}%) — workers free hote hi scan start hoga...`,
-    })
-
-    // Strict requirement: Har second check hota rahe workers free hue ya nahi
-    await sleep(1000)
+export async function waitForChunking(id: string, ctrl: { stopping?: boolean }): Promise<void> {
+  if (ctrl.stopping) return
+  const s = getScan(id)
+  if (!s) throw new Error('Scan missing')
+  if (s.status === 'error') throw new Error(s.error || 'Scan error')
+  s.chunkScanEngine = 'studio'
+  s.verifierEnabled = false
+  s.chunkingProgress = 100
+  s.shortSegmentingProgress = 100
+  if (s.status === 'chunking' || s.status === 'created') {
+    s.status = 'ready'
   }
-  throw new Error('Movie chunking complete nahi hui timeout ke andar — chunking finish hone par Start dabao (minute ranges already apply ho chuke hain, scan sirf unhi par chalega)')
+  saveScan(s)
+  log(id, 'success', `Short aur movie ready hain (Studio parallel window mode). Chunk windows scan start ho raha hai!`)
 }

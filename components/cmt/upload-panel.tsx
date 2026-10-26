@@ -356,11 +356,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
             kind="movie"
             icon={<Clapperboard className="size-5" aria-hidden />}
             title="Movie"
-            subtitle={
-              scan?.chunkScanEngine === 'studio'
-                ? 'Compressed once to movie_360p.mp4 (<= 390 MB, local direct upload)'
-                : 'Any length — chunked into 1-min pieces'
-            }
+            subtitle="Per-window clips extracted on demand (Studio parallel window scan)"
             name={movieServer ? scan?.movieName : movieLocal?.name}
             duration={movieServer ? scan?.movieDuration : movieLocal?.duration}
             size={movieServer ? scan?.movieSize : movieLocal?.size}
@@ -430,36 +426,6 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
         </div>
       </div>
 
-      {chunking && (
-        <div className="mt-3">
-          <div className="flex items-center justify-between text-xs text-muted-foreground">
-            <span className="flex items-center gap-1.5">
-              <Loader2 className="size-3.5 animate-spin text-primary" aria-hidden />
-              {scan?.chunkScanEngine === 'studio'
-                ? 'Compressing movie_360p.mp4 (24fps CFR, <= 390 MB, local direct upload)...'
-                : `ffmpeg chunking movie into ${scan?.chunkCount} one-minute chunks...`}
-            </span>
-            <span className="font-mono">{scan?.chunkingProgress}%</span>
-          </div>
-          <div className="progress-track mt-1.5" role="progressbar" aria-valuenow={scan?.chunkingProgress}>
-            <div className="progress-fill" style={{ width: `${scan?.chunkingProgress || 0}%` }} />
-          </div>
-        </div>
-      )}
-      {scan?.shortSegmentingProgress !== undefined && scan.shortSegmentingProgress < 100 && (
-        <div className="mt-3">
-          <div className="flex items-center justify-between text-xs text-muted-foreground">
-            <span className="flex items-center gap-1.5">
-              <Loader2 className="size-3.5 animate-spin text-primary" aria-hidden />
-              ffmpeg cutting short into {scan?.shortSegments?.length ?? 1} one-minute scan segment(s) — original untouched...
-            </span>
-            <span className="font-mono">{scan.shortSegmentingProgress}%</span>
-          </div>
-          <div className="progress-track mt-1.5" role="progressbar" aria-valuenow={scan.shortSegmentingProgress}>
-            <div className="progress-fill" style={{ width: `${scan.shortSegmentingProgress}%` }} />
-          </div>
-        </div>
-      )}
       {visibleErrors.map((message) => <p key={message} role="alert" className="mt-2 text-xs text-destructive">{message}</p>)}
     </section>
   )

@@ -124,7 +124,7 @@ export function parseBatchVerifierResponse(
     const match = pRegex.exec(rawText)
     if (match) {
       const vText = match[1].toUpperCase()
-      const isConfirmed = (vText === 'CONFIRMED' || vText === 'SAME' || vText === 'MATCH') && vText !== 'MISMATCH' && !vText.includes('DIFF')
+      const isConfirmed = vText === 'CONFIRMED' || vText === 'SAME' || vText === 'MATCH'
       const existing = partsMap.get(p.partIndex)!
       partsMap.set(p.partIndex, {
         ...existing,
@@ -191,7 +191,7 @@ export async function verifySingleMinute(
   minuteIndex: number,
   token?: CancelToken,
 ): Promise<BatchMinuteResult> {
-  const scan = (getScan(scanId) || await getFreshScan(scanId))
+  const scan = getScan(scanId)
   if (!scan) throw new Error(`Scan ${scanId} not found`)
 
   const state = getOrCreateBatchVerifyState(scan)
@@ -265,7 +265,7 @@ export async function verifySingleMinute(
     let chosenModel = ''
 
     while (attempts < maxAttempts) {
-      if (token?.isCancelled()) throw new Error('Verification cancelled')
+      if (token?.cancelled) throw new Error('Verification cancelled')
       attempts++
 
       let releaseLane: ((dur?: number) => void) | null = null
@@ -281,7 +281,7 @@ export async function verifySingleMinute(
           scanTitle: scan.shortName || scanId,
           operation: `Batch Verify Min ${minuteIndex + 1}`,
           videoSeconds: Math.ceil(stitched.totalDurationSec),
-          isStopping: () => token?.isCancelled() || false,
+          isStopping: () => Boolean(token?.cancelled),
           onWait: (msg) => logScan(scanId, 'info', msg),
         })
 
@@ -452,7 +452,7 @@ export async function verifySingleMinute(
         const effectiveConfirmed = isConfirmed || preserveUserChoice
 
         match.batchVerified = effectiveConfirmed ? 'confirmed' : 'rejected'
-        match.batchVerdict = effectiveConfirmed ? 'CONFIRMED' : p.verdict
+        match.batchVerdict = effectiveConfirmed ? 'CONFIRMED' : 'REJECTED'
         match.batchReason =
           preserveUserChoice && !isConfirmed
             ? `User verified selection preserved (${match.reason || 'User review'})`
@@ -689,7 +689,7 @@ export async function startBatchVerificationAll(scanId: string): Promise<void> {
     activeCancelTokens.delete(scanId)
   }
 
-  const scan = (await getFreshScan(scanId)) || getScan(scanId)
+  const scan = getScan(scanId)
   if (!scan) throw new Error(`Scan ${scanId} not found`)
 
   const totalDuration = scan.shortDuration || 60
@@ -715,8 +715,8 @@ export async function startBatchVerificationAll(scanId: string): Promise<void> {
   void (async () => {
     try {
       for (let minIdx = 0; minIdx < minuteCount; minIdx++) {
-        if (token.isCancelled()) break
-        const currentScan = (await getFreshScan(scanId)) || getScan(scanId)
+        if (token.cancelled) break
+        const currentScan = getScan(scanId)
         if (currentScan && currentScan.batchVerify) {
           currentScan.batchVerify.progress = `Verifying Minute ${minIdx + 1} of ${minuteCount}...`
           saveScan(currentScan)
@@ -737,11 +737,11 @@ export async function startBatchVerificationAll(scanId: string): Promise<void> {
       }
     } finally {
       activeCancelTokens.delete(scanId)
-      const latestScan = (await getFreshScan(scanId)) || getScan(scanId)
+      const latestScan = getScan(scanId)
       if (latestScan && latestScan.batchVerify) {
-        latestScan.batchVerify.status = token.isCancelled() ? 'stopped' : 'done'
+        latestScan.batchVerify.status = token.cancelled ? 'stopped' : 'done'
         latestScan.batchVerify.finishedAt = Date.now()
-        latestScan.batchVerify.progress = token.isCancelled()
+        latestScan.batchVerify.progress = token.cancelled
           ? 'Batch verification stopped.'
           : `All ${minuteCount} minute(s) verification completed.`
         saveScan(latestScan)

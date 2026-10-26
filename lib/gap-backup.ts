@@ -10,6 +10,7 @@ import { deleteFileQuiet, cleanupOrphanedGeminiFiles, getClient, parseGapFinderO
 import { COVERAGE_MIN_GAP_SEC, coverageFromRanges, gapsOf, mergeRanges, shortTotalOf } from './short-coverage'
 import { scheduler } from './scheduler'
 import { sameShortSegment, applyGroupMatches } from './candidate-pick'
+import { selectScanKeyPairWithFallback } from './chunk-scan-coordinator'
 import { invalidateRenderedOutput } from './render'
 import type { GapBackupCandidate, GapBackupMinute, GapBackupPart, GapBackupRequest, GapBackupState, Scan, ShortRange } from './types'
 
@@ -169,10 +170,12 @@ function clipSpecs(parts: GapBackupPart[]): GapFinderPartSpec[] {
 }
 
 async function ensureChunk(scan: Scan, movieFile: string, index: number) {
-  const chunksDir = path.join(scanMediaDir(scan.id), 'chunks')
-  const file = chunkPath(chunksDir, index)
+  const legacyFile = chunkPath(path.join(scanMediaDir(scan.id), 'chunks'), index)
+  if (fs.existsSync(legacyFile)) return legacyFile
+  const clipsDir = path.join(scanMediaDir(scan.id), 'clips')
+  const file = chunkPath(clipsDir, index)
   if (fs.existsSync(file)) return file
-  fs.mkdirSync(chunksDir, { recursive: true })
+  fs.mkdirSync(clipsDir, { recursive: true })
   const start = (scan.movieTrimStart ?? 0) + index * 60
   const end = Math.min(scan.movieTrimEnd ?? scan.movieDuration ?? start + 60, start + 60)
   await extractClipPrecise(movieFile, start, end, file)
@@ -582,6 +585,7 @@ export function reviewGapCandidate(scan: Scan, candidateId: string, decision: 'a
         status: 'confirmed',
         confirmedIndex: 0,
         confirmedViaRescan: false,
+        attempts: 0,
         origin: 'gap-backup',
         candidates: [
           {
@@ -627,7 +631,8 @@ export function reviewGapCandidate(scan: Scan, candidateId: string, decision: 'a
       g.userPick = { index: candIdx, viaRescan: false, at: Date.now() }
     }
 
-    applyGroupMatches(scan, g)
+    const group = g!
+    applyGroupMatches(scan, group)
     state.addedMatches = scan.matches.filter((item) => item.origin === 'gap-backup')
     const part = state.parts.find((item) => item.index === candidate.part)
     if (part) part.result = 'accepted'

@@ -366,7 +366,7 @@ async function runRenderPipeline(
         height: h,
         fps: settings.fps,
         channels: 2,
-        preset: 'fast',
+        preset: 'veryfast',
         final: { videoKbps: settings.videoBitrateKbps, audioKbps: settings.audioBitrateKbps },
         token,
         label: `render ${scanId.slice(0, 6)}`,

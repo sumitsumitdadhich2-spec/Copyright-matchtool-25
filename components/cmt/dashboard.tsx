@@ -36,7 +36,6 @@ import { MinuteSelectPanel } from './minute-select-panel'
 import { ScanTimeline } from './scan-timeline'
 import { VerifierTimeline } from './verifier-timeline'
 import { ModelBoard } from './model-board'
-import { OrchestratorMatrixPanel } from './orchestrator-matrix-panel'
 import { ChunkResultsPanel } from './chunk-results-panel'
 import { CandidatesPanel } from './candidates-panel'
 import { LogsPanel } from './logs-panel'
@@ -110,8 +109,8 @@ export function Dashboard() {
       ).length
     : 0
 
-  const isStudioEngine = scan ? scan.chunkScanEngine !== 'api' : true
-  const hasUnverifiedWork = Boolean(scan && !isStudioEngine && (unverifiedGroupCount > 0 || unverifiedMatchCount > 0))
+  const isStudioEngine = true
+  const hasUnverifiedWork = false
 
   // Segments-aware: only selected segments with pending/scanning chunks count as resumable work.
   // Cancelled chunks are intentionally skipped (prefiltered / out-of-range / early-stopped) and must not keep Resume enabled.
@@ -512,7 +511,7 @@ export function Dashboard() {
         </div>
       )}
 
-      {scan && (status === 'completed' || status === 'done') && (
+      {scan && ((status as string) === 'completed' || status === 'done') && (
         <div
           className={`flex flex-wrap items-center justify-between gap-3 rounded-xl border p-3.5 shadow-md ${
             hasUnverifiedWork
@@ -601,7 +600,6 @@ export function Dashboard() {
             <ScanTimeline scan={scan || emptyScan()} />
             <VerifierTimeline scan={scan || emptyScan()} />
             <StudioLivePanel scan={scan} />
-            <OrchestratorMatrixPanel />
             <ModelBoard scan={scan} usage={data?.usage || null} />
             {scan && <CandidatesPanel scan={scan} />}
             {scan && scan.report && <ReportPanel scan={scan} />}

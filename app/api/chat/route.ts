@@ -277,7 +277,7 @@ export async function POST(req: NextRequest) {
       try {
         const uploadResult = await aiClient.files.upload({
           file: uploadFilePath,
-          mimeType: 'video/mp4',
+          config: { mimeType: 'video/mp4' },
         })
 
         uploadedGeminiFileName = uploadResult.name || null

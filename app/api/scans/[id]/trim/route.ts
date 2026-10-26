@@ -1,26 +1,22 @@
 import { NextResponse } from 'next/server'
-import path from 'node:path'
-import { getScan, saveScan, addLog, scanMediaDir } from '@/lib/store'
-import { chunkMovie } from '@/lib/ffmpeg'
+import { getScan, saveScan, addLog } from '@/lib/store'
 import { CHUNK_SECONDS } from '@/lib/models'
 import { getSession } from '@/lib/users'
 import { pipelineReady } from '@/lib/merge-pipeline'
 import { dispatchMinuteFinder } from '@/lib/minute-finder-dispatch'
 import { isMinuteFinderRunning, stopAndWaitMinuteFinder } from '@/lib/gemini-minute-finder'
-import { findAndReuseMovieChunks, prepareStudioMovie360pAndDrive } from '@/lib/media'
 import { loadStudioUserConfig } from '@/lib/studio-settings'
 
 export const runtime = 'nodejs'
 
-/** Confirm the movie trim window (or the full movie) and start chunking.
- *  Chunks cover ONLY the confirmed range; all reported movie timestamps stay
- *  ABSOLUTE to the ORIGINAL movie (the scheduler adds the trim offset). */
+/** Confirm the movie trim window (or the full movie).
+ *  Logical 1-minute slots cover ONLY the confirmed range; all reported movie
+ *  timestamps stay ABSOLUTE to the ORIGINAL movie (the scheduler adds the trim offset). */
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params
   const scan = getScan(id)
   if (!scan) return NextResponse.json({ error: 'Scan not found' }, { status: 404 })
   if (!scan.movieDuration) return NextResponse.json({ error: 'Upload a movie first' }, { status: 400 })
-  if (scan.status === 'chunking') return NextResponse.json({ error: 'Chunking already in progress' }, { status: 409 })
   if (scan.status === 'scanning' || scan.status === 'verifying') {
     return NextResponse.json({ error: 'Cannot change the trim while a scan is running' }, { status: 409 })
   }
@@ -43,12 +39,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
   const session = await getSession()
   const owner = session?.username || scan.ownerUsername || 'admin'
-  const studioCfg = await loadStudioUserConfig(owner)
-  const engine = scan.chunkScanEngine || studioCfg.chunkScanEngine || 'studio'
-  scan.chunkScanEngine = engine
-  if (engine === 'studio') {
-    scan.verifierEnabled = false
-  }
+  await loadStudioUserConfig(owner)
+  scan.chunkScanEngine = 'studio'
+  scan.verifierEnabled = false
 
   const rangeDur = end - start
   const count = Math.ceil(rangeDur / CHUNK_SECONDS)
@@ -63,16 +56,12 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   }
   scan.matches = []
   scan.candidateGroups = []
-  scan.status = engine === 'studio' ? 'ready' : 'chunking'
-  scan.chunkingProgress = engine === 'studio' ? 100 : 0
+  scan.status = 'ready'
+  scan.chunkingProgress = 100
   addLog(
     scan,
     'info',
-    engine === 'studio'
-      ? `Trim confirmed (${isFull ? `FULL movie ${fmtDur(dur)}` : `${fmtDur(start)} → ${fmtDur(end)}`}) — Gemini Studio parallel window mode (${count} logical 1-min slots)`
-      : isFull
-        ? `Trim confirmed: FULL movie (${fmtDur(dur)}) — cutting into ${count} one-minute chunks`
-        : `Trim confirmed: ${fmtDur(start)} → ${fmtDur(end)} (${fmtDur(rangeDur)}) — cutting ONLY this range into ${count} chunk(s); reported movie timestamps stay absolute to the original`,
+    `Trim confirmed (${isFull ? `FULL movie ${fmtDur(dur)}` : `${fmtDur(start)} → ${fmtDur(end)}`}) — Gemini Studio parallel window mode (${count} logical 1-min slots)`,
   )
   saveScan(scan)
 
@@ -87,75 +76,6 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     }
   } catch (err) {
     console.error('[trim] minute finder auto-trigger failed:', err instanceof Error ? err.message : err)
-  }
-
-  const mediaDir = scanMediaDir(id)
-  const dest = path.join(mediaDir, 'movie.mp4')
-
-  if (engine === 'studio') {
-    // Per-window clips are extracted on demand by StudioParallelManager
-  } else {
-    // Chunk in the background; the client polls chunkingProgress.
-    void (async () => {
-      try {
-        // Check if this movie's chunks were already cut in an earlier scan
-        const reused = await findAndReuseMovieChunks(
-          id,
-          scan.movieName || '',
-          scan.movieSize || 0,
-          isFull ? 0 : start,
-          isFull ? dur : end,
-          count,
-        )
-        if (reused.ok) {
-          const s = getScan(id)
-          if (s) {
-            s.chunkCount = reused.count
-            s.chunks = Array.from({ length: reused.count }, (_, i) => ({ index: i, status: 'pending' as const, attempts: 0 }))
-            s.status = 'ready'
-            s.chunkingProgress = 100
-            addLog(s, 'success', `Movie chunks pehle se cut hain (scan ${reused.sourceId}) — ${reused.count} chunks turant reuse ho gaye (no re-cut)`)
-            saveScan(s)
-          }
-          return
-        }
-
-        const actual = await chunkMovie(
-          dest,
-          path.join(mediaDir, 'chunks'),
-          dur,
-          (pct) => {
-            const s = getScan(id)
-            if (s) {
-              s.chunkingProgress = pct
-              saveScan(s)
-            }
-          },
-          isFull ? 0 : start,
-          isFull ? undefined : end,
-          { owner: id },
-        )
-        const s = getScan(id)
-        if (s) {
-          if (actual !== s.chunkCount) {
-            s.chunkCount = actual
-            s.chunks = Array.from({ length: actual }, (_, i) => ({ index: i, status: 'pending' as const, attempts: 0 }))
-          }
-          s.status = 'ready'
-          s.chunkingProgress = 100
-          addLog(s, 'success', `Chunking complete: ${actual} chunk(s) ready`)
-          saveScan(s)
-        }
-      } catch (err) {
-        const s = getScan(id)
-        if (s) {
-          s.status = 'error'
-          s.error = `Chunking failed: ${err instanceof Error ? err.message : String(err)}`
-          addLog(s, 'error', s.error)
-          saveScan(s)
-        }
-      }
-    })()
   }
 
   return NextResponse.json({ ok: true, chunkCount: count, trimStart: scan.movieTrimStart ?? 0, trimEnd: scan.movieTrimEnd ?? dur })

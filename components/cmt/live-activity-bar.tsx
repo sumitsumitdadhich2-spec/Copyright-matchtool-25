@@ -58,8 +58,7 @@ export function LiveActivityBar({ scan, onScrollToLogs }: LiveActivityBarProps) 
         Date.now() - l.t < 35000,
     )
 
-    // 4. Scanning / Chunking active check
-    const isChunking = scan.status === 'chunking'
+    // 4. Scanning active check
     const isScanning = scan.status === 'scanning' || scan.status === 'verifying'
 
     // Determine current priority state
@@ -104,21 +103,6 @@ export function LiveActivityBar({ scan, onScrollToLogs }: LiveActivityBarProps) 
         progress: 50,
         progressLabel: 'AI Rescan in progress...',
         icon: Zap,
-        isLive: true,
-      }
-    }
-
-    if (isChunking) {
-      const pct = scan.chunkingProgress ?? 0
-      return {
-        type: 'chunking' as const,
-        badge: '✂️ Video Splitting',
-        badgeColor: 'border-blue-500/40 bg-blue-500/15 text-blue-400',
-        title: 'Abhi ye chal raha hai: Movie 1-Minute Chunking',
-        description: 'Movie ko 1-1 minute ke chunks me lossless split kiya ja raha hai taaki parallel AI scanning shuru ho sake.',
-        progress: pct,
-        progressLabel: `${pct}% Split complete`,
-        icon: Scissors,
         isLive: true,
       }
     }

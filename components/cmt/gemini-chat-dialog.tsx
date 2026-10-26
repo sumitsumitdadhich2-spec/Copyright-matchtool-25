@@ -835,12 +835,8 @@ function ChatPaneComponent({
                       <button
                         type="button"
                         onClick={() => {
-                          const last = lastRequestRefs.current[pane.id]
-                          if (last) {
-                            void onSend(last.prompt, last.video)
-                          } else {
-                            void onSend(pane.messages[pane.messages.length - 2]?.content)
-                          }
+                          const prevUserMsg = [...pane.messages].reverse().find((m) => m.role === 'user')
+                          void onSend(prevUserMsg?.content, pane.attachedVideo)
                         }}
                         className="flex items-center gap-1 rounded bg-red-600 px-2.5 py-1 text-xs font-semibold text-white hover:bg-red-500 transition-colors shadow"
                       >

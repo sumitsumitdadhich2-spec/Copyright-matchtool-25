@@ -104,7 +104,7 @@ export function VerifierTimeline({ scan }: { scan: Scan }) {
           let st: VerifierItem['status'] = 'pending'
           if (p.verdict === 'CONFIRMED') st = 'confirmed'
           else if (p.verdict === 'REJECTED') st = 'rejected'
-          else if (p.verdict === 'UNVERIFIED') st = 'unverified'
+          else if ((p.verdict as string) === 'UNVERIFIED') st = 'unverified'
           else if (bRes.status === 'verifying' || bRes.status === 'preparing') st = 'verifying'
 
           items.push({
@@ -128,7 +128,7 @@ export function VerifierTimeline({ scan }: { scan: Scan }) {
         // 2. Derive from CandidateGroups
         const minGroups = candidateGroups.filter((g) => g.shortStart < minEnd && g.shortEnd > minStart)
         minGroups.forEach((g, idx) => {
-          const winCand = g.candidates?.[g.winnerCandidateIndex ?? g.confirmedCandidateIndex ?? 0] || g.candidates?.[0]
+          const winCand = g.candidates?.[g.userPick?.index ?? g.confirmedIndex ?? 0] || g.candidates?.[0]
           let st: VerifierItem['status'] = 'pending'
           if (g.status === 'confirmed') st = 'confirmed'
           else if (g.status === 'rejected') st = 'rejected'

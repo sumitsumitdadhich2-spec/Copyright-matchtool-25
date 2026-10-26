@@ -46,7 +46,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     const res = scheduler.applyUserPick(
       id,
       body.groupId || '',
-      body.candidateIndex === null ? null : body.candidateIndex,
+      body.candidateIndex ?? null,
       body.viaRescan === true,
       body,
     )
@@ -70,6 +70,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
         status: 'confirmed',
         confirmedIndex: 0,
         confirmedViaRescan: false,
+        attempts: 0,
         candidates: [
           {
             shortStart: body.shortStart,
@@ -89,24 +90,26 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     }
   }
 
+  const group = g!
+
   if (body.candidateIndex === null) {
-    delete g.userPick
-    applyGroupMatches(scan, g)
-    addLog(scan, 'info', `User choice cleared for short ${fmtTime(g.shortStart)}–${fmtTime(g.shortEnd)} — AI verdict (${g.status}) restored`)
+    delete group.userPick
+    applyGroupMatches(scan, group)
+    addLog(scan, 'info', `User choice cleared for short ${fmtTime(group.shortStart)}–${fmtTime(group.shortEnd)} — AI verdict (${group.status}) restored`)
   } else {
     let idx = Number(body.candidateIndex)
-    if (idx < 0 || idx >= g.candidates.length) {
+    if (idx < 0 || idx >= group.candidates.length) {
       if (body.movieStart != null && body.movieEnd != null) {
-        const found = g.candidates.findIndex(
+        const found = group.candidates.findIndex(
           (c) => Math.abs(c.movieStart - body.movieStart!) < 0.5 && Math.abs(c.movieEnd - body.movieEnd!) < 0.5,
         )
         if (found >= 0) {
           idx = found
         } else {
-          idx = g.candidates.length
-          g.candidates.push({
-            shortStart: body.shortStart ?? g.shortStart,
-            shortEnd: body.shortEnd ?? g.shortEnd,
+          idx = group.candidates.length
+          group.candidates.push({
+            shortStart: body.shortStart ?? group.shortStart,
+            shortEnd: body.shortEnd ?? group.shortEnd,
             movieStart: body.movieStart,
             movieEnd: body.movieEnd,
             chunkIndex: body.chunkIndex ?? 0,
@@ -119,19 +122,19 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
         return NextResponse.json({ error: 'Invalid candidate index' }, { status: 400 })
       }
     }
-    const c = g.candidates[idx]
+    const c = group.candidates[idx]
     const viaRescan = body.viaRescan === true
     if (viaRescan && (c.rescanMovieStart == null || c.rescanMovieEnd == null)) {
       return NextResponse.json({ error: 'This candidate has no rescan window' }, { status: 400 })
     }
-    g.userPick = { index: idx, viaRescan, at: Date.now() }
-    applyGroupMatches(scan, g)
+    group.userPick = { index: idx, viaRescan, at: Date.now() }
+    applyGroupMatches(scan, group)
     const ms = viaRescan ? c.rescanMovieStart! : c.movieStart
     const me = viaRescan ? c.rescanMovieEnd! : c.movieEnd
     addLog(
       scan,
       'success',
-      `USER CHOICE: short ${fmtTime(g.shortStart)}–${fmtTime(g.shortEnd)} → movie ${fmtTime(ms)}–${fmtTime(me)} (candidate #${idx + 1}${viaRescan ? ', rescan window' : ''}, chunk ${c.chunkIndex}) set as MAIN clip — AI verdict was ${g.status}. Preview + export input updated.`,
+      `USER CHOICE: short ${fmtTime(group.shortStart)}–${fmtTime(group.shortEnd)} → movie ${fmtTime(ms)}–${fmtTime(me)} (candidate #${idx + 1}${viaRescan ? ', rescan window' : ''}, chunk ${c.chunkIndex}) set as MAIN clip — AI verdict was ${group.status}. Preview + export input updated.`,
     )
   }
 

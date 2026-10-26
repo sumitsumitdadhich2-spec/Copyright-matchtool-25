@@ -15,7 +15,7 @@ import {
   Check,
   Eye,
 } from 'lucide-react'
-import type { MissingSceneScanState, MissingSceneTarget, Scan } from '@/lib/types'
+import type { MissingSceneCandidate, MissingSceneScanState, MissingSceneTarget, Scan } from '@/lib/types'
 import { fetcher, fmtTime } from '@/lib/format'
 import { CandidateSideBySide } from './candidate-side-by-side'
 
@@ -91,7 +91,7 @@ export function MissingScenePanel({ scan }: { scan: Scan }) {
       )
       return {
         id,
-        sceneId: hit.sceneId,
+        sceneId: hit.sceneId || `scene-${hit.movieMinute}`,
         shortStart: hit.shortStart,
         shortEnd: hit.shortEnd,
         movieMinute: hit.movieMinute,

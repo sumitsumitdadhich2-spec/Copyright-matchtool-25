@@ -252,7 +252,6 @@ interface PersistedParallelState {
   hasStartedRun?: boolean
   mediaInfo?: ParallelMediaVerificationInfo | null
   shortLocalPath: string | null
-  shortYoutubeUrl: string | null
   shortDriveFileName: string | null
   shortDurationSec: number
   movieLocalPath: string | null
@@ -877,7 +876,6 @@ export class StudioParallelManager {
   private startedAt: number | null = null
   private finishedAt: number | null = null
   private shortLocalPath: string | null = null
-  private shortYoutubeUrl: string | null = null
   private shortDriveFileName: string | null = null
   private shortDurationSec: number = 150
   private movieLocalPath: string | null = null
@@ -1148,7 +1146,6 @@ export class StudioParallelManager {
         this.shortLocalPath = this.isPathStrictlyInsideThisScanMediaDir(raw.shortLocalPath)
           ? (raw.shortLocalPath ?? null)
           : null
-        this.shortYoutubeUrl = raw.shortYoutubeUrl ?? null
         this.shortDriveFileName = raw.shortDriveFileName ?? null
         this.shortDurationSec = raw.shortDurationSec || 150
         this.movieLocalPath =
@@ -1431,7 +1428,6 @@ export class StudioParallelManager {
         hasStartedRun: this.hasStartedRun,
         mediaInfo: this.mediaInfo,
         shortLocalPath: this.shortLocalPath,
-        shortYoutubeUrl: this.shortYoutubeUrl,
         shortDriveFileName: this.shortDriveFileName,
         shortDurationSec: this.shortDurationSec,
         movieLocalPath: this.movieLocalPath,
@@ -1744,7 +1740,6 @@ export class StudioParallelManager {
     minuteInputSource?: 'auto' | 'manual'
     concurrency?: number
     shortLocalPath?: string | null
-    shortYoutubeUrl?: string | null
     shortDriveFileName?: string | null
     shortDurationSec?: number
     movieLocalPath?: string | null
@@ -1996,6 +1991,11 @@ export class StudioParallelManager {
             this.clipsReady = Math.min(this.clipsTotal, this.clipsReady + 1)
             if (this.clipsReady >= this.clipsTotal) {
               this.clipsExtracting = false
+              const sAfterClips = getScan(this.scanId)
+              if (sAfterClips && sAfterClips.pipelineStage === 'clips_extract') {
+                sAfterClips.pipelineStage = 'chunk_scanning'
+                saveScan(sAfterClips)
+              }
             }
             const winRange = `${w.startFormatted}–${w.endFormatted}`
             this.appendCombinedLog({
@@ -2028,7 +2028,6 @@ export class StudioParallelManager {
       const finalizeMediaAndLaunchWorkers = (verifiedMedia: ParallelMediaVerificationInfo) => {
         this.mediaInfo = verifiedMedia
         this.shortLocalPath = verifiedMedia.shortPath
-        this.shortYoutubeUrl = null
         this.shortDriveFileName = null
         if (verifiedMedia.shortDurationSec && verifiedMedia.shortDurationSec > 0) {
           this.shortDurationSec = verifiedMedia.shortDurationSec
@@ -2091,6 +2090,13 @@ export class StudioParallelManager {
           this.clipsReady = 0
           this.clipsTotal = orderedWindows.length
           this.clipsExtracting = orderedWindows.length > 0
+          if (orderedWindows.length > 0) {
+            const sClipStart = getScan(this.scanId)
+            if (sClipStart && sClipStart.status !== 'done') {
+              sClipStart.pipelineStage = 'clips_extract'
+              saveScan(sClipStart)
+            }
+          }
           for (const w of orderedWindows) {
             startWindowClipExtractionForWindow(w)
           }
@@ -3036,7 +3042,6 @@ export class StudioParallelManager {
         maxOutputTokens: cfg.studioMaxOutputTokens || 65536,
         maxInputTokens: cfg.studioMaxInputTokens,
         pageRecycleInterval: cfg.studioPageRecycleInterval || 5,
-        shortYoutubeUrl: null,
         shortDriveFileName: null,
         shortLocalPath: this.shortLocalPath,
         shortStartSec: 0,
