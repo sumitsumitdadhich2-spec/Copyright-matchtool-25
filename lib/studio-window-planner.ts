@@ -434,6 +434,21 @@ export function formatParallelTimecode(seconds: number): string {
 }
 
 /**
+ * Format a [startSec, endSec] range as "M:SS to M:SS", guaranteeing that a valid segment
+ * with endSec >= startSec never formats with identical start and end ("0:01 to 0:01").
+ */
+export function formatParallelRange(startSec: number, endSec: number): string {
+  const sRound = Math.max(0, Math.round(startSec))
+  let eRound = Math.max(sRound, Math.round(endSec))
+  if (eRound === sRound) {
+    const sFloor = Math.max(0, Math.floor(startSec))
+    const eCeil = Math.max(sFloor + 1, Math.ceil(endSec))
+    return `${formatParallelTimecode(sFloor)} to ${formatParallelTimecode(eCeil)}`
+  }
+  return `${formatParallelTimecode(sRound)} to ${formatParallelTimecode(eRound)}`
+}
+
+/**
  * Parse a timecode string ("7:00", "29:15", "1:03:00") into seconds.
  */
 export function parseParallelTimecodeToSeconds(tc: string): number | null {
@@ -766,10 +781,11 @@ export function extractHissa1And2EntriesFromResponse(rawText: string): {
     if (m) {
       const sStart = parseParallelTimecodeToSeconds(m[1])
       const sEnd = parseParallelTimecodeToSeconds(m[2])
-      if (sStart !== null && sEnd !== null && sEnd > sStart) {
+      if (sStart !== null && sEnd !== null && sEnd >= sStart) {
+        const effectiveShortEnd = sEnd > sStart ? sEnd : sStart + 1
         hissa1Entries.push({
           shortStartSec: sStart,
-          shortEndSec: sEnd,
+          shortEndSec: effectiveShortEnd,
           description: m[3].trim(),
         })
       }
@@ -789,35 +805,46 @@ export function extractHissa1And2EntriesFromResponse(rawText: string): {
     if (!line || /HISSA\s*2/i.test(line)) continue
 
     const foundMatch = line.match(
-      /^(?:\d+[.)]\s*)?(?:Short[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*\([^)]*\))?\s*(?:=|-->|->|→)\s*(?:Movie[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*\([^)]*\))?\s*$/i,
+      /^(?:\d+[.)]\s*)?(?:Short[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*\([^)]*\))?\s*(?:=|-->|->|—>|=>|→)\s*(?:Movie[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*(?:\([^)]*\)|\[[^\]]*\]))*\s*$/i,
     )
     if (foundMatch) {
       const sStart = parseParallelTimecodeToSeconds(foundMatch[1])
       const sEnd = parseParallelTimecodeToSeconds(foundMatch[2])
       const mStart = parseParallelTimecodeToSeconds(foundMatch[3])
       const mEnd = parseParallelTimecodeToSeconds(foundMatch[4])
-      if (sStart !== null && sEnd !== null && mStart !== null && mEnd !== null) {
+      if (
+        sStart !== null &&
+        sEnd !== null &&
+        mStart !== null &&
+        mEnd !== null &&
+        sEnd >= sStart &&
+        mEnd >= mStart
+      ) {
+        const effectiveShortEnd = sEnd > sStart ? sEnd : sStart + 1
+        const effectiveMovieEnd =
+          mEnd > mStart ? mEnd : mStart + Math.max(1, effectiveShortEnd - sStart)
         hissa2Entries.push({
           shortStartSec: sStart,
-          shortEndSec: sEnd,
+          shortEndSec: effectiveShortEnd,
           found: true,
           movieStartSec: mStart,
-          movieEndSec: mEnd,
+          movieEndSec: effectiveMovieEnd,
         })
       }
       continue
     }
 
     const nfMatch = line.match(
-      /^(?:\d+[.)]\s*)?(?:Short[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*\([^)]*\))?\s*(?:=|-->|->|→)\s*(?:NOT[_\s-]*FOUND|NONE|N\/A|NULL|NO[_\s-]*MATCH|NAHI[_\s-]*MILA)\b/i,
+      /^(?:\d+[.)]\s*)?(?:Short[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*\([^)]*\))?\s*(?:=|-->|->|—>|=>|→|:|-|–|—)?\s*(?:NOT[_\s-]*FOUND|NONE|N\/A|NULL|NO[_\s-]*MATCH|NAHI[_\s-]*MILA)\b/i,
     )
     if (nfMatch) {
       const sStart = parseParallelTimecodeToSeconds(nfMatch[1])
       const sEnd = parseParallelTimecodeToSeconds(nfMatch[2])
-      if (sStart !== null && sEnd !== null) {
+      if (sStart !== null && sEnd !== null && sEnd >= sStart) {
+        const effectiveShortEnd = sEnd > sStart ? sEnd : sStart + 1
         hissa2Entries.push({
           shortStartSec: sStart,
-          shortEndSec: sEnd,
+          shortEndSec: effectiveShortEnd,
           found: false,
           movieStartSec: null,
           movieEndSec: null,
@@ -834,13 +861,57 @@ export function extractHissa1And2EntriesFromResponse(rawText: string): {
 
 const SEAM_TOL = 1.5
 
+function findBestHissa1Description(
+  hissa1Entries: Array<{ shortStartSec: number; shortEndSec: number; description: string }>,
+  shortStartSec: number,
+  shortEndSec: number,
+): string {
+  let bestDesc = ''
+  let bestDist = Infinity
+  for (const h1 of hissa1Entries) {
+    if (!h1.description || h1.description === 'Scene segment') continue
+    const dist =
+      Math.abs(h1.shortStartSec - shortStartSec) + Math.abs(h1.shortEndSec - shortEndSec)
+    if (dist < bestDist && dist <= 1.2) {
+      bestDist = dist
+      bestDesc = h1.description
+    }
+  }
+  if (bestDesc) return bestDesc
+  for (const h1 of hissa1Entries) {
+    const dist =
+      Math.abs(h1.shortStartSec - shortStartSec) + Math.abs(h1.shortEndSec - shortEndSec)
+    if (dist <= 0.5 && h1.description) return h1.description
+  }
+  return ''
+}
+
+function computeCoveredFraction(
+  startSec: number,
+  endSec: number,
+  coveredRanges: Array<{ start: number; end: number }>,
+): number {
+  const dur = endSec - startSec
+  if (dur <= 0) return 1
+  let covered = 0
+  for (const r of coveredRanges) {
+    if (r.end <= startSec) continue
+    if (r.start >= endSec) break
+    const oStart = Math.max(startSec, r.start)
+    const oEnd = Math.min(endSec, r.end)
+    if (oEnd > oStart) covered += oEnd - oStart
+  }
+  return Math.min(1, covered / dur)
+}
+
 /**
  * Merge results from all completed parallel windows:
- * 1. Build canonical short segments list from HISSA 1 / HISSA 2 across completed windows.
+ * 1. Build canonical short segments list from HISSA 1 / HISSA 2 across completed windows without integer-rounding key collisions.
  * 2. Seam stitch candidates that straddle contiguous window boundaries (windowA.endSec === windowB.startSec) within SEAM_TOL = 1.5s.
  * 3. Deduplicate seam overlaps (if two windows report the same movie range within ±6s, merge as 1 match).
- * 4. Flag CONFLICT if two windows report genuinely different movie ranges (>6s apart) for the same short segment.
- * 5. Produce clean TXT and JSON reports.
+ * 4. Resolve CONFLICT segments using temporal continuity with adjacent FOUND segments when one candidate clearly continues the surrounding movie scene.
+ * 5. Filter out redundant NOT FOUND rows from non-matching windows when those short ranges are already covered by FOUND matches in other windows.
+ * 6. Produce clean TXT and JSON reports.
  */
 export function mergeParallelWindowResults(params: {
   windows: Array<{
@@ -867,22 +938,30 @@ export function mergeParallelWindowResults(params: {
     })
   })
 
-  const segmentMap = new Map<
-    string,
-    {
-      shortStartSec: number
-      shortEndSec: number
-      descriptions: string[]
-      candidates: Array<{
-        windowId: string
-        windowRange: string
-        movieStartSec: number
-        movieEndSec: number
-        movieRange: string
-        description: string
-      }>
-    }
-  >()
+  type RawCandidate = {
+    windowId: string
+    windowRange: string
+    shortStartSec: number
+    shortEndSec: number
+    movieStartSec: number
+    movieEndSec: number
+    movieRange: string
+    description: string
+  }
+
+  type SegmentBucket = {
+    shortStartSec: number
+    shortEndSec: number
+    descriptions: string[]
+    candidates: RawCandidate[]
+  }
+
+  const foundBuckets: SegmentBucket[] = []
+  const rawNotFoundEntries: Array<{
+    shortStartSec: number
+    shortEndSec: number
+    description: string
+  }> = []
 
   let completedWindows = 0
   let failedWindows = 0
@@ -896,70 +975,120 @@ export function mergeParallelWindowResults(params: {
     if (!w.rawResponseText) continue
     const { hissa1Entries, hissa2Entries } = extractHissa1And2EntriesFromResponse(w.rawResponseText)
 
-    const descByKey = new Map<string, string>()
-    for (const h1 of hissa1Entries) {
-      const key = `${Math.round(h1.shortStartSec)}-${Math.round(h1.shortEndSec)}`
-      descByKey.set(key, h1.description)
-      if (!segmentMap.has(key)) {
-        segmentMap.set(key, {
-          shortStartSec: h1.shortStartSec,
-          shortEndSec: h1.shortEndSec,
-          descriptions: [h1.description],
-          candidates: [],
-        })
-      } else {
-        const existing = segmentMap.get(key)!
-        if (h1.description && !existing.descriptions.includes(h1.description)) {
-          existing.descriptions.push(h1.description)
-        }
-      }
-    }
-
     for (const h2 of hissa2Entries) {
-      const key = `${Math.round(h2.shortStartSec)}-${Math.round(h2.shortEndSec)}`
-      if (!segmentMap.has(key)) {
-        segmentMap.set(key, {
-          shortStartSec: h2.shortStartSec,
-          shortEndSec: h2.shortEndSec,
-          descriptions: [],
-          candidates: [],
-        })
-      }
-      const entry = segmentMap.get(key)!
+      const desc = findBestHissa1Description(hissa1Entries, h2.shortStartSec, h2.shortEndSec)
       if (h2.found && h2.movieStartSec !== null && h2.movieEndSec !== null) {
-        entry.candidates.push({
+        const cand: RawCandidate = {
           windowId: w.id,
           windowRange: `${w.startFormatted}-${w.endFormatted}`,
+          shortStartSec: h2.shortStartSec,
+          shortEndSec: h2.shortEndSec,
           movieStartSec: h2.movieStartSec,
           movieEndSec: h2.movieEndSec,
-          movieRange: `${formatParallelTimecode(h2.movieStartSec)} to ${formatParallelTimecode(h2.movieEndSec)}`,
-          description: descByKey.get(key) || entry.descriptions[0] || '',
+          movieRange: formatParallelRange(h2.movieStartSec, h2.movieEndSec),
+          description: desc,
+        }
+
+        // Match an existing FOUND bucket ONLY when it comes from a DIFFERENT window
+        // and its short interval strongly overlaps (boundaries within 0.45s and >= 50% overlap).
+        // Two entries from the SAME window are always distinct sequential segments in HISSA 2 and must never collide.
+        let matchedBucket: SegmentBucket | null = null
+        for (const b of foundBuckets) {
+          const sameWindow = b.candidates.some((c) => c.windowId === w.id)
+          if (sameWindow) continue
+          const overlapStart = Math.max(b.shortStartSec, h2.shortStartSec)
+          const overlapEnd = Math.min(b.shortEndSec, h2.shortEndSec)
+          const overlap = Math.max(0, overlapEnd - overlapStart)
+          const minDur = Math.max(
+            0.1,
+            Math.min(b.shortEndSec - b.shortStartSec, h2.shortEndSec - h2.shortStartSec),
+          )
+          if (
+            Math.abs(b.shortStartSec - h2.shortStartSec) <= 0.45 &&
+            Math.abs(b.shortEndSec - h2.shortEndSec) <= 0.45 &&
+            overlap / minDur >= 0.5
+          ) {
+            matchedBucket = b
+            break
+          }
+        }
+
+        if (!matchedBucket) {
+          foundBuckets.push({
+            shortStartSec: h2.shortStartSec,
+            shortEndSec: h2.shortEndSec,
+            descriptions: desc ? [desc] : [],
+            candidates: [cand],
+          })
+        } else {
+          // Keep the widest sub-second short coverage from FOUND candidates
+          matchedBucket.shortStartSec = Math.min(matchedBucket.shortStartSec, h2.shortStartSec)
+          matchedBucket.shortEndSec = Math.max(matchedBucket.shortEndSec, h2.shortEndSec)
+          if (desc && !matchedBucket.descriptions.includes(desc)) {
+            matchedBucket.descriptions.push(desc)
+          }
+          matchedBucket.candidates.push(cand)
+        }
+      } else {
+        rawNotFoundEntries.push({
+          shortStartSec: h2.shortStartSec,
+          shortEndSec: h2.shortEndSec,
+          description: desc,
         })
       }
     }
   }
 
-  const sortedSegments = Array.from(segmentMap.values()).sort(
+  foundBuckets.sort(
     (a, b) => a.shortStartSec - b.shortStartSec || a.shortEndSec - b.shortEndSec,
   )
 
-  const mergedSegments: MergedShortSegmentResult[] = []
-  let foundCount = 0
-  let notFoundCount = 0
-  let conflictCount = 0
+  // Process FOUND buckets: seam stitch & cluster deduplication
+  const processedFound: Array<{
+    shortStartSec: number
+    shortEndSec: number
+    shortRange: string
+    description: string
+    candidatesAfterStitch: Array<{
+      windowId: string
+      windowRange: string
+      movieStartSec: number
+      movieEndSec: number
+      movieRange: string
+      description: string
+    }>
+    distinctClusters: Array<{
+      windowId: string
+      windowRange: string
+      movieStartSec: number
+      movieEndSec: number
+      movieRange: string
+      description: string
+    }>
+  }> = []
 
-  sortedSegments.forEach((seg, idx) => {
-    const shortRange = `${formatParallelTimecode(seg.shortStartSec)} to ${formatParallelTimecode(seg.shortEndSec)}`
+  for (const seg of foundBuckets) {
+    const shortRange = formatParallelRange(seg.shortStartSec, seg.shortEndSec)
     const description = seg.descriptions[0] || 'Scene segment'
 
-    // Step 1: SEAM STITCHING (before +/-6s dedupe), supporting chains (A+B+C)
-    type StitchableCandidate = (typeof seg.candidates)[number] & {
+    type StitchableCandidate = {
+      windowId: string
+      windowRange: string
+      movieStartSec: number
+      movieEndSec: number
+      movieRange: string
+      description: string
       firstWindowId: string
       lastWindowId: string
       windowIds: string[]
     }
     const stitchWork: StitchableCandidate[] = seg.candidates.map((c) => ({
-      ...c,
+      windowId: c.windowId,
+      windowRange: c.windowRange,
+      movieStartSec: c.movieStartSec,
+      movieEndSec: c.movieEndSec,
+      movieRange: c.movieRange,
+      description: c.description || description,
       firstWindowId: c.windowId,
       lastWindowId: c.windowId,
       windowIds: [c.windowId],
@@ -979,7 +1108,6 @@ export function mergeParallelWindowResults(params: {
           const windowB = windowBoundsById.get(candB.firstWindowId)
           if (!windowA || !windowB) continue
 
-          // Never stitch windows from different runs or non-adjacent windows
           if (
             windowA.runIndex !== undefined &&
             windowB.runIndex !== undefined &&
@@ -1001,7 +1129,7 @@ export function mergeParallelWindowResults(params: {
               windowRange: `${candA.windowRange} + ${candB.windowRange}`,
               movieStartSec: unionStart,
               movieEndSec: unionEnd,
-              movieRange: `${formatParallelTimecode(unionStart)} to ${formatParallelTimecode(unionEnd)}`,
+              movieRange: formatParallelRange(unionStart, unionEnd),
               description: candA.description,
               firstWindowId: candA.firstWindowId,
               lastWindowId: candB.lastWindowId,
@@ -1018,12 +1146,11 @@ export function mergeParallelWindowResults(params: {
       }
     }
 
-    const candidatesAfterStitch: typeof seg.candidates = stitchWork.map(
+    const candidatesAfterStitch = stitchWork.map(
       ({ firstWindowId: _f, lastWindowId: _l, windowIds: _w, ...rest }) => rest,
     )
 
-    // Deduplicate seam overlaps (movie timestamps within ±6s of each other)
-    const distinctClusters: typeof seg.candidates = []
+    const distinctClusters: typeof candidatesAfterStitch = []
     for (const cand of candidatesAfterStitch) {
       const duplicate = distinctClusters.find(
         (c) =>
@@ -1035,14 +1162,109 @@ export function mergeParallelWindowResults(params: {
       }
     }
 
-    if (distinctClusters.length === 0) {
+    processedFound.push({
+      shortStartSec: seg.shortStartSec,
+      shortEndSec: seg.shortEndSec,
+      shortRange,
+      description,
+      candidatesAfterStitch,
+      distinctClusters,
+    })
+  }
+
+  // Build merged covered short intervals from FOUND segments so redundant NOT FOUND rows are filtered out
+  const rawCovered = processedFound
+    .map((p) => ({ start: p.shortStartSec, end: p.shortEndSec }))
+    .filter((r) => r.end > r.start)
+    .sort((a, b) => a.start - b.start)
+  const mergedCoveredRanges: Array<{ start: number; end: number }> = []
+  for (const r of rawCovered) {
+    const last = mergedCoveredRanges[mergedCoveredRanges.length - 1]
+    if (last && r.start <= last.end + 0.08) {
+      last.end = Math.max(last.end, r.end)
+    } else {
+      mergedCoveredRanges.push({ ...r })
+    }
+  }
+
+  // Filter NOT FOUND entries:
+  // - Drop broad multi-second summary/container rows (> 4.5s) when they overlap any FOUND range.
+  // - Drop any NOT FOUND row that is already >= 50% covered by FOUND segments.
+  // - Deduplicate remaining genuinely uncovered NOT FOUND rows.
+  const keptNotFound: Array<{
+    shortStartSec: number
+    shortEndSec: number
+    description: string
+  }> = []
+
+  const sortedNf = [...rawNotFoundEntries].sort(
+    (a, b) =>
+      a.shortStartSec - b.shortStartSec ||
+      a.shortEndSec - a.shortStartSec - (b.shortEndSec - b.shortStartSec),
+  )
+
+  for (const nf of sortedNf) {
+    const dur = nf.shortEndSec - nf.shortStartSec
+    const covFrac = computeCoveredFraction(nf.shortStartSec, nf.shortEndSec, mergedCoveredRanges)
+    if (covFrac >= 0.5) continue
+    if (dur > 4.5 && covFrac > 0.05) continue
+
+    const alreadyHasNf = keptNotFound.some((k) => {
+      const oStart = Math.max(k.shortStartSec, nf.shortStartSec)
+      const oEnd = Math.min(k.shortEndSec, nf.shortEndSec)
+      const overlap = Math.max(0, oEnd - oStart)
+      const minDur = Math.max(
+        0.1,
+        Math.min(k.shortEndSec - k.shortStartSec, nf.shortEndSec - nf.shortStartSec),
+      )
+      return (
+        (Math.abs(k.shortStartSec - nf.shortStartSec) <= 0.45 &&
+          Math.abs(k.shortEndSec - nf.shortEndSec) <= 0.45) ||
+        overlap / minDur >= 0.7
+      )
+    })
+    if (!alreadyHasNf) {
+      keptNotFound.push(nf)
+    } else if (nf.description && nf.description !== 'Scene segment') {
+      const existing = keptNotFound.find(
+        (k) =>
+          Math.abs(k.shortStartSec - nf.shortStartSec) <= 0.45 &&
+          Math.abs(k.shortEndSec - nf.shortEndSec) <= 0.45,
+      )
+      if (existing && (!existing.description || existing.description === 'Scene segment')) {
+        existing.description = nf.description
+      }
+    }
+  }
+
+  // Combine processedFound and keptNotFound into final chronological segments
+  type CombinedItem =
+    | { kind: 'found'; data: (typeof processedFound)[number]; foundIdx: number }
+    | { kind: 'not_found'; data: (typeof keptNotFound)[number] }
+
+  const allItems: CombinedItem[] = [
+    ...processedFound.map((data, foundIdx) => ({ kind: 'found' as const, data, foundIdx })),
+    ...keptNotFound.map((data) => ({ kind: 'not_found' as const, data })),
+  ].sort(
+    (a, b) =>
+      a.data.shortStartSec - b.data.shortStartSec || a.data.shortEndSec - b.data.shortEndSec,
+  )
+
+  const mergedSegments: MergedShortSegmentResult[] = []
+  let foundCount = 0
+  let notFoundCount = 0
+  let conflictCount = 0
+
+  allItems.forEach((item, idx) => {
+    if (item.kind === 'not_found') {
       notFoundCount++
+      const nf = item.data
       mergedSegments.push({
         segmentIndex: idx + 1,
-        shortStartSec: seg.shortStartSec,
-        shortEndSec: seg.shortEndSec,
-        shortRange,
-        description,
+        shortStartSec: nf.shortStartSec,
+        shortEndSec: nf.shortEndSec,
+        shortRange: formatParallelRange(nf.shortStartSec, nf.shortEndSec),
+        description: nf.description || 'Scene segment',
         status: 'NOT_FOUND',
         primaryMovieRange: null,
         primaryMovieStartSec: null,
@@ -1050,36 +1272,97 @@ export function mergeParallelWindowResults(params: {
         primaryWindowId: null,
         candidates: [],
       })
-    } else if (distinctClusters.length === 1) {
+      return
+    }
+
+    const seg = item.data
+    const distinctClusters = [...seg.distinctClusters]
+
+    if (distinctClusters.length === 1) {
       foundCount++
       const primary = distinctClusters[0]
       mergedSegments.push({
         segmentIndex: idx + 1,
         shortStartSec: seg.shortStartSec,
         shortEndSec: seg.shortEndSec,
-        shortRange,
-        description,
+        shortRange: seg.shortRange,
+        description: seg.description,
         status: 'FOUND',
         primaryMovieRange: primary.movieRange,
         primaryMovieStartSec: primary.movieStartSec,
         primaryMovieEndSec: primary.movieEndSec,
         primaryWindowId: primary.windowId,
-        candidates: candidatesAfterStitch,
+        candidates: seg.candidatesAfterStitch,
       })
-    } else {
-      conflictCount++
-      const primary = distinctClusters[0]
+      return
+    }
+
+    // Multiple clusters: score each cluster by temporal continuity with adjacent single-cluster FOUND segments
+    const prevAnchor = (() => {
+      for (let k = item.foundIdx - 1; k >= 0; k--) {
+        const p = processedFound[k]
+        if (seg.shortStartSec - p.shortEndSec > 5) break
+        if (p.distinctClusters.length === 1) return p.distinctClusters[0]
+      }
+      return null
+    })()
+
+    const nextAnchor = (() => {
+      for (let k = item.foundIdx + 1; k < processedFound.length; k++) {
+        const n = processedFound[k]
+        if (n.shortStartSec - seg.shortEndSec > 5) break
+        if (n.distinctClusters.length === 1) return n.distinctClusters[0]
+      }
+      return null
+    })()
+
+    const scoreCluster = (c: (typeof distinctClusters)[number]): number => {
+      let minDist = Infinity
+      if (prevAnchor) {
+        minDist = Math.min(minDist, Math.abs(c.movieStartSec - prevAnchor.movieEndSec))
+      }
+      if (nextAnchor) {
+        minDist = Math.min(minDist, Math.abs(nextAnchor.movieStartSec - c.movieEndSec))
+      }
+      return minDist
+    }
+
+    distinctClusters.sort((a, b) => scoreCluster(a) - scoreCluster(b))
+    const bestCluster = distinctClusters[0]
+    const secondBestCluster = distinctClusters[1]
+    const bestDist = scoreCluster(bestCluster)
+    const secondDist = secondBestCluster ? scoreCluster(secondBestCluster) : Infinity
+
+    // If bestCluster is tightly continuous with surrounding FOUND shots (<= 6s gap) and other candidates are outliers (> 12s away),
+    // promote it to FOUND so false cross-window conflicts don't break a continuous scene.
+    if (bestDist <= 6 && secondDist > 12) {
+      foundCount++
       mergedSegments.push({
         segmentIndex: idx + 1,
         shortStartSec: seg.shortStartSec,
         shortEndSec: seg.shortEndSec,
-        shortRange,
-        description,
+        shortRange: seg.shortRange,
+        description: seg.description,
+        status: 'FOUND',
+        primaryMovieRange: bestCluster.movieRange,
+        primaryMovieStartSec: bestCluster.movieStartSec,
+        primaryMovieEndSec: bestCluster.movieEndSec,
+        primaryWindowId: bestCluster.windowId,
+        candidates: [bestCluster],
+      })
+    } else {
+      conflictCount++
+      mergedSegments.push({
+        segmentIndex: idx + 1,
+        shortStartSec: seg.shortStartSec,
+        shortEndSec: seg.shortEndSec,
+        shortRange: seg.shortRange,
+        description: seg.description,
         status: 'CONFLICT',
-        primaryMovieRange: primary.movieRange,
-        primaryMovieStartSec: primary.movieStartSec,
-        primaryMovieEndSec: primary.movieEndSec,
-        primaryWindowId: primary.windowId,
+        primaryMovieRange: bestCluster.movieRange,
+        primaryMovieStartSec: bestCluster.movieStartSec,
+        primaryMovieEndSec: bestCluster.movieEndSec,
+        primaryWindowId: bestCluster.windowId,
         candidates: distinctClusters,
       })
     }

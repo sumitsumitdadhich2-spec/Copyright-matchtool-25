@@ -237,11 +237,13 @@ function isTailTruncated(normalizedHissa2: string): boolean {
   }
 
   const lastEntryRaw = strippedNotes.slice(lastShortIndex).trim()
-  // Strip optional trailing frame range "(1814-1827 frames)" from the end of a Movie match entry before checking tail connectors
-  const lastEntryCore = lastEntryRaw.replace(/\s*\(\d+\s*-\s*\d+\s*frames\)\s*$/i, '').trim()
+  // Strip optional trailing frame range "(1814-1827 frames)" or window tag "[W08]" from the end of a Movie match entry before checking tail connectors
+  const lastEntryCore = lastEntryRaw
+    .replace(/\s*(?:\([^)]*\)|\[[^\]]*\])\s*$/i, '')
+    .trim()
 
   // Dangling connector or incomplete timestamp token at the end of the last real entry
-  if (/(?:-->|->|—>|=>|→|-|–|—|:|\.\d{0,2})$/.test(lastEntryCore)) {
+  if (/(?:-->|->|—>|=>|→|=|-|–|—|:|\.\d{0,2})$/.test(lastEntryCore)) {
     return true
   }
 
@@ -250,15 +252,15 @@ function isTailTruncated(normalizedHissa2: string): boolean {
     return true
   }
 
-  // Complete match entry: Short <start> - <end> --> Movie <start> - <end>
+  // Complete match entry: Short <start> - <end> [(frames)] --> [Movie] <start> - <end>
   const hasCompleteMatch =
-    /^Short[:\s]+(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?(?:\s*\([^)]*\))?\s*(?:-->|->|—>|=>|→|=)\s*Movie[:\s]+(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?$/i.test(
+    /^(?:Short[:\s]+)?(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?(?:\s*\([^)]*\))?\s*(?:-->|->|—>|=>|→|=)\s*(?:Movie[:\s]+)?(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?$/i.test(
       lastEntryCore,
     )
 
-  // Complete not-found entry: Short <start> - <end> --> NOT FOUND
+  // Complete not-found entry: Short <start> - <end> [(frames)] --> NOT FOUND
   const hasCompleteNotFound =
-    /^Short[:\s]+(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?(?:\s*\([^)]*\))?\s*(?:-->|->|—>|=>|→|:|-|–|—|=)?\s*NOT[\s_]*FOUND$/i.test(
+    /^(?:Short[:\s]+)?(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?(?:\s*\([^)]*\))?\s*(?:-->|->|—>|=>|→|:|-|–|—|=)?\s*(?:NOT[\s_-]*FOUND|NONE|N\/A|NULL|NO[\s_-]*MATCH|NAHI[\s_-]*MILA)$/i.test(
       lastEntryCore,
     )
 
@@ -539,9 +541,9 @@ export function validateStudioAnswer(
     }
   }
 
-  // Match NOT FOUND entries in normalized text
+  // Match NOT FOUND entries in normalized text (allowing optional frame annotations after Short timestamps)
   const notFoundPattern =
-    /\bShort[:\s]+((?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?)\s*(?:-|–|—|to)\s*((?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?)\s*(?:-->|->|—>|=>|→|:|-|–|—)?\s*NOT[\s_]*FOUND\b/gi
+    /(?:\bShort[:\s]+)?((?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?)\s*(?:-|–|—|to)\s*((?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?)(?:\s*\([^)]*\))?\s*(?:-->|->|—>|=>|→|=|:|-|–|—)?\s*(?:NOT[\s_-]*FOUND|NONE|N\/A|NULL|NO[\s_-]*MATCH|NAHI[\s_-]*MILA)\b/gi
   let nfMatch: RegExpExecArray | null
   while ((nfMatch = notFoundPattern.exec(normalizedHissa2)) !== null) {
     notFoundLineCount += 1

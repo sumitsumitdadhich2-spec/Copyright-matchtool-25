@@ -11,6 +11,7 @@ import { COVERAGE_MIN_GAP_SEC, coverageFromRanges, gapsOf, mergeRanges, shortTot
 import { scheduler } from './scheduler'
 import { sameShortSegment, applyGroupMatches } from './candidate-pick'
 import { selectScanKeyPairWithFallback } from './chunk-scan-coordinator'
+import { syncScanWithParallelReportIfNeeded } from './studio-parallel-manager'
 import { invalidateRenderedOutput } from './render'
 import type { GapBackupCandidate, GapBackupMinute, GapBackupPart, GapBackupRequest, GapBackupState, Scan, ShortRange } from './types'
 
@@ -53,8 +54,15 @@ function coverageMatches(scan: Scan) {
 
 function uncovered(scan: Scan): ShortRange[] {
   const total = shortTotalOf(scan)
-  return gapsOf(mergeRanges(coverageMatches(scan).map((match) => ({ start: match.shortStart, end: match.shortEnd }))), total)
-    .filter((gap) => gap.end - gap.start >= COVERAGE_MIN_GAP_SEC)
+  return gapsOf(
+    mergeRanges(
+      coverageMatches(scan).map((match) => ({
+        start: Math.max(0, match.shortStart),
+        end: match.shortEnd > match.shortStart ? match.shortEnd : match.shortStart + 1,
+      })),
+    ),
+    total,
+  ).filter((gap) => gap.end - gap.start >= COVERAGE_MIN_GAP_SEC)
 }
 
 function buildParts(gaps: ShortRange[]): GapBackupPart[] {
@@ -117,6 +125,7 @@ export function stopGapBackup(id: string) {
 }
 
 export function gapBackupPreview(scan: Scan) {
+  syncScanWithParallelReportIfNeeded(scan)
   const saved = scan.gapBackup
   const state = saved && Array.isArray(saved.minutes) && Array.isArray(saved.requests) ? saved : emptyState()
   return { coverage: scanCoverage(scan), gaps: uncovered(scan), state }
@@ -135,6 +144,7 @@ export function startGapBackup(
   if (!scan.shortDuration || !scan.movieDuration || scan.awaitingTrim) return { ok: false, error: 'Upload both videos and confirm the movie trim first' }
   if (scan.gapBackup?.candidates.some((candidate) => candidate.review === 'pending')) return { ok: false, error: 'Review the pending Gemini candidates before retrying unresolved ranges' }
   if (!apiKeys.length) return { ok: false, error: 'Add a Gemini API key in Settings first' }
+  syncScanWithParallelReportIfNeeded(scan)
   const isNewDay = checkDailyReset()
   if (isNewDay) {
     addLog(scan, 'success', `[Daily Quota Reset] New date detected (${geminiUsageDay()}) — all Gemini daily quotas reset to fresh state.`)

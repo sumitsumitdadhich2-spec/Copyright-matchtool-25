@@ -30,6 +30,10 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
   if (!running && scheduler.reconcileCompletedScan(scan)) {
     saveScan(scan)
   }
+  if (!running) {
+    const { syncScanWithParallelReportIfNeeded } = await import('@/lib/studio-parallel-manager')
+    syncScanWithParallelReportIfNeeded(scan)
+  }
   const key = getApiKey()
   return NextResponse.json({
     scan,

@@ -2137,22 +2137,32 @@ export function isSuspiciousChunkOutput(raw: string, matches: ChunkMatch[]): str
  * ABSOLUTE movie time using the chunk's start offset. */
 export function parseChunkMatches(raw: string, chunkIndex: number, chunkOffsetSeconds: number, model: string): ChunkMatch[] {
   const out: ChunkMatch[] = []
+  if (!raw) return out
+
+  // If full response text is passed, slice from HISSA 2 so HISSA 1 timestamps are never matched
+  const hissa2Match = /\bHISSA\s*2\b/i.exec(raw)
+  const targetText = hissa2Match ? raw.slice(hissa2Match.index) : raw
+
   // Matches flexible formats:
   // "- Short 00:18.042 - 00:19.125 --> Movie 00:00.000 - 00:01.083"
-  // "Short: 00:18.042 to 00:19.125 -> Movie: 00:00.000 to 00:01.083"
-  // "Short 00:15.000 - 00:16.000 --> Movie 01:07.250 - 01:08.250 (1614-1638 frames)"
-  // including HH:MM:SS or MM:SS format, various dash/arrow types (--> / -> / —> / => / →),
-  // and entries wrapped on the same line or separated by spaces/annotations.
+  // "Short 02:45.000 - 02:46.000 (3960-3984 frames) --> Movie 01:02:36.000 - 01:02:36.958 (1440-1463 frames)"
+  // "0:00 to 0:01 = 55:00 to 55:01"
+  // including HH:MM:SS or MM:SS format, optional parenthetical frame counts after Short/Movie ranges,
+  // and connectors (--> / -> / —> / => / → / =).
   const re =
-    /\bShort[:\s]+((?:\d+:)?\d+:\d+(?:\.\d+)?)\s*(?:-|–|—|to)\s*((?:\d+:)?\d+:\d+(?:\.\d+)?)\s*(?:-->|->|—>|=>|→)\s*Movie[:\s]+((?:\d+:)?\d+:\d+(?:\.\d+)?)\s*(?:-|–|—|to)\s*((?:\d+:)?\d+:\d+(?:\.\d+)?)/gi
+    /(?:\bShort[:\s]+|(?<=^|\n)\s*(?:[-*•]\s*|\d+[.)]\s*)?)((?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?)\s*(?:-|–|—|to)\s*((?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?)(?:\s*\([^)]*\))?\s*(?:-->|->|—>|=>|→|=)\s*(?:Movie[:\s]+)?((?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?)\s*(?:-|–|—|to)\s*((?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?)/gi
   let m: RegExpExecArray | null
-  while ((m = re.exec(raw)) !== null) {
+  while ((m = re.exec(targetText)) !== null) {
     const shortStart = parseTsFlexible(m[1]) ?? parseTs(m[1])
-    const shortEnd = parseTsFlexible(m[2]) ?? parseTs(m[2])
+    let shortEnd = parseTsFlexible(m[2]) ?? parseTs(m[2])
     const movieLocalStart = parseTsFlexible(m[3]) ?? parseTs(m[3])
-    const movieLocalEnd = parseTsFlexible(m[4]) ?? parseTs(m[4])
+    let movieLocalEnd = parseTsFlexible(m[4]) ?? parseTs(m[4])
     if (shortStart === null || shortEnd === null || movieLocalStart === null || movieLocalEnd === null) continue
-    if (shortEnd <= shortStart || movieLocalEnd <= movieLocalStart) continue
+    if (shortEnd < shortStart || movieLocalEnd < movieLocalStart) continue
+    if (shortEnd === shortStart) shortEnd = shortStart + 1
+    if (movieLocalEnd === movieLocalStart) {
+      movieLocalEnd = movieLocalStart + Math.max(1, shortEnd - shortStart)
+    }
     out.push({
       shortStart,
       shortEnd,

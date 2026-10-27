@@ -2318,21 +2318,40 @@ export class StudioParallelManager {
       const defaultModel =
         this.windows.find((w) => w.modelName)?.modelName || DEFAULT_STUDIO_MODEL_NAME
 
+      // Preserve any manually accepted gap-backup or userPick matches
+      const manualMatches = (scan.matches || []).filter(
+        (m) => m.origin === 'gap-backup' || m.userPick === true,
+      )
+
       if (mergedReport && mergedReport.segments.length > 0) {
         for (const seg of mergedReport.segments) {
           if (
             (seg.status === 'FOUND' || seg.status === 'CONFLICT') &&
             seg.primaryMovieStartSec !== null &&
             seg.primaryMovieEndSec !== null &&
-            seg.primaryMovieEndSec > seg.primaryMovieStartSec
+            seg.primaryMovieEndSec >= seg.primaryMovieStartSec
           ) {
-            const cIdx = deriveChunkIndexForMovieTime(scan, seg.primaryMovieStartSec)
+            const shortStart = Number(seg.shortStartSec.toFixed(3))
+            const shortEnd = Number(
+              (seg.shortEndSec > seg.shortStartSec
+                ? seg.shortEndSec
+                : seg.shortStartSec + 1
+              ).toFixed(3),
+            )
+            const movieStart = Number(seg.primaryMovieStartSec.toFixed(3))
+            const movieEnd = Number(
+              (seg.primaryMovieEndSec > seg.primaryMovieStartSec
+                ? seg.primaryMovieEndSec
+                : seg.primaryMovieStartSec + Math.max(1, shortEnd - shortStart)
+              ).toFixed(3),
+            )
+            const cIdx = deriveChunkIndexForMovieTime(scan, movieStart)
             finalMatches.push({
               chunkIndex: cIdx,
-              shortStart: Number(seg.shortStartSec.toFixed(3)),
-              shortEnd: Number(seg.shortEndSec.toFixed(3)),
-              movieStart: Number(seg.primaryMovieStartSec.toFixed(3)),
-              movieEnd: Number(seg.primaryMovieEndSec.toFixed(3)),
+              shortStart,
+              shortEnd,
+              movieStart,
+              movieEnd,
               description: seg.description || 'Matched scene',
               model: defaultModel,
               verified: true,
@@ -2346,15 +2365,27 @@ export class StudioParallelManager {
       for (const w of this.windows) {
         if (w.status !== 'DONE' || !Array.isArray(w.matches)) continue
         for (const m of w.matches) {
-          const cIdx = deriveChunkIndexForMovieTime(scan, m.movieStart)
+          const shortStart = m.shortStart
+          const shortEnd = m.shortEnd > m.shortStart ? m.shortEnd : m.shortStart + 1
+          const movieStart = m.movieStart
+          const movieEnd =
+            m.movieEnd > m.movieStart
+              ? m.movieEnd
+              : m.movieStart + Math.max(1, shortEnd - shortStart)
+          const cIdx = deriveChunkIndexForMovieTime(scan, movieStart)
           const isDup = finalMatches.some(
             (ex) =>
-              Math.abs(ex.shortStart - m.shortStart) < 1.2 &&
-              Math.abs(ex.movieStart - m.movieStart) < 2.0,
+              Math.abs(ex.shortStart - shortStart) < 0.08 &&
+              Math.abs(ex.shortEnd - shortEnd) < 0.08 &&
+              Math.abs(ex.movieStart - movieStart) < 0.5,
           )
           if (!isDup) {
             finalMatches.push({
               ...m,
+              shortStart,
+              shortEnd,
+              movieStart,
+              movieEnd,
               chunkIndex: cIdx,
               model: m.model || w.modelName || defaultModel,
               verified: true,
@@ -2364,10 +2395,22 @@ export class StudioParallelManager {
         }
       }
 
+      for (const mm of manualMatches) {
+        const isDup = finalMatches.some(
+          (ex) =>
+            Math.abs(ex.shortStart - mm.shortStart) < 0.08 &&
+            Math.abs(ex.shortEnd - mm.shortEnd) < 0.08 &&
+            Math.abs(ex.movieStart - mm.movieStart) < 0.5,
+        )
+        if (!isDup) {
+          finalMatches.push(mm)
+        }
+      }
+
       finalMatches.sort((a, b) => a.shortStart - b.shortStart || a.movieStart - b.movieStart)
       scan.matches = finalMatches
       scan.verifierEnabled = false
-      scan.candidateGroups = []
+      scan.candidateGroups = scan.candidateGroups || []
 
       // Update per-minute shortSegments & chunks so ChunkResultsPanel, ReportPanel, ComparePanel, and RenderPanel are 100% ready
       const trimStart = scan.movieTrimStart ?? 0
@@ -3116,7 +3159,9 @@ export class StudioParallelManager {
       }
 
       const meta = ctrl.getActiveRunMeta()
-      const notFoundMatches = (result.rawText.match(/NOT\s+FOUND\s+IN\s+THIS\s+CHUNK/gi) || []).length
+      const hissa2SliceIdx = result.rawText.search(/\bHISSA\s*2\b/i)
+      const hissa2Slice = hissa2SliceIdx >= 0 ? result.rawText.slice(hissa2SliceIdx) : result.rawText
+      const notFoundMatches = (hissa2Slice.match(/\bNOT[\s_-]*FOUND\b/gi) || []).length
       win.status = 'DONE'
       win.modelName = meta.modelName
       win.tokens = result.tokenCount
@@ -3900,5 +3945,182 @@ registerParallelWindowCompletionChecker((scanId: string) => {
   }
 })
 
+
+/**
+ * Reconcile a Scan record's `matches`, `shortSegments`, and `report.coverage` with its Studio Parallel
+ * Merged Report (and heal any zero-length or <1.2s-dropped sub-second matches on existing completed scans).
+ */
+export function syncScanWithParallelReportIfNeeded(scan: Scan): boolean {
+  if (!scan || !scan.id || scan.id === 'default') return false
+  try {
+    let changed = false
+
+    // 1. Heal any zero-length matches already present on scan.matches
+    if (Array.isArray(scan.matches)) {
+      for (const m of scan.matches) {
+        if (m.shortEnd <= m.shortStart) {
+          m.shortEnd = m.shortStart + 1
+          changed = true
+        }
+        if (m.movieEnd <= m.movieStart) {
+          m.movieEnd = m.movieStart + Math.max(1, m.shortEnd - m.shortStart)
+          changed = true
+        }
+      }
+    }
+
+    // 2. If parallel windows exist for this scan and none are currently running, rebuild matches from mergedReport
+    const map = getManagersMap()
+    const mgr = map.get(scan.id)
+    if (mgr && !mgr.isRunning()) {
+      const wins = mgr.getWindows()
+      const hasDoneWithRaw = wins.some((w) => w.status === 'DONE' && Boolean(w.rawResponseText))
+      if (hasDoneWithRaw) {
+        const mergedReport = mgr.getMergedReport()
+        if (mergedReport && mergedReport.segments.length > 0) {
+          const defaultModel =
+            wins.find((w) => w.modelName)?.modelName || DEFAULT_STUDIO_MODEL_NAME
+          const manualMatches = (scan.matches || []).filter(
+            (m) => m.origin === 'gap-backup' || m.userPick === true,
+          )
+          const rebuilt: ChunkMatch[] = []
+
+          for (const seg of mergedReport.segments) {
+            if (
+              (seg.status === 'FOUND' || seg.status === 'CONFLICT') &&
+              seg.primaryMovieStartSec !== null &&
+              seg.primaryMovieEndSec !== null &&
+              seg.primaryMovieEndSec >= seg.primaryMovieStartSec
+            ) {
+              const shortStart = Number(seg.shortStartSec.toFixed(3))
+              const shortEnd = Number(
+                (seg.shortEndSec > seg.shortStartSec
+                  ? seg.shortEndSec
+                  : seg.shortStartSec + 1
+                ).toFixed(3),
+              )
+              const movieStart = Number(seg.primaryMovieStartSec.toFixed(3))
+              const movieEnd = Number(
+                (seg.primaryMovieEndSec > seg.primaryMovieStartSec
+                  ? seg.primaryMovieEndSec
+                  : seg.primaryMovieStartSec + Math.max(1, shortEnd - shortStart)
+                ).toFixed(3),
+              )
+              const cIdx = deriveChunkIndexForMovieTime(scan, movieStart)
+              rebuilt.push({
+                chunkIndex: cIdx,
+                shortStart,
+                shortEnd,
+                movieStart,
+                movieEnd,
+                description: seg.description || 'Matched scene',
+                model: defaultModel,
+                verified: true,
+                origin: 'chunk',
+              })
+            }
+          }
+
+          for (const w of wins) {
+            if (w.status !== 'DONE' || !Array.isArray(w.matches)) continue
+            for (const m of w.matches) {
+              const shortStart = m.shortStart
+              const shortEnd = m.shortEnd > m.shortStart ? m.shortEnd : m.shortStart + 1
+              const movieStart = m.movieStart
+              const movieEnd =
+                m.movieEnd > m.movieStart
+                  ? m.movieEnd
+                  : m.movieStart + Math.max(1, shortEnd - shortStart)
+              const cIdx = deriveChunkIndexForMovieTime(scan, movieStart)
+              const isDup = rebuilt.some(
+                (ex) =>
+                  Math.abs(ex.shortStart - shortStart) < 0.08 &&
+                  Math.abs(ex.shortEnd - shortEnd) < 0.08 &&
+                  Math.abs(ex.movieStart - movieStart) < 0.5,
+              )
+              if (!isDup) {
+                rebuilt.push({
+                  ...m,
+                  shortStart,
+                  shortEnd,
+                  movieStart,
+                  movieEnd,
+                  chunkIndex: cIdx,
+                  model: m.model || w.modelName || defaultModel,
+                  verified: true,
+                  origin: m.origin || 'chunk',
+                })
+              }
+            }
+          }
+
+          for (const mm of manualMatches) {
+            const isDup = rebuilt.some(
+              (ex) =>
+                Math.abs(ex.shortStart - mm.shortStart) < 0.08 &&
+                Math.abs(ex.shortEnd - mm.shortEnd) < 0.08 &&
+                Math.abs(ex.movieStart - mm.movieStart) < 0.5,
+            )
+            if (!isDup) {
+              rebuilt.push(mm)
+            }
+          }
+
+          rebuilt.sort((a, b) => a.shortStart - b.shortStart || a.movieStart - b.movieStart)
+
+          const prevCount = (scan.matches || []).length
+          const prevCov = computeShortCoverage(scan)
+          const nextCov = computeShortCoverage({
+            shortDuration: scan.shortDuration,
+            matches: rebuilt,
+          })
+
+          if (
+            rebuilt.length !== prevCount ||
+            Math.abs(nextCov.coveredSec - prevCov.coveredSec) > 0.05 ||
+            nextCov.gaps.length !== prevCov.gaps.length
+          ) {
+            scan.matches = rebuilt
+            if (Array.isArray(scan.shortSegments)) {
+              for (const seg of scan.shortSegments) {
+                seg.matches = []
+                for (const m of rebuilt) {
+                  const clipped = clipMatchToShortSegment(m, seg.start, seg.end, scan)
+                  if (clipped) {
+                    seg.matches.push({ ...clipped, verified: true })
+                  }
+                }
+              }
+            }
+            changed = true
+          }
+        }
+      }
+    }
+
+    if (scan.report) {
+      const freshCoverage = computeShortCoverage(scan)
+      const prevReportCov = scan.report.coverage
+      if (
+        !prevReportCov ||
+        Math.abs(prevReportCov.coveredSec - freshCoverage.coveredSec) > 0.05 ||
+        prevReportCov.gaps.length !== freshCoverage.gaps.length ||
+        scan.report.matches?.length !== (scan.matches || []).length
+      ) {
+        scan.report.matches = scan.matches
+        scan.report.coverage = freshCoverage
+        scan.report.groupsConfirmed = (scan.matches || []).length
+        changed = true
+      }
+    }
+
+    if (changed) {
+      saveScan(scan)
+    }
+    return changed
+  } catch {
+    return false
+  }
+}
 
 export const studioParallelManager = getStudioParallelManager('default')

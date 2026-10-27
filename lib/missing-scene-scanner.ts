@@ -19,6 +19,7 @@ import { addLog, getScan, saveScan, scanMediaDir, incrementModelUsage, apiKeyHas
 import { gapsOf, mergeRanges } from './short-coverage'
 import { globalGeminiCoordinator } from './global-gemini-coordinator'
 import { applyGroupMatches, sameShortSegment } from './candidate-pick'
+import { syncScanWithParallelReportIfNeeded } from './studio-parallel-manager'
 import { invalidateRenderedOutput } from './render'
 import type { ChunkMatch, MissingSceneCandidate, MissingSceneScanState, MissingSceneTarget, MissingSceneWindowHit, Scan } from './types'
 
@@ -52,12 +53,16 @@ export function stopMissingSceneScanner(scanId: string): { ok: boolean; error?: 
 
 /** Compute gaps in short video based on existing confirmed/verified matches */
 export function getDetectedMissingScenes(scan: Scan): MissingSceneTarget[] {
+  syncScanWithParallelReportIfNeeded(scan)
   const shortDur = scan.shortDuration || 0
   if (shortDur <= 0) return []
   // Matches that genuinely cover the short video (excluding rejected ones)
   const matches = (scan.matches || [])
     .filter((m) => !m.rejected && m.batchVerified !== 'rejected')
-    .map((m) => ({ start: m.shortStart, end: m.shortEnd }))
+    .map((m) => ({
+      start: Math.max(0, m.shortStart),
+      end: m.shortEnd > m.shortStart ? m.shortEnd : m.shortStart + 1,
+    }))
   const covered = mergeRanges(matches)
   const gaps = gapsOf(covered, shortDur).filter((g) => g.end - g.start >= 0.4)
   return gaps.map((g, idx) => ({

@@ -1771,8 +1771,9 @@ class Scheduler {
               const withChunk: ChunkMatch = { ...m, chunkIndex: absIdx, verified: true }
               const isDupGlobal = scan.matches.some(
                 (ex) =>
-                  Math.abs(ex.shortStart - withChunk.shortStart) < 1.2 &&
-                  Math.abs(ex.movieStart - withChunk.movieStart) < 2.0,
+                  Math.abs(ex.shortStart - withChunk.shortStart) < 0.08 &&
+                  Math.abs(ex.shortEnd - withChunk.shortEnd) < 0.08 &&
+                  Math.abs(ex.movieStart - withChunk.movieStart) < 0.5,
               )
               if (!isDupGlobal) {
                 scan.matches.push(withChunk)
@@ -1783,8 +1784,9 @@ class Scheduler {
                 seg.matches = seg.matches || []
                 const isDupSeg = seg.matches.some(
                   (ex: ChunkMatch) =>
-                    Math.abs(ex.shortStart - clipped.shortStart) < 1.2 &&
-                    Math.abs(ex.movieStart - clipped.movieStart) < 2.0,
+                    Math.abs(ex.shortStart - clipped.shortStart) < 0.08 &&
+                    Math.abs(ex.shortEnd - clipped.shortEnd) < 0.08 &&
+                    Math.abs(ex.movieStart - clipped.movieStart) < 0.5,
                 )
                 if (!isDupSeg) {
                   seg.matches.push({ ...clipped, verified: true })

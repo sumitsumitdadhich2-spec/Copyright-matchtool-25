@@ -16,7 +16,7 @@ import type { ChunkMatch, Scan, ShortCoverage, ShortRange } from './types'
 export const COVERAGE_MIN_GAP_SEC = 0.5
 
 /** Union of ranges: sorted, overlapping/touching (≤ `touch` s apart) ranges merged. */
-export function mergeRanges(rs: ShortRange[], touch = 0.01): ShortRange[] {
+export function mergeRanges(rs: ShortRange[], touch = 0.05): ShortRange[] {
   const s = [...rs].filter((r) => r.end > r.start).sort((a, b) => a.start - b.start)
   const out: ShortRange[] = []
   for (const r of s) {
@@ -62,7 +62,11 @@ export function missingRanges(
 /** Coverage of `total` seconds by the given short ranges (any order, overlaps allowed). */
 export function coverageFromRanges(ranges: ShortRange[], total: number): ShortCoverage {
   const covered = mergeRanges(
-    ranges.map((r) => ({ start: Math.max(0, r.start), end: Math.min(total, r.end) })),
+    ranges.map((r) => {
+      const start = Math.max(0, r.start)
+      const rawEnd = r.end > r.start ? r.end : r.end === r.start ? r.start + 1 : r.end
+      return { start, end: Math.min(total, rawEnd) }
+    }),
   )
   const gaps = gapsOf(covered, total).filter((g) => g.end - g.start >= COVERAGE_MIN_GAP_SEC)
   const missingSec = gaps.reduce((n, g) => n + (g.end - g.start), 0)
@@ -74,7 +78,7 @@ export function coverageFromRanges(ranges: ShortRange[], total: number): ShortCo
 /** Short duration to measure against: stored duration, else the last match end. */
 export function shortTotalOf(scan: Pick<Scan, 'shortDuration' | 'matches'>): number {
   if (scan.shortDuration && scan.shortDuration > 0) return scan.shortDuration
-  return (scan.matches || []).reduce((n, m) => Math.max(n, m.shortEnd), 0)
+  return (scan.matches || []).reduce((n, m) => Math.max(n, m.shortEnd > m.shortStart ? m.shortEnd : m.shortStart + 1), 0)
 }
 
 /**
@@ -88,7 +92,9 @@ export function computeShortCoverage(scan: Pick<Scan, 'shortDuration' | 'matches
 }
 
 function matchRange(m: ChunkMatch): ShortRange {
-  return { start: m.shortStart, end: m.shortEnd }
+  const start = Math.max(0, m.shortStart)
+  const end = m.shortEnd > m.shortStart ? m.shortEnd : start + 1
+  return { start, end }
 }
 
 /** mm:ss.mmm for coverage logs (short clock). */
