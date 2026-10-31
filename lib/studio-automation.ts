@@ -12,7 +12,7 @@ import {
 import {
   DEFAULT_STUDIO_UPLOAD_GATE,
   computeEffectiveMaxInputTokens,
-  encryptSecret,
+  getSettingsCookieFingerprint,
   loadDecryptedPlaywrightCookies,
   loadStudioUserConfig,
   saveStudioUserConfig,

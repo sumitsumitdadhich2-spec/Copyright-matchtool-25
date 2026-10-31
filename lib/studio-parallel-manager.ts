@@ -899,6 +899,13 @@ const globalForParallelStudio = globalThis as unknown as {
   __cmtStudioParallelRestored?: boolean
 }
 
+if (globalForParallelStudio.__cmtGlobalProfileSlotPool) {
+  Object.setPrototypeOf(
+    globalForParallelStudio.__cmtGlobalProfileSlotPool,
+    GlobalProfileSlotPool.prototype,
+  )
+}
+
 export const globalProfileSlotPool: GlobalProfileSlotPool =
   globalForParallelStudio.__cmtGlobalProfileSlotPool ||
   (globalForParallelStudio.__cmtGlobalProfileSlotPool = new GlobalProfileSlotPool())
