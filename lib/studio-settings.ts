@@ -42,6 +42,8 @@ export interface StudioUserConfig {
   studioConcurrency?: number
   /** Max concurrent workers allowed in media upload/attach gate (default 2) */
   studioUploadGateConcurrency?: number
+  /** Stagger timer between pressing Run on different windows across all workers (seconds, default 20) */
+  studioRunStaggerSec?: number
   /** Movie minute input list/ranges for Parallel Window Scan */
   studioMinuteInput?: string
   /** Measured token rate (tokens/sec at 24 FPS) from Test Clip */
@@ -71,6 +73,7 @@ export interface PublicStudioSettings {
   studioOffsetMode: 'auto' | 'relative' | 'absolute'
   studioConcurrency: number
   studioUploadGateConcurrency: number
+  studioRunStaggerSec: number
   studioMinuteInput: string
   studioMeasuredTokenRate: number | null
   studioLowMemoryChromeFlags: boolean
@@ -130,6 +133,7 @@ export function computeEffectiveMaxInputTokens(
 
 export const DEFAULT_STUDIO_CONCURRENCY = 4
 export const DEFAULT_STUDIO_UPLOAD_GATE = 2
+export const DEFAULT_STUDIO_RUN_STAGGER_SEC = 20
 export const DEFAULT_STUDIO_MINUTE_INPUT =
   '7,8,9,10,14,15,16,17,19,20,21,25-41,48-54,56,57,58,63-67,71-100'
 
@@ -146,6 +150,7 @@ export const DEFAULT_STUDIO_CONFIG: StudioUserConfig = {
   studioOffsetMode: 'auto',
   studioConcurrency: DEFAULT_STUDIO_CONCURRENCY,
   studioUploadGateConcurrency: DEFAULT_STUDIO_UPLOAD_GATE,
+  studioRunStaggerSec: DEFAULT_STUDIO_RUN_STAGGER_SEC,
   studioMinuteInput: DEFAULT_STUDIO_MINUTE_INPUT,
   studioMeasuredTokenRate: null,
   studioLowMemoryChromeFlags: false,
@@ -234,6 +239,10 @@ export async function loadStudioUserConfig(username: string): Promise<StudioUser
     studioUploadGateConcurrency: Math.max(
       1,
       Math.min(10, Math.round(Number(raw?.studioUploadGateConcurrency) || DEFAULT_STUDIO_UPLOAD_GATE)),
+    ),
+    studioRunStaggerSec: Math.max(
+      0,
+      Math.min(120, Math.round(Number(raw?.studioRunStaggerSec) ?? DEFAULT_STUDIO_RUN_STAGGER_SEC)),
     ),
     studioMinuteInput:
       typeof raw?.studioMinuteInput === 'string' && raw.studioMinuteInput.trim()
@@ -435,6 +444,7 @@ export async function getPublicStudioSettings(username: string): Promise<PublicS
     studioOffsetMode: cfg.studioOffsetMode,
     studioConcurrency: cfg.studioConcurrency ?? DEFAULT_STUDIO_CONCURRENCY,
     studioUploadGateConcurrency: cfg.studioUploadGateConcurrency ?? DEFAULT_STUDIO_UPLOAD_GATE,
+    studioRunStaggerSec: cfg.studioRunStaggerSec ?? DEFAULT_STUDIO_RUN_STAGGER_SEC,
     studioMinuteInput: cfg.studioMinuteInput || DEFAULT_STUDIO_MINUTE_INPUT,
     studioMeasuredTokenRate: cfg.studioMeasuredTokenRate ?? null,
     studioLowMemoryChromeFlags: Boolean(cfg.studioLowMemoryChromeFlags ?? false),

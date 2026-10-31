@@ -218,14 +218,14 @@ export function StudioParallelGrid({
       return snap.movieDurationSec
     }
     return null
-  }, [scanMovieDuration, scan, snap?.movieDurationSec])
+  }, [scanMovieDuration, scan, snap])
 
   const effectiveFoundMinutes = useMemo(() => {
     const fromScan = extractScanFoundMinutesClient(scan, effectiveMovieDurationSec)
     if (fromScan) return fromScan
     if (snap?.foundMinutesInput) return snap.foundMinutesInput
     return ''
-  }, [scan, effectiveMovieDurationSec, snap?.foundMinutesInput])
+  }, [scan, effectiveMovieDurationSec, snap])
 
   const initialSource: 'auto' | 'manual' =
     snap?.minuteInputSource === 'manual' || scanMinuteInputSource === 'manual'

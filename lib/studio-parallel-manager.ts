@@ -3305,11 +3305,12 @@ export class StudioParallelManager {
         })
       } else if (
         msg.startsWith('POLICY_BLOCKED:') ||
+        msg.startsWith('POLICY_BLOCKED_EXHAUSTED:') ||
         /(prohibited_content|blocked\s+due\s+to\s+safety)/i.test(msg)
       ) {
         win.status = 'PROHIBITED'
         win.stage = 'prohibited'
-        win.summaryText = 'PROHIBITED CONTENT (skipped, no retry)'
+        win.summaryText = 'PROHIBITED CONTENT (failed after 5 retries)'
         win.error = msg
         this.appendCombinedLog({
           workerId,
@@ -3318,7 +3319,7 @@ export class StudioParallelManager {
           windowRange: windowRangeStr,
           level: 'ERROR',
           step: 'window PROHIBITED',
-          message: `Window #${win.windowNumber} (${windowRangeStr}): PROHIBITED CONTENT (skipped, no retry)`,
+          message: `Window #${win.windowNumber} (${windowRangeStr}): PROHIBITED CONTENT (exhausted after 5 retries: ${msg})`,
         })
       } else {
         win.status = 'FAILED'

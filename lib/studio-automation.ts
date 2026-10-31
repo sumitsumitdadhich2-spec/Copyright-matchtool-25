@@ -11,6 +11,7 @@ import {
 } from './studio-selectors'
 import {
   DEFAULT_STUDIO_UPLOAD_GATE,
+  DEFAULT_STUDIO_RUN_STAGGER_SEC,
   computeEffectiveMaxInputTokens,
   getSettingsCookieFingerprint,
   loadDecryptedPlaywrightCookies,
@@ -599,6 +600,79 @@ const globalForUploadGate = globalThis as unknown as {
 export const globalStudioUploadGate: GlobalStudioUploadGate =
   globalForUploadGate.__cmtStudioUploadGate ||
   (globalForUploadGate.__cmtStudioUploadGate = new GlobalStudioUploadGate())
+
+/**
+ * Global 20s Run Stagger Gate across all parallel workers.
+ * Ensures that if any window presses Run (e.g. 3.8 Flash), no other window
+ * can press Run until at least 20 seconds have elapsed.
+ * This prevents account-level concurrency spikes and 403 PERMISSION_DENIED errors.
+ */
+export class GlobalStudioRunStaggerGate {
+  private lastRunAt = 0
+  private staggerMs = 20_000
+  private queueTail: Promise<void> = Promise.resolve()
+
+  public setStaggerMs(ms: number) {
+    this.staggerMs = Math.max(1000, ms)
+  }
+
+  public getStaggerMs(): number {
+    return this.staggerMs
+  }
+
+  /**
+   * Acquire permission to press Run. Guarantees that at least `staggerMs` (default 20s)
+   * has elapsed since the previous window pressed Run across ALL workers and scans.
+   */
+  public async acquireRunSlot(
+    jobLabel: string,
+    options?: {
+      isAborted?: () => boolean
+      onWait?: (waitRemainingSec: number) => void
+    },
+  ): Promise<void> {
+    let releaseQueue!: () => void
+    const nextInQueue = new Promise<void>((resolve) => {
+      releaseQueue = resolve
+    })
+
+    const prevInQueue = this.queueTail
+    this.queueTail = prevInQueue.then(() => nextInQueue).catch(() => nextInQueue)
+
+    await prevInQueue
+
+    try {
+      if (options?.isAborted?.()) {
+        return
+      }
+
+      const now = Date.now()
+      const elapsedSinceLastRun = now - this.lastRunAt
+      if (this.lastRunAt > 0 && elapsedSinceLastRun < this.staggerMs) {
+        const remainingMs = this.staggerMs - elapsedSinceLastRun
+        const remainingSec = Math.ceil(remainingMs / 1000)
+        options?.onWait?.(remainingSec)
+        await new Promise((r) => setTimeout(r, remainingMs))
+      }
+
+      this.lastRunAt = Date.now()
+    } finally {
+      releaseQueue()
+    }
+  }
+
+  public recordRunPressed() {
+    this.lastRunAt = Date.now()
+  }
+}
+
+const globalForRunStaggerGate = globalThis as unknown as {
+  __cmtStudioRunStaggerGate?: GlobalStudioRunStaggerGate
+}
+
+export const globalStudioRunStaggerGate: GlobalStudioRunStaggerGate =
+  globalForRunStaggerGate.__cmtStudioRunStaggerGate ||
+  (globalForRunStaggerGate.__cmtStudioRunStaggerGate = new GlobalStudioRunStaggerGate())
 
 let globalClipboardLockPromise: Promise<void> = Promise.resolve()
 
@@ -1548,8 +1622,193 @@ export class StudioBrowserController {
     }
   }
 
+  /**
+   * Detect if Google AI Studio's "Model selection" side panel / drawer / modal is currently open.
+   * If detected, clicks its top-right cross (X) button to close it, waits for it to dismiss,
+   * and falls back to pressing Escape if still visible.
+   * This prevents the Model Selection panel from intercepting pointer events and blocking
+   * video attachments or other UI actions.
+   */
+  public async closeModelSelectionPanelIfOpen(page: Page): Promise<boolean> {
+    try {
+      if (!page || page.isClosed()) return false
+
+      const isPanelOpen = await page.evaluate(() => {
+        const isVisible = (el: Element | null): el is HTMLElement => {
+          if (!el) return false
+          const h = el as HTMLElement
+          const r = h.getBoundingClientRect()
+          return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+        }
+
+        // 1. Look for explicit "Model selection" heading or title
+        const allHeadings = Array.from(
+          document.querySelectorAll('h1, h2, h3, h4, h5, div, span, header, [role="heading"]'),
+        )
+        const hasModelSelectionTitle = allHeadings.some((el) => {
+          if (!isVisible(el)) return false
+          const txt = (el.innerText || el.textContent || '').trim()
+          return /^model\s+selection$/i.test(txt)
+        })
+
+        // 2. Look for "Search for a model or agent" input
+        const searchInput = Array.from(
+          document.querySelectorAll(
+            'input[placeholder*="Search for a model" i], input[placeholder*="Search models" i], input[aria-label*="Search for a model" i]',
+          ),
+        ).some(isVisible)
+
+        // 3. Look for model selection container / panel
+        const modelSelectionPane = Array.from(
+          document.querySelectorAll(
+            'ms-model-picker, ms-model-selection, .model-selection-panel, [data-test-id*="model-selection" i]',
+          ),
+        ).some(isVisible)
+
+        return hasModelSelectionTitle || searchInput || modelSelectionPane
+      })
+
+      if (!isPanelOpen) return false
+
+      this.logStep('closing model selection', 'Detected open "Model selection" panel — clicking cross (X) button to dismiss', 'info')
+
+      // Step 1: Click the close / cross button via DOM evaluation (handles shadow DOM, nested buttons, exact position)
+      const clickedCross = await page
+        .evaluate(() => {
+          const isVisible = (el: Element | null): el is HTMLElement => {
+            if (!el) return false
+            const h = el as HTMLElement
+            const r = h.getBoundingClientRect()
+            return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+          }
+
+          // Find the "Model selection" heading or container
+          const allElements = Array.from(
+            document.querySelectorAll(
+              'h1, h2, h3, h4, h5, div, span, header, [role="heading"], ms-model-picker, ms-model-selection, aside, mat-sidenav, mat-drawer',
+            ),
+          )
+          const headerEl = allElements.find((el) => {
+            if (!isVisible(el)) return false
+            const txt = (el.innerText || el.textContent || '').trim()
+            return /^model\s+selection$/i.test(txt)
+          })
+
+          if (headerEl) {
+            let container: HTMLElement | null = headerEl as HTMLElement
+            for (let i = 0; i < 5 && container && container.parentElement; i++) {
+              container = container.parentElement
+              const btns = Array.from(container.querySelectorAll('button, [role="button"]')).filter(isVisible)
+              for (const b of btns) {
+                const aria = (b.getAttribute('aria-label') || '').trim()
+                const title = (b.getAttribute('title') || b.getAttribute('mattooltip') || '').trim()
+                const txt = (b.innerText || b.textContent || '').trim()
+                const hasCloseIcon =
+                  Boolean(b.querySelector('mat-icon, span.material-symbols-outlined, span.google-symbols, svg')) &&
+                  /close|clear|cancel/i.test(b.innerHTML || '')
+                if (
+                  /\b(close|dismiss)\b/i.test(aria) ||
+                  /\b(close|dismiss)\b/i.test(title) ||
+                  /^(close|×|✕|✖|x)$/i.test(txt) ||
+                  hasCloseIcon
+                ) {
+                  b.click()
+                  return true
+                }
+              }
+            }
+          }
+
+          // Fallback: search for close button near search input
+          const searchInput = document.querySelector(
+            'input[placeholder*="Search for a model" i], input[placeholder*="Search models" i], input[aria-label*="Search for a model" i]',
+          ) as HTMLElement | null
+          if (searchInput && isVisible(searchInput)) {
+            let parent = searchInput.parentElement
+            for (let i = 0; i < 6 && parent; i++) {
+              const btns = Array.from(parent.querySelectorAll('button, [role="button"]')).filter(isVisible)
+              for (const b of btns) {
+                const aria = (b.getAttribute('aria-label') || '').trim()
+                const title = (b.getAttribute('title') || b.getAttribute('mattooltip') || '').trim()
+                const txt = (b.innerText || b.textContent || '').trim()
+                const hasCloseIcon =
+                  Boolean(b.querySelector('mat-icon, span.material-symbols-outlined, span.google-symbols, svg')) &&
+                  /close|clear|cancel/i.test(b.innerHTML || '')
+                if (
+                  /\b(close|dismiss)\b/i.test(aria) ||
+                  /\b(close|dismiss)\b/i.test(title) ||
+                  /^(close|×|✕|✖|x)$/i.test(txt) ||
+                  hasCloseIcon
+                ) {
+                  b.click()
+                  return true
+                }
+              }
+              parent = parent.parentElement
+            }
+          }
+
+          return false
+        })
+        .catch(() => false)
+
+      await new Promise((r) => setTimeout(r, 250))
+
+      // Step 2: If DOM evaluate didn't click, try Playwright locators for close button
+      if (!clickedCross) {
+        for (const sel of STUDIO_SELECTORS.modelSelectionCloseButton) {
+          try {
+            const loc = page.locator(sel).first()
+            if ((await loc.count()) > 0 && (await loc.isVisible().catch(() => false))) {
+              await loc.click({ timeout: 1000 }).catch(() => {})
+              break
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+
+      await new Promise((r) => setTimeout(r, 250))
+
+      // Step 3: Check if still open; if so, press Escape key
+      const stillOpen = await page
+        .evaluate(() => {
+          const searchInput = document.querySelector(
+            'input[placeholder*="Search for a model" i], input[placeholder*="Search models" i], input[aria-label*="Search for a model" i]',
+          ) as HTMLElement | null
+          return Boolean(searchInput && searchInput.getBoundingClientRect().height > 0)
+        })
+        .catch(() => false)
+
+      if (stillOpen) {
+        await page.keyboard.press('Escape').catch(() => {})
+        await new Promise((r) => setTimeout(r, 200))
+      }
+
+      // Step 4: Ensure no residual backdrop is left intercepting pointer events
+      await page
+        .evaluate(() => {
+          const backdrops = Array.from(
+            document.querySelectorAll('.cdk-overlay-backdrop.dialog-backdrop-blur-overlay, .cdk-overlay-backdrop'),
+          ) as HTMLElement[]
+          for (const b of backdrops) {
+            b.click()
+            b.remove()
+          }
+        })
+        .catch(() => {})
+
+      this.logStep('model selection closed', 'Model selection panel closed successfully', 'info')
+      return true
+    } catch {
+      return false
+    }
+  }
+
   public async dismissAnyOnboardingModals(page: Page) {
     await this.closePaidApiKeyPopupByCrossButton(page)
+    await this.closeModelSelectionPanelIfOpen(page)
 
     for (const sel of STUDIO_SELECTORS.dismissDialogs) {
       try {
@@ -1831,6 +2090,7 @@ export class StudioBrowserController {
    */
   private async dismissOpenOverlayIfAny(page: Page): Promise<void> {
     try {
+      await this.closeModelSelectionPanelIfOpen(page)
       const hasOpenOverlay = await page.evaluate(() => {
         const activeOverlay = document.querySelector(
           '.cdk-overlay-pane [role="menu"], .cdk-overlay-pane [role="listbox"], .cdk-overlay-pane mat-option, .cdk-overlay-pane [role="option"]',
@@ -2036,6 +2296,21 @@ export class StudioBrowserController {
       await trigger.click().catch(() => {})
       await new Promise((r) => setTimeout(r, 450))
 
+      // If search input exists in the opened model picker, type the query to filter the cards
+      try {
+        const searchInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSearchInput, 800)
+        if (searchInput) {
+          const searchQuery = isArgon ? 'Argon' : desiredVersion ? `${desiredVersion}` : desired
+          await searchInput.click().catch(() => {})
+          await searchInput.fill(searchQuery).catch(() => {})
+          await searchInput.dispatchEvent('input').catch(() => {})
+          await searchInput.dispatchEvent('change').catch(() => {})
+          await new Promise((r) => setTimeout(r, 450))
+        }
+      } catch {
+        /* ignore */
+      }
+
       const clickedModel = await page
         .evaluate(
           ({ ver, wantFlash, wantArgon, fullLabel }) => {
@@ -2048,7 +2323,7 @@ export class StudioBrowserController {
 
             const roots = Array.from(
               document.querySelectorAll(
-                '.cdk-overlay-pane, mat-dialog-container, [role="listbox"], [role="menu"], ms-model-carousel, [class*="model-list" i], [class*="model-picker" i]',
+                '.cdk-overlay-pane, mat-dialog-container, [role="dialog"], [role="listbox"], [role="menu"], ms-model-carousel, ms-model-picker, ms-model-selection, .model-selection-panel, [class*="model-list" i], [class*="model-picker" i], [class*="model-selection" i], mat-drawer, mat-sidenav, aside',
               ),
             ).filter((el) => isVisible(el))
 
@@ -2056,7 +2331,7 @@ export class StudioBrowserController {
             for (const root of roots) {
               root
                 .querySelectorAll(
-                  'mat-option, [role="option"], [role="menuitem"], button, [class*="model-card" i], [class*="model-item" i], [class*="model-row" i]',
+                  'mat-card, ms-model-card, [class*="model-card" i], [class*="model-item" i], [class*="model-row" i], [class*="card" i], button, [role="button"], mat-option, [role="option"], [role="menuitem"], div[jslog]',
                 )
                 .forEach((n) => {
                   if (isVisible(n)) candidates.push(n as HTMLElement)
@@ -2072,7 +2347,7 @@ export class StudioBrowserController {
                   return txt
                 }
               } else if (ver) {
-                if (txt.includes(ver) && (!wantFlash || /flash/i.test(txt)) && !/lite/i.test(txt)) {
+                if (txt.includes(ver) && (!wantFlash || /flash/i.test(txt)) && !/lite/i.test(txt) && !/\btts\b/i.test(txt)) {
                   c.click()
                   return txt
                 }
@@ -2092,6 +2367,8 @@ export class StudioBrowserController {
       // Requirement 2: If selecting "Argon" (or any model) opened a "paid API key" / billing popup,
       // close it ONLY via its cross (X) button.
       await this.closePaidApiKeyPopupByCrossButton(page)
+      // ALWAYS dismiss the "Model selection" side panel via its cross (X) button if still open
+      await this.closeModelSelectionPanelIfOpen(page)
       await this.dismissOpenOverlayIfAny(page)
 
       const updatedCardText = (await this.readVisibleModelCardText(page)) || ''
@@ -2113,6 +2390,7 @@ export class StudioBrowserController {
       const res = await trySelectSingleModel(candidateModel)
       if (res.matched) {
         this.logStep('model selected', `Active model in Run Settings: ${res.cardText || candidateModel}`, 'info')
+        await this.closeModelSelectionPanelIfOpen(page)
         return {
           selectedModelName: canonicalizeStudioModelName(candidateModel),
           visibleCardText: res.cardText || candidateModel,
@@ -2129,6 +2407,7 @@ export class StudioBrowserController {
       }
     }
 
+    await this.closeModelSelectionPanelIfOpen(page)
     const fallbackCard = (await this.readVisibleModelCardText(page)) || targetModelName
     return {
       selectedModelName: canonicalizeStudioModelName(targetModelName),
@@ -2924,6 +3203,7 @@ export class StudioBrowserController {
   ) {
     const { label, driveFileName, localFilePath, startSec, endSec, fps, scope } = params
     await this.waitIfPausedOrThrowIfStopped(scope)
+    await this.closeModelSelectionPanelIfOpen(page)
 
     const uploadedBasename =
       driveFileName ||
@@ -3117,6 +3397,7 @@ export class StudioBrowserController {
       await this.waitIfPausedOrThrowIfStopped(scope)
       lastConfigError = ''
 
+      await this.closeModelSelectionPanelIfOpen(page)
       await targetChip.scrollIntoViewIfNeeded().catch(() => {})
       await targetChip.hover().catch(() => {})
       await new Promise((r) => setTimeout(r, 250))
@@ -3126,9 +3407,20 @@ export class StudioBrowserController {
       for (const btnSel of STUDIO_SELECTORS.videoChipSettingsButton) {
         const btn = targetChip.locator(btnSel).first()
         if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
-          await btn.click()
-          openedDialog = true
-          break
+          try {
+            await btn.click({ timeout: 5000 })
+            openedDialog = true
+            break
+          } catch {
+            await this.closeModelSelectionPanelIfOpen(page)
+            try {
+              await btn.click({ timeout: 5000 })
+              openedDialog = true
+              break
+            } catch {
+              /* ignore and try next button */
+            }
+          }
         }
       }
       if (!openedDialog) {
@@ -3149,9 +3441,20 @@ export class StudioBrowserController {
             .trim()
             .toLowerCase()
           if (!/\b(close|cancel|clear|remove|delete)\b|^×$|^x$/i.test(btnMeta)) {
-            await btn.click()
-            openedDialog = true
-            break
+            try {
+              await btn.click({ timeout: 5000 })
+              openedDialog = true
+              break
+            } catch {
+              await this.closeModelSelectionPanelIfOpen(page)
+              try {
+                await btn.click({ timeout: 5000 })
+                openedDialog = true
+                break
+              } catch {
+                /* continue */
+              }
+            }
           }
         }
       }
@@ -4342,6 +4645,8 @@ export class StudioBrowserController {
     const MAX_ATTEMPTS = params.maxAttempts ?? (parallelMode ? 5 : 3)
     const MAX_PERMISSION_RETRIES = 10
     let permissionDeniedRetries = 0
+    const MAX_POLICY_RETRIES = 5
+    let policyBlockedRetries = 0
     const MAX_INTERNAL_ERROR_REFRESH = 3
     let internalErrorRefreshes = 0
     const MAX_INVALID_RESULT_RETRIES = parallelMode ? MAX_ATTEMPTS : 3
@@ -4953,8 +5258,10 @@ export class StudioBrowserController {
           }
 
           try {
+            await this.closeModelSelectionPanelIfOpen(page)
             if (needAttachShort) {
               await waitUntilRamSafeForAttach('attach_short')
+              await this.closeModelSelectionPanelIfOpen(page)
               currentStage = 'setup/attach_short'
               await this.attachVideoAndConfigureRange(page, {
                 label: 'short',
@@ -4969,6 +5276,7 @@ export class StudioBrowserController {
 
             if (needAttachMovie) {
               await waitUntilRamSafeForAttach('attach_movie')
+              await this.closeModelSelectionPanelIfOpen(page)
               currentStage = 'setup/attach_movie'
               const attachMovieFilePath = windowClip?.clipPath || movieLocalPath
               const movieSizeMbForAttach = (() => {
@@ -5278,6 +5586,24 @@ export class StudioBrowserController {
           .catch(() => ({ count: 0, lastHadInternalError: false }))
 
         try {
+          // Ensure Model selection panel is closed before clicking Run
+          await this.closeModelSelectionPanelIfOpen(page)
+
+          // 20-second Run Stagger Gate across all windows:
+          // If any window pressed Run (e.g. 3.8 Flash), wait at least 20s before another window presses Run
+          const staggerSec = userCfg.studioRunStaggerSec ?? DEFAULT_STUDIO_RUN_STAGGER_SEC
+          globalStudioRunStaggerGate.setStaggerMs(staggerSec * 1000)
+          await globalStudioRunStaggerGate.acquireRunSlot(jobLabel, {
+            isAborted: () => this.isStopping(scope),
+            onWait: (waitRemainingSec) => {
+              const waitMsg = `Waiting ${waitRemainingSec}s before pressing Run on ${jobLabel} (${staggerSec}s Run stagger gate between windows)`
+              this.logStep('waiting run stagger', waitMsg, 'info')
+              onLog?.('info', `[${this.workerTag || this.profileDirName}] ${waitMsg}`)
+            },
+          })
+
+          await this.closeModelSelectionPanelIfOpen(page)
+
           // (e) Press Run (or Rerun if on same page after hard refresh and Run button is disabled while Rerun is visible)
           const runBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 4000)
           const runBtnEnabled = runBtn ? await runBtn.isEnabled().catch(() => false) : false
@@ -5313,6 +5639,7 @@ export class StudioBrowserController {
               await promptInput.press('Control+Enter')
             }
           }
+          globalStudioRunStaggerGate.recordRunPressed()
           this.logStep('press Run', `${jobLabel} [${activeModelName}]`)
 
           // Poll every 1 s up to 10-min timeout.
@@ -5459,10 +5786,6 @@ export class StudioBrowserController {
 
               activeModelName = nextAvailableModel
               this.activeModelName = activeModelName
-              activeModelIndex = Math.max(
-                0,
-                MODEL_FALLBACK_CHAIN.findIndex((m) => m.toLowerCase() === activeModelName.toLowerCase()),
-              )
 
               const switchedRes = await this.selectModelInRunSettings(
                 page,
@@ -6201,14 +6524,45 @@ export class StudioBrowserController {
           msg.startsWith('POLICY_BLOCKED:') ||
           /(prohibited_content|blocked\s+due\s+to\s+safety)/i.test(msg)
         if (isPolicy) {
+          policyBlockedRetries += 1
           const policyErr = msg.startsWith('POLICY_BLOCKED:') ? msg : `POLICY_BLOCKED: ${msg}`
-          this.logStep(`ERROR [${currentStage}]`, policyErr, 'error')
+          const maxPolicyAttempts = MAX_POLICY_RETRIES
+          this.logStep(
+            `POLICY_BLOCKED (${policyBlockedRetries}/${maxPolicyAttempts})`,
+            `${policyErr} on ${jobLabel} — retrying window in fresh chat (attempt ${policyBlockedRetries}/${maxPolicyAttempts})`,
+            'warn',
+          )
+          onLog?.(
+            'warn',
+            `POLICY_BLOCKED on ${jobLabel} (${policyBlockedRetries}/${maxPolicyAttempts}): ${policyErr} — retrying window in clean chat in ${backoffSec}s`,
+          )
+          if (policyBlockedRetries >= maxPolicyAttempts) {
+            this.logStep(
+              `ERROR [${currentStage}]`,
+              `${policyErr} (exhausted after ${maxPolicyAttempts} retries)`,
+              'error',
+            )
+            await this.recordFinishedWindowJobAndMaybeRecyclePage(
+              username,
+              effectiveRecycleInterval,
+              onLog,
+            )
+            throw new Error(`POLICY_BLOCKED_EXHAUSTED: ${policyErr} (after ${maxPolicyAttempts} retries)`)
+          }
+
+          this.logStep(
+            `RETRY [runWindowJob] (${policyBlockedRetries}/${maxPolicyAttempts})`,
+            `prohibited content recovery -> recycling page & opening fresh chat in ${backoffSec}s (retry ${policyBlockedRetries + 1}/${maxPolicyAttempts})`,
+            'warn',
+          )
           await this.recordFinishedWindowJobAndMaybeRecyclePage(
             username,
             effectiveRecycleInterval,
             onLog,
           )
-          throw new Error(policyErr)
+          await new Promise((r) => setTimeout(r, backoffSec * 1000))
+          attempt -= 1
+          continue
         }
 
         const isCrash = this.isBrowserOrTargetCrashError(msg)

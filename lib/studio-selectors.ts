@@ -87,6 +87,38 @@ export const STUDIO_SELECTORS = {
     '.mat-mdc-select-panel input',
   ],
 
+  /** Model selection panel / drawer container and cross/close button */
+  modelSelectionPanel: [
+    '.ms-sliding-right-panel-dialog',
+    '[class*="ms-sliding-right-panel-dialog" i]',
+    'mat-dialog-container:has(.mat-mdc-dialog-title:has-text("Model selection"))',
+    'mat-dialog-container:has-text("Model selection")',
+    'ms-model-picker',
+    'ms-model-selection',
+    '.model-selection-panel',
+    'mat-drawer:has-text("Model selection")',
+    'mat-sidenav:has-text("Model selection")',
+    '[role="dialog"]:has-text("Model selection")',
+    'aside:has-text("Model selection")',
+    'div:has(> * :has-text("Model selection"))',
+    'div:has(input[placeholder*="Search for a model" i])',
+  ],
+
+  modelSelectionCloseButton: [
+    'button[aria-label="Close panel" i]',
+    'button[data-test-close-button]',
+    'button[mat-dialog-close]',
+    'button[aria-label*="Close model" i]',
+    'button[aria-label="Close" i]',
+    'button[aria-label*="Close" i]',
+    'button[aria-label*="Dismiss" i]',
+    '.ms-sliding-right-panel-dialog button:has(span:has-text("close"))',
+    'button:has(mat-icon:has-text("close"))',
+    'button:has(span.material-symbols-outlined:has-text("close"))',
+    'button:has(span.google-symbols:has-text("close"))',
+    'button:has-text("close")',
+  ],
+
   /** Temperature input box (numeric input next to slider) */
   temperatureInput: [
     'input[aria-label*="Temperature" i]',

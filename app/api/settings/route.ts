@@ -180,6 +180,9 @@ export async function PUT(req: Request) {
       ...(st.studioAttachMovieFromDrive !== undefined
         ? { studioAttachMovieFromDrive: Boolean(st.studioAttachMovieFromDrive) }
         : {}),
+      ...(st.studioRunStaggerSec !== undefined
+        ? { studioRunStaggerSec: Math.max(0, Math.min(300, Math.floor(Number(st.studioRunStaggerSec) || 0))) }
+        : {}),
     })
     return NextResponse.json({ ok: true, studio: await getPublicStudioSettings(session.username) })
   }
@@ -281,6 +284,9 @@ export async function POST(req: Request) {
         : {}),
       ...(st.studioAttachMovieFromDrive !== undefined
         ? { studioAttachMovieFromDrive: Boolean(st.studioAttachMovieFromDrive) }
+        : {}),
+      ...(st.studioRunStaggerSec !== undefined
+        ? { studioRunStaggerSec: Math.max(0, Math.min(300, Math.floor(Number(st.studioRunStaggerSec) || 0))) }
         : {}),
     })
     return NextResponse.json({ ok: true, studio: await getPublicStudioSettings(username) })

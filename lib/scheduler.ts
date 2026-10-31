@@ -2105,7 +2105,10 @@ class Scheduler {
             this.mark(job)
             return
           }
-          const isPolicy = msg.startsWith('POLICY_BLOCKED:') || /prohibited_content/i.test(msg)
+          const isPolicy =
+            msg.startsWith('POLICY_BLOCKED:') ||
+            msg.startsWith('POLICY_BLOCKED_EXHAUSTED:') ||
+            /prohibited_content/i.test(msg)
           for (const seg of coveredSegs) {
             for (const ci of movieBlock.chunkIndexes) {
               const ch = seg.chunks[ci]

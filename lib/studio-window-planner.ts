@@ -439,7 +439,7 @@ export function formatParallelTimecode(seconds: number): string {
  */
 export function formatParallelRange(startSec: number, endSec: number): string {
   const sRound = Math.max(0, Math.round(startSec))
-  let eRound = Math.max(sRound, Math.round(endSec))
+  const eRound = Math.max(sRound, Math.round(endSec))
   if (eRound === sRound) {
     const sFloor = Math.max(0, Math.floor(startSec))
     const eCeil = Math.max(sFloor + 1, Math.ceil(endSec))

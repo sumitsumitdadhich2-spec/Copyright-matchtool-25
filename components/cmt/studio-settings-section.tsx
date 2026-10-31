@@ -5,7 +5,6 @@ import {
   Check,
   CloudUpload,
   Cookie,
-  Cpu,
   ExternalLink,
   HelpCircle,
   Loader2,
@@ -55,6 +54,9 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
   const [attachMovieFromDrive, setAttachMovieFromDrive] = useState<boolean>(
     studio?.studioAttachMovieFromDrive ?? false,
   )
+  const [runStaggerSec, setRunStaggerSec] = useState<number>(
+    studio?.studioRunStaggerSec ?? 20,
+  )
 
   const [cookieText, setCookieText] = useState('')
   const [savingCookies, setSavingCookies] = useState(false)
@@ -81,6 +83,7 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
     setWindowMinutes(studio.studioWindowMinutes)
     setShortPartMinutes(studio.studioShortPartMinutes)
     setWindowOverlapSec(studio.studioWindowOverlapSec)
+    setRunStaggerSec(studio.studioRunStaggerSec !== undefined ? studio.studioRunStaggerSec : 20)
     setOffsetMode(studio.studioOffsetMode)
     setLowMemoryChromeFlags(Boolean(studio.studioLowMemoryChromeFlags ?? false))
     setDisableDevShmUsage(
@@ -96,6 +99,7 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
     studio?.studioWindowMinutes,
     studio?.studioShortPartMinutes,
     studio?.studioWindowOverlapSec,
+    studio?.studioRunStaggerSec,
     studio?.studioOffsetMode,
     studio?.studioLowMemoryChromeFlags,
     studio?.studioDisableDevShmUsage,
@@ -136,6 +140,7 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
           studioWindowMinutes: Number(windowMinutes),
           studioShortPartMinutes: Number(shortPartMinutes),
           studioWindowOverlapSec: Number(windowOverlapSec),
+          studioRunStaggerSec: Math.max(0, Math.min(300, Math.floor(Number(runStaggerSec) || 0))),
           studioOffsetMode: offsetMode,
           studioLowMemoryChromeFlags: lowMemoryChromeFlags,
           studioDisableDevShmUsage: disableDevShmUsage,
@@ -621,6 +626,21 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
                 max={100}
                 value={pageRecycleInterval}
                 onChange={(e) => setPageRecycleInterval(Number(e.target.value))}
+                className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring"
+              />
+            </label>
+
+            <label className="space-y-1 text-xs sm:col-span-2">
+              <div className="flex items-center justify-between">
+                <span className="text-muted-foreground">Run stagger gate between windows (seconds, default 20)</span>
+                <span className="font-mono text-[10px] text-sky-400">Anti-403 permission guard</span>
+              </div>
+              <input
+                type="number"
+                min={0}
+                max={300}
+                value={runStaggerSec}
+                onChange={(e) => setRunStaggerSec(Number(e.target.value))}
                 className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring"
               />
             </label>
