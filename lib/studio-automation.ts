@@ -970,6 +970,109 @@ export class StudioBrowserController {
     })
   }
 
+  private appliedCookieFingerprint: string | null = null
+
+  private wipeProfileSessionFilesOnDisk(profileDir: string) {
+    const pathsToRemove = [
+      path.join(profileDir, 'storage-state.json'),
+      path.join(profileDir, 'Default', 'Cookies'),
+      path.join(profileDir, 'Default', 'Cookies-journal'),
+      path.join(profileDir, 'Default', 'Network', 'Cookies'),
+      path.join(profileDir, 'Default', 'Network', 'Cookies-journal'),
+      path.join(profileDir, 'Default', 'Local Storage'),
+      path.join(profileDir, 'Default', 'Session Storage'),
+      path.join(profileDir, 'Default', 'IndexedDB'),
+      path.join(profileDir, 'Default', 'Service Worker'),
+      path.join(profileDir, 'Default', 'SharedStorage'),
+      path.join(profileDir, 'Default', 'WebStorage'),
+    ]
+    for (const p of pathsToRemove) {
+      try {
+        fs.rmSync(p, { recursive: true, force: true })
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  public async clearAllBrowserCookiesAndStorage(): Promise<void> {
+    this.appliedCookieFingerprint = null
+    if (this.context) {
+      try {
+        await this.context.clearCookies()
+      } catch {
+        /* ignore */
+      }
+      if (this.page && !this.page.isClosed()) {
+        let cdp: Awaited<ReturnType<BrowserContext['newCDPSession']>> | null = null
+        try {
+          cdp = await this.context.newCDPSession(this.page)
+          await cdp.send('Network.clearBrowserCookies').catch(() => {})
+          await cdp.send('Network.clearBrowserCache').catch(() => {})
+          for (const origin of [
+            'https://aistudio.google.com',
+            'https://accounts.google.com',
+            'https://www.google.com',
+          ]) {
+            await cdp
+              .send('Storage.clearDataForOrigin', {
+                origin,
+                storageTypes: 'all',
+              })
+              .catch(() => {})
+          }
+        } catch {
+          /* ignore */
+        } finally {
+          if (cdp) await cdp.detach().catch(() => {})
+        }
+      }
+    }
+  }
+
+  public async syncContextCookiesWithSettings(
+    username: string,
+    forceApply = false,
+  ): Promise<void> {
+    if (!this.context) return
+    const fingerprint = await getSettingsCookieFingerprint(username)
+    if (!forceApply && this.appliedCookieFingerprint === fingerprint) {
+      return
+    }
+
+    const cookies = await loadDecryptedPlaywrightCookies(username)
+    // Always wipe any existing browser cookies/storage first when syncing or switching cookies
+    await this.clearAllBrowserCookiesAndStorage()
+
+    if (cookies.length === 0) {
+      this.appliedCookieFingerprint = 'NONE'
+      this.lastInjectedCookieUser = null
+      this.logStep(
+        'cookies cleared',
+        'No cookies configured in Settings — cleared all browser cookies & session storage',
+        'warn',
+      )
+      return
+    }
+
+    try {
+      await this.context.addCookies(cookies)
+      this.appliedCookieFingerprint = fingerprint
+      this.lastInjectedCookieUser = username
+      this.logStep(
+        'cookies loaded from Settings',
+        `${cookies.length} Google cookie(s) applied from Settings (id=${fingerprint.slice(0, 8)})`,
+        'info',
+      )
+    } catch (err) {
+      this.logStep(
+        'cookie warning',
+        `Some cookies could not be added: ${err instanceof Error ? err.message : String(err)}`,
+        'warn',
+      )
+    }
+  }
+
   public async ensurePage(username: string): Promise<Page> {
     if (this.pageCrashed) {
       await this.forceRestartDeadBrowser()
@@ -980,7 +1083,7 @@ export class StudioBrowserController {
           origin: 'https://aistudio.google.com',
         })
         .catch(() => {})
-      this.lastInjectedCookieUser = username
+      await this.syncContextCookiesWithSettings(username, false)
       if (!this.browserLaunchInfo) {
         const pwPath = chromium.executablePath()
         const sysChrome = ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium'].find((p) =>
@@ -1003,6 +1106,9 @@ export class StudioBrowserController {
 
         const profileDir = path.join(DATA_DIR, this.profileDirName)
         if (!fs.existsSync(profileDir)) fs.mkdirSync(profileDir, { recursive: true })
+        // Wipe any stale disk cookies/session files inside the profile dir before launching so Settings is the sole source of truth
+        this.wipeProfileSessionFilesOnDisk(profileDir)
+        this.appliedCookieFingerprint = null
 
         const displayEnv = await this.ensureXvfbDisplay()
         const userCfg = await loadStudioUserConfig(username)
@@ -1125,26 +1231,14 @@ export class StudioBrowserController {
           })
           .catch(() => {})
 
-        // If the profile has no Google cookies yet, seed once from any pasted/saved user cookies
-        try {
-          const existingGoogleCookies = await this.context.cookies([
-            'https://aistudio.google.com',
-            'https://accounts.google.com',
-          ])
-          if (existingGoogleCookies.length === 0) {
-            await this.injectUserCookies(username)
-          }
-        } catch {
-          /* ignore initial cookie check */
-        }
-
         const pages = this.context.pages()
         this.page = pages.length > 0 ? pages[0] : await this.context.newPage()
         this.pageCrashed = false
         this.attachPageLifecycleListeners(this.page)
         await this.page.setViewportSize(VIEWPORT)
 
-        this.lastInjectedCookieUser = username
+        // Strictly apply cookies from Settings (or clear all if none set in Settings)
+        await this.syncContextCookiesWithSettings(username, true)
         return this.page
       } finally {
         this.launching = null
@@ -1155,54 +1249,17 @@ export class StudioBrowserController {
   }
 
   /**
-   * Persist updated/rotated Google cookies and storage state from the persistent browser context
-   * after every job (Google cookies rotate frequently during active sessions).
+   * Do NOT write browser cookies back into Settings (`StudioUserConfig`).
+   * Cookies must be controlled exclusively from Settings so stale worker profiles can never
+   * resurrect deleted cookies or overwrite newly pasted cookies.
    */
-  public async saveRotatedSessionFromContext(username: string): Promise<void> {
-    if (!this.context) return
-    try {
-      const profileDir = path.join(DATA_DIR, this.profileDirName)
-      const statePath = path.join(profileDir, 'storage-state.json')
-      const state = await this.context.storageState({ path: statePath })
-      const rotatedCookies = await this.context.cookies([
-        'https://aistudio.google.com',
-        'https://accounts.google.com',
-        'https://google.com',
-      ])
-      const cookiesToSave = rotatedCookies.length > 0 ? rotatedCookies : state.cookies
-      if (cookiesToSave.length > 0) {
-        const encrypted = encryptSecret(JSON.stringify(cookiesToSave))
-        await saveStudioUserConfig(username, {
-          encryptedCookies: encrypted,
-        })
-      }
-    } catch {
-      /* ignore cookie rotation persistence warning */
-    }
+  public async saveRotatedSessionFromContext(_username: string): Promise<void> {
+    // Intentionally a no-op: Settings is the single source of truth for cookies.
   }
 
   public async applySavedCookiesToContext(username: string): Promise<void> {
     if (!this.context) return
-    await this.injectUserCookies(username)
-    await this.saveRotatedSessionFromContext(username)
-  }
-
-  private async injectUserCookies(username: string) {
-    if (!this.context) return
-    const cookies = await loadDecryptedPlaywrightCookies(username)
-    if (cookies.length > 0) {
-      try {
-        await this.context.addCookies(cookies)
-        this.lastInjectedCookieUser = username
-        this.logStep('cookies loaded', `${cookies.length} Google cookie(s) applied to browser session`)
-      } catch (err) {
-        this.logStep(
-          'cookie warning',
-          `Some cookies could not be added: ${err instanceof Error ? err.message : String(err)}`,
-          'warn',
-        )
-      }
-    }
+    await this.syncContextCookiesWithSettings(username, true)
   }
 
   public setTestClipResult(result: StudioTestClipResult | null) {

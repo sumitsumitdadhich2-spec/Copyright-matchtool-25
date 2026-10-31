@@ -29,6 +29,7 @@ import {
   normalizeStudioThinkingLevel,
   resetModelQuotaState,
 } from '@/lib/studio-model-state'
+import { globalProfileSlotPool } from '@/lib/studio-parallel-manager'
 
 export const runtime = 'nodejs'
 
@@ -222,12 +223,15 @@ export async function POST(req: Request) {
       encryptedCookies: undefined,
       lastLoginStatus: 'untested',
       lastLoginEmail: null,
+      lastLoginTestedAt: null,
     })
+    await globalProfileSlotPool.purgeAllWorkerProfilesAndContexts()
     return NextResponse.json({ ok: true, studio: await getPublicStudioSettings(username) })
   }
   if (typeof body.googleCookies === 'string') {
     try {
       const { count } = await saveUserGoogleCookies(username, body.googleCookies)
+      await globalProfileSlotPool.purgeAllWorkerProfilesAndContexts()
       return NextResponse.json({ ok: true, count, studio: await getPublicStudioSettings(username) })
     } catch (err) {
       return NextResponse.json(

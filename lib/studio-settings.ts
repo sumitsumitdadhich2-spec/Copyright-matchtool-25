@@ -340,6 +340,8 @@ export async function saveUserGoogleCookies(username: string, rawCookieJson: str
   await saveStudioUserConfig(username, {
     encryptedCookies,
     lastLoginStatus: 'untested',
+    lastLoginEmail: null,
+    lastLoginTestedAt: null,
   })
   return { count: cookies.length }
 }
@@ -352,18 +354,19 @@ export async function loadDecryptedPlaywrightCookies(username: string): Promise<
       const parsed = parseCookieInputToPlaywright(plain)
       if (parsed.length > 0) return parsed
     } catch {
-      // fall through to env fallback
-    }
-  }
-  const envCookies = (process.env.STUDIO_COOKIES_JSON || '').trim()
-  if (envCookies) {
-    try {
-      return parseCookieInputToPlaywright(envCookies)
-    } catch {
       return []
     }
   }
   return []
+}
+
+export async function getSettingsCookieFingerprint(username: string): Promise<string> {
+  const cookies = await loadDecryptedPlaywrightCookies(username)
+  if (cookies.length === 0) return 'NONE'
+  const canonical = JSON.stringify(
+    cookies.map((c) => ({ name: c.name, value: c.value, domain: c.domain, path: c.path })),
+  )
+  return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 16)
 }
 
 export async function saveUserDriveTokens(username: string, bundle: DriveTokenBundle): Promise<void> {
@@ -395,13 +398,6 @@ export async function getPublicStudioSettings(username: string): Promise<PublicS
     try {
       const cookies = JSON.parse(decryptSecret(cfg.encryptedCookies))
       if (Array.isArray(cookies)) cookieCount = cookies.length
-    } catch {
-      cookieCount = 0
-    }
-  }
-  if (cookieCount === 0 && (process.env.STUDIO_COOKIES_JSON || '').trim()) {
-    try {
-      cookieCount = parseCookieInputToPlaywright(process.env.STUDIO_COOKIES_JSON!).length
     } catch {
       cookieCount = 0
     }

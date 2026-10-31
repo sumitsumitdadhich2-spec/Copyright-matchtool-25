@@ -8,6 +8,7 @@ import {
 } from '@/lib/studio-automation'
 import {
   getStudioParallelManager,
+  globalProfileSlotPool,
   resolveScanMovieDurationSec,
 } from '@/lib/studio-parallel-manager'
 import { prepareStudioMovie360pAndDrive, ensureStudioShortReady } from '@/lib/media'
@@ -132,6 +133,7 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ ok: false, error: 'Paste Cookie-Editor JSON first' }, { status: 400 })
         }
         const saved = await saveUserGoogleCookies(username, body.cookiesJson)
+        await globalProfileSlotPool.purgeAllWorkerProfilesAndContexts()
         await studioController.applySavedCookiesToContext(username)
         return NextResponse.json({
           ok: true,

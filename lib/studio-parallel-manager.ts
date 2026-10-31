@@ -796,6 +796,56 @@ class GlobalProfileSlotPool {
     await Promise.allSettled(closePromises)
   }
 
+  /**
+   * Completely wipe all cookies, session storage, and disk profile folders across main + all worker Chrome profiles (W01..W20).
+   * Called whenever cookies are saved, replaced, or deleted in Settings.
+   */
+  public async purgeAllWorkerProfilesAndContexts(): Promise<void> {
+    const { studioController } = await import('./studio-automation')
+    const tasks: Promise<unknown>[] = [
+      studioController
+        .clearAllBrowserCookiesAndStorage()
+        .catch(() => {})
+        .then(() => studioController.closeContext().catch(() => {})),
+    ]
+
+    for (const slot of this.slots.values()) {
+      slot.everLaunched = false
+      tasks.push(
+        slot.controller
+          .clearAllBrowserCookiesAndStorage()
+          .catch(() => {})
+          .then(() => slot.controller.closeContext().catch(() => {})),
+      )
+    }
+    await Promise.allSettled(tasks)
+
+    // Kill any remaining Chrome processes for base profile and w01..w20
+    await killWorkerChromeProcessesByProfileDir(BASE_PROFILE_NAME).catch(() => {})
+    for (let i = 1; i <= 20; i++) {
+      const profName = `${BASE_PROFILE_NAME}-w${String(i).padStart(2, '0')}`
+      await killWorkerChromeProcessesByProfileDir(profName).catch(() => {})
+    }
+
+    // Delete all data/studio-chrome-profile* directories from disk so zero old account data remains
+    try {
+      if (fs.existsSync(DATA_DIR)) {
+        const entries = fs.readdirSync(DATA_DIR)
+        for (const entry of entries) {
+          if (entry === BASE_PROFILE_NAME || entry.startsWith(`${BASE_PROFILE_NAME}-w`)) {
+            try {
+              fs.rmSync(path.join(DATA_DIR, entry), { recursive: true, force: true })
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
   public getLeasedSlotsForScan(scanId: string): ProfileSlotEntry[] {
     const out: ProfileSlotEntry[] = []
     for (const slot of this.slots.values()) {
