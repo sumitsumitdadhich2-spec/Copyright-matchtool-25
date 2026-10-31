@@ -4319,7 +4319,12 @@ export class StudioBrowserController {
       MODEL_FALLBACK_CHAIN.findIndex((m) => m.toLowerCase() === activeModelName.toLowerCase()),
     )
     let resetOnPermissionDenied = false
-    let resetOnInternalError = false
+    let pendingInternalErrorAction:
+      | 'none'
+      | 'same_page_hard_refresh'
+      | 'browser_restart'
+      | 'last_resort_new_chat' = 'none'
+    let lastKnownSettledTokens: number | null = null
 
     this.activeMaxAttempts = MAX_ATTEMPTS
     this.activeModelName = activeModelName
@@ -4350,6 +4355,12 @@ export class StudioBrowserController {
       let currentStage = 'setup/ensure_page'
       await this.waitIfPausedOrThrowIfStopped(scope)
 
+      const currentInternalErrorAction = pendingInternalErrorAction
+      pendingInternalErrorAction = 'none'
+      const isSamePageHardRefresh = currentInternalErrorAction === 'same_page_hard_refresh'
+      const isInternalErrorBrowserRestart = currentInternalErrorAction === 'browser_restart'
+      const isInternalErrorLastResortNewChat = currentInternalErrorAction === 'last_resort_new_chat'
+
       try {
         let page = await this.ensurePage(username)
         if (this.browserLaunchInfo && attempt === 1 && permissionDeniedRetries === 0 && internalErrorRefreshes === 0) {
@@ -4357,17 +4368,21 @@ export class StudioBrowserController {
           this.logStep('browser info', this.browserLaunchInfo, isFallbackWarn ? 'warn' : 'info')
         }
 
-        // (a) On 403 PERMISSION_DENIED retry OR internal error hard refresh: alternate between:
+        let urlBeforeReload = ''
+        let urlAfterReload = ''
+
+        // (a) On 403 PERMISSION_DENIED retry: alternate between:
         //   - Odd retry (1, 3, 5...): Hard page reset (close old page, clear cache + site storage via CDP without touching cookies, open fresh page in same context, goto new_chat)
         //   - Even retry (2, 4, 6...): Full browser restart (close context, relaunch persistent profile, open fresh page, goto new_chat)
-        // On normal start or any other error retry: open a NEW chat on aistudio.google.com.
-        if (resetOnPermissionDenied || resetOnInternalError) {
-          const isInternalErrReset = resetOnInternalError
+        // On internal error:
+        //   - 1st & 2nd time: REAL Chrome hard refresh on the SAME page via CDP (Page.reload ignoreCache=true, no page close, no new_chat, no clearDataForOrigin)
+        //   - 3rd time: Browser restart (persistent profile relaunch, cookies & origin storage preserved, no clearDataForOrigin)
+        //   - After 3rd time (last resort): New chat (retry same window)
+        if (resetOnPermissionDenied) {
           resetOnPermissionDenied = false
-          resetOnInternalError = false
-          const resetCounter = isInternalErrReset ? internalErrorRefreshes : permissionDeniedRetries
-          const resetMax = isInternalErrReset ? MAX_INTERNAL_ERROR_REFRESH : MAX_PERMISSION_RETRIES
-          const resetPrefix = isInternalErrReset ? 'internal error' : '403'
+          const resetCounter = permissionDeniedRetries
+          const resetMax = MAX_PERMISSION_RETRIES
+          const resetPrefix = '403'
           const isHardPageReset = resetCounter % 2 === 1
           const storageTypesToClear = 'local_storage,indexeddb,cache_storage,service_workers,websql'
 
@@ -4477,8 +4492,84 @@ export class StudioBrowserController {
               timeout: 45_000,
             })
           }
+        } else if (isSamePageHardRefresh) {
+          currentStage = 'setup/hard_refresh_same_page'
+          urlBeforeReload = page.url()
+          let reloadMethod = 'CDP Page.reload(ignoreCache=true)'
+          let client: Awaited<ReturnType<BrowserContext['newCDPSession']>> | null = null
+          try {
+            client = await page.context().newCDPSession(page)
+            await client.send('Network.setCacheDisabled', { cacheDisabled: true })
+            const navPromise = page
+              .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45_000 })
+              .catch(() => null)
+            await client.send('Page.reload', { ignoreCache: true })
+            await navPromise
+            await page.waitForLoadState('domcontentloaded', { timeout: 30_000 }).catch(() => {})
+            await page.waitForLoadState('load', { timeout: 15_000 }).catch(() => {})
+          } catch (cdpErr) {
+            const cdpErrMsg = cdpErr instanceof Error ? cdpErr.message : String(cdpErr)
+            this.logStep(
+              'hard refresh CDP fallback',
+              `${jobLabel}: CDP reload failed (${cdpErrMsg.slice(0, 100)}) -> trying page.reload / Control+Shift+R`,
+              'warn',
+            )
+            try {
+              reloadMethod = 'page.reload(domcontentloaded)'
+              await page.reload({ waitUntil: 'domcontentloaded', timeout: 45_000 })
+            } catch {
+              reloadMethod = 'keyboard Control+Shift+R'
+              const kbNav = page
+                .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45_000 })
+                .catch(() => null)
+              await page.keyboard.press('Control+Shift+R').catch(() => {})
+              await kbNav
+            }
+          } finally {
+            if (client) {
+              await client.send('Network.setCacheDisabled', { cacheDisabled: false }).catch(() => {})
+              await client.detach().catch(() => {})
+            }
+          }
+
+          // Wait for AI Studio UI ready (prompt box visible)
+          const uiReadyPrompt = await findFirstVisibleLocator(page, STUDIO_SELECTORS.promptInput, 25_000)
+          urlAfterReload = page.url()
+          const sameUrlFlag = urlBeforeReload === urlAfterReload
+          const refreshLogStep = `internal error -> REAL hard refresh (page.reload ignoreCache, same page) (refresh ${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
+          const refreshDetail = `${jobLabel} (refresh ${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH}, model=${activeModelName}, method=${reloadMethod}, sameUrl=${sameUrlFlag}, uiReady=${Boolean(uiReadyPrompt)})`
+          this.logStep(refreshLogStep, refreshDetail, 'info')
+          onLog?.('info', `${refreshLogStep}: ${refreshDetail}`)
+        } else if (isInternalErrorBrowserRestart) {
+          currentStage = 'setup/browser_restart'
+          // 3rd internal error: restart browser (persistent profile relaunch) WITHOUT clearDataForOrigin
+          if (this.context) {
+            try {
+              await this.context.close()
+            } catch {
+              /* ignore context close warning */
+            }
+            this.context = null
+            this.page = null
+          }
+          await new Promise((r) => setTimeout(r, 1000))
+          page = await this.ensurePage(username)
+          const restartLogStep = `internal error -> browser restart (persistent profile relaunch) (refresh ${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
+          const restartDetail = `${jobLabel} (refresh ${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH}, model=${activeModelName}) — persistent profile (${this.profileDirName}) relaunched (cookies & origin storage preserved)`
+          this.logStep(restartLogStep, restartDetail, 'info')
+          onLog?.('info', `${restartLogStep}: ${restartDetail}`)
+          await page.goto(STUDIO_URLS.newChat, {
+            waitUntil: 'domcontentloaded',
+            timeout: 45_000,
+          })
         } else {
           currentStage = 'setup/new_chat'
+          if (isInternalErrorLastResortNewChat) {
+            const lastResortStep = 'internal error -> last resort: naya chat (retry same window)'
+            const lastResortDetail = `${jobLabel} (after ${MAX_INTERNAL_ERROR_REFRESH}/${MAX_INTERNAL_ERROR_REFRESH} refreshes, attempt ${attempt}/${MAX_ATTEMPTS}, model=${activeModelName})`
+            this.logStep(lastResortStep, lastResortDetail, 'warn')
+            onLog?.('warn', `${lastResortStep}: ${lastResortDetail}`)
+          }
           this.logStep('opening new chat', `${jobLabel} (attempt ${attempt}/${MAX_ATTEMPTS}, model=${activeModelName})`)
           await page.goto(STUDIO_URLS.newChat, {
             waitUntil: 'domcontentloaded',
@@ -4507,28 +4598,259 @@ export class StudioBrowserController {
           )
         }
 
-        // (b) Configure Run Settings (panel is already open in new chat: wait for elements, select model/fallback model, set Thinking=chosen level; leave panel open)
-        currentStage = 'setup/run_settings'
-        const runSettingsRes = await this.configureRunSettings(
-          page,
-          {
-            modelName: activeModelName,
-            maxOutputTokens,
-            thinkingLevel: effectiveThinkingLevel,
-            fallbackChain: MODEL_FALLBACK_CHAIN,
-          },
-          scope,
-        )
-        if (runSettingsRes.selectedModelName && runSettingsRes.selectedModelName !== activeModelName) {
-          activeModelName = runSettingsRes.selectedModelName
-          this.activeModelName = activeModelName
-          const newIdx = MODEL_FALLBACK_CHAIN.findIndex(
-            (m) => m.toLowerCase() === activeModelName.toLowerCase(),
-          )
-          if (newIdx >= 0) activeModelIndex = newIdx
+        const promptText = buildStudioChunkPrompt({
+          movieWindowSec: movieEndSec - movieStartSec,
+          shortPartSec: shortEndSec - shortStartSec,
+          sanitized,
+        })
+
+        let needConfigureRunSettings = true
+        let needAttachShort = true
+        let needAttachMovie = true
+        let needPastePrompt = true
+
+        if (isSamePageHardRefresh) {
+          currentStage = 'setup/verify_after_hard_refresh'
+          urlAfterReload = page.url()
+          const sameChatUrl = urlBeforeReload === urlAfterReload
+
+          const shortBaseName = (
+            shortDriveFileName ||
+            (shortLocalPath ? path.basename(shortLocalPath) : '')
+          ).toLowerCase()
+          const movieBaseName = (
+            (windowClip?.clipPath ? path.basename(windowClip.clipPath) : '') ||
+            movieDriveFileName ||
+            (movieLocalPath ? path.basename(movieLocalPath) : '')
+          ).toLowerCase()
+
+          const syncedComposerChips = await this.syncFallbackMediaChips(page)
+          const currentTokensAfterReload = await this.readStudioTokenCount(page)
+
+          const pageState = await page
+            .evaluate(
+              ({
+                expectedModel,
+                expectedThinking,
+                shortName,
+                movieName,
+                modelTriggerSels,
+                promptInputSels,
+              }) => {
+                const isVis = (el: Element | null): el is HTMLElement => {
+                  if (!el) return false
+                  const h = el as HTMLElement
+                  const r = h.getBoundingClientRect()
+                  return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+                }
+
+                // 1. Check currently displayed model & thinking level in Run Settings
+                let displayedModel = ''
+                for (const sel of modelTriggerSels) {
+                  try {
+                    const el = document.querySelector(sel)
+                    if (isVis(el)) {
+                      displayedModel = (el.innerText || el.textContent || '').trim()
+                      if (displayedModel) break
+                    }
+                  } catch {
+                    /* ignore */
+                  }
+                }
+                const modelMatches =
+                  displayedModel.length > 0 &&
+                  displayedModel.toLowerCase().includes(expectedModel.toLowerCase())
+
+                let displayedThinking = ''
+                const thinkEl = document.querySelector(
+                  'ms-thinking-level-select mat-select, ms-thinking-level-select [role="combobox"], ms-thinking-level-select',
+                )
+                if (isVis(thinkEl)) {
+                  displayedThinking = (thinkEl.innerText || thinkEl.textContent || '').trim()
+                }
+                const thinkingMatches =
+                  !thinkEl ||
+                  displayedThinking.toLowerCase().includes(expectedThinking.toLowerCase())
+
+                // 2. Check attached video chips in composer and in chat turns
+                const chipLabels: string[] = []
+                const chipSelectors = [
+                  'button[aria-label*="Edit video options" i]',
+                  'button[aria-label*="Video options" i]',
+                  'button[aria-label*="Edit media options" i]',
+                  '[data-cmt-chip-idx]',
+                  'ms-prompt-chip',
+                  'ms-media-chip',
+                  'ms-video-chunk',
+                  'ms-chat-turn video',
+                ]
+                const seenChipEls = new Set<Element>()
+                for (const sel of chipSelectors) {
+                  try {
+                    const nodes = Array.from(document.querySelectorAll(sel))
+                    for (const node of nodes) {
+                      if (!isVis(node)) continue
+                      const container =
+                        node.closest(
+                          'ms-prompt-chip, ms-media-chip, ms-video-chunk, .chip, .media-chip, [data-cmt-chip-idx]',
+                        ) ||
+                        node.parentElement ||
+                        node
+                      if (seenChipEls.has(container)) continue
+                      seenChipEls.add(container)
+                      const label = (
+                        (container as HTMLElement).innerText ||
+                        container.textContent ||
+                        container.getAttribute('aria-label') ||
+                        node.getAttribute('aria-label') ||
+                        ''
+                      )
+                        .trim()
+                        .toLowerCase()
+                      chipLabels.push(label)
+                    }
+                  } catch {
+                    /* ignore */
+                  }
+                }
+
+                const hasShortByName =
+                  shortName.length > 0 && chipLabels.some((l) => l.includes(shortName))
+                const hasMovieByName =
+                  movieName.length > 0 && chipLabels.some((l) => l.includes(movieName))
+
+                // 3. Check prompt text in prompt input or committed user turn
+                let promptBoxText = ''
+                for (const sel of promptInputSels) {
+                  try {
+                    const el = document.querySelector(sel)
+                    if (isVis(el)) {
+                      const val =
+                        (el as HTMLTextAreaElement).value ??
+                        el.innerText ??
+                        el.textContent ??
+                        ''
+                      promptBoxText = String(val).trim()
+                      if (promptBoxText) break
+                    }
+                  } catch {
+                    /* ignore */
+                  }
+                }
+
+                let turnHasPromptText = false
+                const turns = Array.from(
+                  document.querySelectorAll('ms-chat-turn, [data-turn-role="user"], .user-turn'),
+                )
+                for (const t of turns) {
+                  const txt = ((t as HTMLElement).innerText || t.textContent || '').trim()
+                  if (/HISSA\s*1/i.test(txt) && /HISSA\s*2/i.test(txt)) {
+                    turnHasPromptText = true
+                    break
+                  }
+                }
+
+                const runBtns = Array.from(
+                  document.querySelectorAll(
+                    'ms-run-button button, button.run-button, button[aria-label*="Run" i], button[aria-label*="Rerun" i], button[mattooltip*="Rerun" i]',
+                  ),
+                )
+                let runOrRerunEnabled = false
+                for (const b of runBtns) {
+                  if (!isVis(b)) continue
+                  const btn = b as HTMLButtonElement
+                  if (!btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+                    runOrRerunEnabled = true
+                    break
+                  }
+                }
+
+                return {
+                  displayedModel,
+                  modelMatches,
+                  displayedThinking,
+                  thinkingMatches,
+                  chipCount: chipLabels.length,
+                  hasShortByName,
+                  hasMovieByName,
+                  promptBoxLen: promptBoxText.length,
+                  promptBoxHasHissa: /HISSA\s*1/i.test(promptBoxText),
+                  turnHasPromptText,
+                  runOrRerunEnabled,
+                }
+              },
+              {
+                expectedModel: activeModelName,
+                expectedThinking: effectiveThinkingLevel,
+                shortName: shortBaseName,
+                movieName: movieBaseName,
+                modelTriggerSels: [...STUDIO_SELECTORS.modelSelectorTrigger],
+                promptInputSels: [...STUDIO_SELECTORS.promptInput],
+              },
+            )
+            .catch(() => ({
+              displayedModel: '',
+              modelMatches: false,
+              displayedThinking: '',
+              thinkingMatches: false,
+              chipCount: 0,
+              hasShortByName: false,
+              hasMovieByName: false,
+              promptBoxLen: 0,
+              promptBoxHasHissa: false,
+              turnHasPromptText: false,
+              runOrRerunEnabled: false,
+            }))
+
+          const effectiveChipCount = Math.max(syncedComposerChips.length, pageState.chipCount)
+          const tokensShowBothAttached =
+            currentTokensAfterReload !== null &&
+            currentTokensAfterReload >= minPlausible24FpsTokens
+
+          const shortAttached =
+            pageState.hasShortByName || effectiveChipCount >= 2 || tokensShowBothAttached
+          const movieAttached =
+            pageState.hasMovieByName || effectiveChipCount >= 2 || tokensShowBothAttached
+
+          needConfigureRunSettings = !(pageState.modelMatches && pageState.thinkingMatches)
+          needAttachShort = !shortAttached
+          needAttachMovie = !movieAttached
+          // Prompt is present if it is in the prompt box OR already committed in the chat turn with an enabled Run/Rerun button
+          const promptAlreadyPresent =
+            pageState.promptBoxHasHissa ||
+            pageState.promptBoxLen >= Math.min(80, Math.floor(promptText.length * 0.5)) ||
+            (pageState.turnHasPromptText && pageState.runOrRerunEnabled && !needAttachShort && !needAttachMovie)
+          needPastePrompt = !promptAlreadyPresent
+
+          const verifySummary = `${jobLabel}: sameUrl=${sameChatUrl} (${urlAfterReload}), modelOk=${!needConfigureRunSettings} (displayed="${pageState.displayedModel || 'unknown'}"), shortChip=${shortAttached}, movieChip=${movieAttached} (chips=${effectiveChipCount}, tokens=${currentTokensAfterReload ?? 'null'}), promptPresent=${promptAlreadyPresent} -> redo=[model:${needConfigureRunSettings}, short:${needAttachShort}, movie:${needAttachMovie}, prompt:${needPastePrompt}]`
+          this.logStep('verify state after hard refresh', verifySummary, 'info')
+          onLog?.('info', `verify state after hard refresh: ${verifySummary}`)
         }
 
-        // (c) Attach Video 1 = short part & Video 2 = movie_360p, set start/end & 24 FPS (waits 10s after each Save)
+        // (b) Configure Run Settings (if normal start or if model/thinking needed re-setting after hard refresh)
+        if (needConfigureRunSettings) {
+          currentStage = 'setup/run_settings'
+          const runSettingsRes = await this.configureRunSettings(
+            page,
+            {
+              modelName: activeModelName,
+              maxOutputTokens,
+              thinkingLevel: effectiveThinkingLevel,
+              fallbackChain: MODEL_FALLBACK_CHAIN,
+            },
+            scope,
+          )
+          if (runSettingsRes.selectedModelName && runSettingsRes.selectedModelName !== activeModelName) {
+            activeModelName = runSettingsRes.selectedModelName
+            this.activeModelName = activeModelName
+            const newIdx = MODEL_FALLBACK_CHAIN.findIndex(
+              (m) => m.toLowerCase() === activeModelName.toLowerCase(),
+            )
+            if (newIdx >= 0) activeModelIndex = newIdx
+          }
+        }
+
+        // (c) Attach Video 1 = short part & Video 2 = movie_360p, set start/end & 24 FPS (only for missing chips!)
         // Guarded by RAM > 90% check and Global UPLOAD GATE (max 2 concurrent uploads across all scans/workers)
         globalStudioUploadGate.setMaxConcurrent(
           userCfg.studioUploadGateConcurrency || DEFAULT_STUDIO_UPLOAD_GATE,
@@ -4554,167 +4876,194 @@ export class StudioBrowserController {
           }
         }
 
-        await waitUntilRamSafeForAttach('attach_short')
+        if (needAttachShort || needAttachMovie) {
+          await waitUntilRamSafeForAttach(needAttachShort ? 'attach_short' : 'attach_movie')
 
-        let releaseUploadGate: (() => void) | null = null
-        if (parallelMode) {
-          currentStage = 'WAITING FOR UPLOAD GATE'
-          const holderKey = `${this.workerTag || this.profileDirName}:${scanId}`
-          releaseUploadGate = await globalStudioUploadGate.acquire(holderKey, {
-            isAborted: () => this.isStopping(scope),
-            onWaiting: (inUse, maxConc, qPos) => {
-              this.logStep(
-                'WAITING FOR UPLOAD GATE',
-                `Upload gate ${inUse}/${maxConc} busy (queue #${qPos}) — waiting before attaching videos`,
-                'info',
-              )
-            },
-          })
-        }
-
-        try {
-          await waitUntilRamSafeForAttach('attach_short')
-          currentStage = 'setup/attach_short'
-          await this.attachVideoAndConfigureRange(page, {
-            label: 'short',
-            driveFileName: shortDriveFileName,
-            localFilePath: shortLocalPath,
-            startSec: shortStartSec,
-            endSec: shortEndSec,
-            fps: 24,
-            scope,
-          })
-
-          await waitUntilRamSafeForAttach('attach_movie')
-          currentStage = 'setup/attach_movie'
-          const attachMovieFilePath = windowClip?.clipPath || movieLocalPath
-          const movieSizeMbForAttach = (() => {
-            try {
-              if (attachMovieFilePath && fs.existsSync(attachMovieFilePath)) {
-                return Number((fs.statSync(attachMovieFilePath).size / (1024 * 1024)).toFixed(1))
-              }
-            } catch {
-              /* ignore */
-            }
-            return 0
-          })()
-          const sampleAndLogAttachMovieMem = (phaseLabel: string, elapsedSec?: number) => {
-            const ramPct = readAutomationRamPercent()
-            const wStats = getWorkerChromeStats(this.profileDirName)
-            const shmMb = readDevShmUsedMb()
-            if (wStats.rssMb > 0) {
-              this.lastSampledWorkerRssMb = wStats.rssMb
-              if (wStats.rssMb > this.peakWorkerRssMb) {
-                this.peakWorkerRssMb = wStats.rssMb
-              }
-            }
-            const elapsedTag = elapsedSec !== undefined ? ` t=+${elapsedSec}s` : ''
-            this.logStep(
-              `attach_movie mem [${phaseLabel}]`,
-              `${jobLabel}${elapsedTag} · RAM=${ramPct}% · workerChromeRSS=${wStats.rssMb}MB (peak=${this.peakWorkerRssMb}MB, procs=${wStats.procCount}) · /dev/shm=${shmMb}MB · movie=${movieSizeMbForAttach}MB`,
-              ramPct >= 85 ? 'warn' : 'info',
-            )
+          let releaseUploadGate: (() => void) | null = null
+          if (parallelMode) {
+            currentStage = 'WAITING FOR UPLOAD GATE'
+            const holderKey = `${this.workerTag || this.profileDirName}:${scanId}`
+            releaseUploadGate = await globalStudioUploadGate.acquire(holderKey, {
+              isAborted: () => this.isStopping(scope),
+              onWaiting: (inUse, maxConc, qPos) => {
+                this.logStep(
+                  'WAITING FOR UPLOAD GATE',
+                  `Upload gate ${inUse}/${maxConc} busy (queue #${qPos}) — waiting before attaching videos`,
+                  'info',
+                )
+              },
+            })
           }
-          sampleAndLogAttachMovieMem('before')
-          const attachStartMs = Date.now()
-          const attachMemTimer = setInterval(() => {
-            try {
-              const elapsedSec = Math.round((Date.now() - attachStartMs) / 1000)
-              sampleAndLogAttachMovieMem('3s-tick', elapsedSec)
-            } catch {
-              /* ignore timer error */
-            }
-          }, 3000)
+
           try {
-            if (windowClip) {
+            if (needAttachShort) {
+              await waitUntilRamSafeForAttach('attach_short')
+              currentStage = 'setup/attach_short'
               await this.attachVideoAndConfigureRange(page, {
-                label: 'movie',
-                driveFileName: null,
-                localFilePath: windowClip.clipPath,
-                startSec: 0,
-                endSec: windowClip.durationSec,
+                label: 'short',
+                driveFileName: shortDriveFileName,
+                localFilePath: shortLocalPath,
+                startSec: shortStartSec,
+                endSec: shortEndSec,
                 fps: 24,
                 scope,
               })
-            } else {
-              await this.attachVideoAndConfigureRange(page, {
-                label: 'movie',
-                driveFileName: movieDriveFileName,
-                localFilePath: movieLocalPath,
-                startSec: movieStartSec,
-                endSec: movieEndSec,
-                fps: 24,
-                scope,
-              })
+            }
+
+            if (needAttachMovie) {
+              await waitUntilRamSafeForAttach('attach_movie')
+              currentStage = 'setup/attach_movie'
+              const attachMovieFilePath = windowClip?.clipPath || movieLocalPath
+              const movieSizeMbForAttach = (() => {
+                try {
+                  if (attachMovieFilePath && fs.existsSync(attachMovieFilePath)) {
+                    return Number((fs.statSync(attachMovieFilePath).size / (1024 * 1024)).toFixed(1))
+                  }
+                } catch {
+                  /* ignore */
+                }
+                return 0
+              })()
+              const sampleAndLogAttachMovieMem = (phaseLabel: string, elapsedSec?: number) => {
+                const ramPct = readAutomationRamPercent()
+                const wStats = getWorkerChromeStats(this.profileDirName)
+                const shmMb = readDevShmUsedMb()
+                if (wStats.rssMb > 0) {
+                  this.lastSampledWorkerRssMb = wStats.rssMb
+                  if (wStats.rssMb > this.peakWorkerRssMb) {
+                    this.peakWorkerRssMb = wStats.rssMb
+                  }
+                }
+                const elapsedTag = elapsedSec !== undefined ? ` t=+${elapsedSec}s` : ''
+                this.logStep(
+                  `attach_movie mem [${phaseLabel}]`,
+                  `${jobLabel}${elapsedTag} · RAM=${ramPct}% · workerChromeRSS=${wStats.rssMb}MB (peak=${this.peakWorkerRssMb}MB, procs=${wStats.procCount}) · /dev/shm=${shmMb}MB · movie=${movieSizeMbForAttach}MB`,
+                  ramPct >= 85 ? 'warn' : 'info',
+                )
+              }
+              sampleAndLogAttachMovieMem('before')
+              const attachStartMs = Date.now()
+              const attachMemTimer = setInterval(() => {
+                try {
+                  const elapsedSec = Math.round((Date.now() - attachStartMs) / 1000)
+                  sampleAndLogAttachMovieMem('3s-tick', elapsedSec)
+                } catch {
+                  /* ignore timer error */
+                }
+              }, 3000)
+              try {
+                if (windowClip) {
+                  await this.attachVideoAndConfigureRange(page, {
+                    label: 'movie',
+                    driveFileName: null,
+                    localFilePath: windowClip.clipPath,
+                    startSec: 0,
+                    endSec: windowClip.durationSec,
+                    fps: 24,
+                    scope,
+                  })
+                } else {
+                  await this.attachVideoAndConfigureRange(page, {
+                    label: 'movie',
+                    driveFileName: movieDriveFileName,
+                    localFilePath: movieLocalPath,
+                    startSec: movieStartSec,
+                    movieEndSec: movieEndSec,
+                    endSec: movieEndSec,
+                    fps: 24,
+                    scope,
+                  } as Parameters<typeof this.attachVideoAndConfigureRange>[1])
+                }
+              } finally {
+                clearInterval(attachMemTimer)
+                const totalElapsedSec = Math.round((Date.now() - attachStartMs) / 1000)
+                sampleAndLogAttachMovieMem('after', totalElapsedSec)
+              }
             }
           } finally {
-            clearInterval(attachMemTimer)
-            const totalElapsedSec = Math.round((Date.now() - attachStartMs) / 1000)
-            sampleAndLogAttachMovieMem('after', totalElapsedSec)
-          }
-        } finally {
-          if (releaseUploadGate) {
-            releaseUploadGate()
-            releaseUploadGate = null
+            if (releaseUploadGate) {
+              releaseUploadGate()
+              releaseUploadGate = null
+            }
           }
         }
 
-        // (d) Paste the chunk prompt text BEFORE reading the input token counter and BEFORE pressing Run
-        currentStage = 'setup/prompt_paste'
-        const promptText = buildStudioChunkPrompt({
-          movieWindowSec: movieEndSec - movieStartSec,
-          shortPartSec: shortEndSec - shortStartSec,
-          sanitized,
-        })
-
+        // (d) Paste the chunk prompt text if needed BEFORE reading the input token counter and BEFORE pressing Run
         const promptInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.promptInput, 5000)
         if (!promptInput) {
           throw new Error('Could not find prompt input textarea on AI Studio page')
         }
-        await promptInput.click()
-        await promptInput.fill(promptText)
+        if (needPastePrompt) {
+          currentStage = 'setup/prompt_paste'
+          await promptInput.click()
+          await promptInput.fill(promptText)
+        }
 
-        // Wait up to 60 s for AI Studio to finish counting tokens for both attached videos + pasted prompt text:
-        // poll every 1 s, log each reading in the step log, and accept the value only when
-        // it is >= minPlausible24FpsTokens AND unchanged for 3 consecutive reads (counter settled).
+        // Token counter verification:
+        // If videos were just attached, wait up to 60 s for AI Studio to finish counting tokens (settled 3/3).
+        // If this was a same-page hard refresh where both videos remained attached, verify/reuse settled tokens quickly.
         currentStage = 'setup/token_poll'
         let tokens: number | null = null
         let settledTokens: number | null = null
-        let lastReadTokens: number | null = null
-        let consecutiveSameReads = 0
-        let pollCount = 0
-        const tokenWaitDeadline = Date.now() + 60_000
 
-        while (Date.now() < tokenWaitDeadline) {
-          await new Promise((r) => setTimeout(r, 1000))
-          pollCount += 1
-          const readVal = await this.readStudioTokenCount(page)
-          if (readVal !== null) {
-            tokens = readVal
-            if (readVal >= minPlausible24FpsTokens) {
-              if (readVal === lastReadTokens) {
-                consecutiveSameReads += 1
+        if (isSamePageHardRefresh && !needAttachShort && !needAttachMovie) {
+          const quickRead = await this.readStudioTokenCount(page)
+          if (quickRead !== null && quickRead >= minPlausible24FpsTokens) {
+            settledTokens = quickRead
+            tokens = quickRead
+            lastKnownSettledTokens = quickRead
+            this.logStep(
+              'token poll (post-refresh)',
+              `${quickRead.toLocaleString()} tokens preserved after hard refresh`,
+            )
+          } else if (lastKnownSettledTokens !== null && lastKnownSettledTokens >= minPlausible24FpsTokens) {
+            settledTokens = lastKnownSettledTokens
+            tokens = lastKnownSettledTokens
+            this.logStep(
+              'token poll (post-refresh)',
+              `using lastKnownSettledTokens=${lastKnownSettledTokens.toLocaleString()} after hard refresh`,
+            )
+          }
+        }
+
+        if (settledTokens === null) {
+          let lastReadTokens: number | null = null
+          let consecutiveSameReads = 0
+          let pollCount = 0
+          const tokenWaitDeadline = Date.now() + 60_000
+
+          while (Date.now() < tokenWaitDeadline) {
+            await new Promise((r) => setTimeout(r, 1000))
+            pollCount += 1
+            const readVal = await this.readStudioTokenCount(page)
+            if (readVal !== null) {
+              tokens = readVal
+              if (readVal >= minPlausible24FpsTokens) {
+                if (readVal === lastReadTokens) {
+                  consecutiveSameReads += 1
+                } else {
+                  lastReadTokens = readVal
+                  consecutiveSameReads = 1
+                }
               } else {
                 lastReadTokens = readVal
-                consecutiveSameReads = 1
+                consecutiveSameReads = 0
+              }
+              this.logStep(
+                `token poll ${pollCount}s`,
+                `${readVal.toLocaleString()} tokens (min ${minPlausible24FpsTokens.toLocaleString()}, settled ${consecutiveSameReads}/3)`,
+              )
+              if (readVal >= minPlausible24FpsTokens && consecutiveSameReads >= 3) {
+                settledTokens = readVal
+                tokens = settledTokens
+                lastKnownSettledTokens = settledTokens
+                break
               }
             } else {
-              lastReadTokens = readVal
+              lastReadTokens = null
               consecutiveSameReads = 0
+              this.logStep(`token poll ${pollCount}s`, 'null (counter not readable)')
             }
-            this.logStep(
-              `token poll ${pollCount}s`,
-              `${readVal.toLocaleString()} tokens (min ${minPlausible24FpsTokens.toLocaleString()}, settled ${consecutiveSameReads}/3)`,
-            )
-            if (readVal >= minPlausible24FpsTokens && consecutiveSameReads >= 3) {
-              settledTokens = readVal
-              tokens = settledTokens
-              break
-            }
-          } else {
-            lastReadTokens = null
-            consecutiveSameReads = 0
-            this.logStep(`token poll ${pollCount}s`, 'null (counter not readable)')
           }
         }
 
@@ -4743,8 +5092,10 @@ export class StudioBrowserController {
           }
         }
 
-        // Wait 10 seconds after the prompt is pasted and the token counter has settled, then press Run
-        await new Promise((r) => setTimeout(r, 10_000))
+        // Wait 10 seconds after the prompt is pasted and the token counter has settled (or 2s after same-page refresh if nothing was re-uploaded), then press Run
+        await new Promise((r) =>
+          setTimeout(r, isSamePageHardRefresh && !needAttachShort && !needAttachMovie ? 2_000 : 10_000),
+        )
 
         currentStage = 'run/execute'
         // Attach network response listener BEFORE pressing Run so we capture exact GenerateContent status + body on 403/errors
@@ -4841,13 +5192,69 @@ export class StudioBrowserController {
           }
         }
 
+        // Snapshot pre-run model turn state so a pre-existing failed turn on the same page doesn't false-trigger before the new run starts
+        const preRunTurnSnap = await page
+          .evaluate((turnSels) => {
+            let turns: Element[] = []
+            for (const sel of turnSels) {
+              if (sel.includes(':has-text(')) continue
+              try {
+                const found = Array.from(document.querySelectorAll(sel))
+                if (found.length > 0) {
+                  turns = found
+                  break
+                }
+              } catch {
+                // ignore
+              }
+            }
+            const lastTurn = turns[turns.length - 1] as HTMLElement | undefined
+            const lastText = lastTurn ? (lastTurn.innerText || lastTurn.textContent || '').trim() : ''
+            return {
+              count: turns.length,
+              lastHadInternalError:
+                /(an\s+internal\s+error\s+has\s+occurred|internal\s+error(?:\s+has\s+occurred|\s+encountered)?|something\s+went\s+wrong|failed\s+to\s+generate\s+content)/i.test(
+                  lastText,
+                ),
+            }
+          }, [...STUDIO_SELECTORS.modelTurnContainers])
+          .catch(() => ({ count: 0, lastHadInternalError: false }))
+
         try {
-          // (e) Press Run
+          // (e) Press Run (or Rerun if on same page after hard refresh and Run button is disabled while Rerun is visible)
           const runBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 4000)
-          if (runBtn) {
+          const runBtnEnabled = runBtn ? await runBtn.isEnabled().catch(() => false) : false
+          if (runBtn && runBtnEnabled) {
             await runBtn.click()
           } else {
-            await promptInput.press('Control+Enter')
+            const rerunBtn = await findFirstVisibleLocator(
+              page,
+              [
+                'button[aria-label*="Rerun" i]',
+                'button[mattooltip*="Rerun" i]',
+                'ms-chat-turn button:has-text("Rerun")',
+              ],
+              1500,
+            )
+            if (rerunBtn && (await rerunBtn.isEnabled().catch(() => false))) {
+              await rerunBtn.click()
+            } else if (runBtn) {
+              // Ensure prompt text is in promptInput so Run becomes enabled
+              const curPromptVal = await promptInput.inputValue().catch(() => '')
+              if (!curPromptVal || !curPromptVal.trim()) {
+                await promptInput.click().catch(() => {})
+                await promptInput.fill(promptText).catch(() => {})
+                await new Promise((r) => setTimeout(r, 500))
+              }
+              const enabledAfterFill = await runBtn.isEnabled().catch(() => false)
+              if (enabledAfterFill) {
+                await runBtn.click()
+              } else {
+                await promptInput.press('Control+Enter')
+              }
+            } else {
+              await promptInput.press('Control+Enter')
+            }
           }
           this.logStep('press Run', `${jobLabel} [${activeModelName}]`)
 
@@ -5029,10 +5436,10 @@ export class StudioBrowserController {
               lastCandidateText = ''
 
               const retryRunBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 2500)
-              const runBtnEnabled = retryRunBtn
+              const retryRunBtnEnabled = retryRunBtn
                 ? await retryRunBtn.isEnabled().catch(() => false)
                 : false
-              if (retryRunBtn && runBtnEnabled) {
+              if (retryRunBtn && retryRunBtnEnabled) {
                 await retryRunBtn.click().catch(() => {})
                 this.logStep('re-press Run (same chat)', `${jobLabel} [${activeModelName}]`, 'info')
                 continue
@@ -5093,44 +5500,63 @@ export class StudioBrowserController {
                 throw new Error('POLICY_BLOCKED: Gemini prohibited content')
               }
 
-              // Requirement 6: Also check the last model turn text + network 500/INTERNAL for "An internal error has occurred"
+              // Requirement 6: Also check the last model turn text + network 500/INTERNAL for "An internal error has occurred" / "Internal error encountered"
               const turnInternalError = await page
-                .evaluate((turnSels) => {
-                  let turns: Element[] = []
-                  for (const sel of turnSels) {
-                    if (sel.includes(':has-text(')) continue
-                    try {
-                      const found = Array.from(document.querySelectorAll(sel))
-                      if (found.length > 0) {
-                        turns = found
-                        break
+                .evaluate(
+                  ({ turnSels, preCount, preHadErr, stopSeen, elapsedSec }) => {
+                    let turns: Element[] = []
+                    for (const sel of turnSels) {
+                      if (sel.includes(':has-text(')) continue
+                      try {
+                        const found = Array.from(document.querySelectorAll(sel))
+                        if (found.length > 0) {
+                          turns = found
+                          break
+                        }
+                      } catch {
+                        // ignore
                       }
-                    } catch {
-                      // ignore
                     }
-                  }
-                  const lastTurn = turns[turns.length - 1] as HTMLElement | undefined
-                  if (!lastTurn) return null
-                  const t = (lastTurn.innerText || lastTurn.textContent || '').trim()
-                  if (
-                    /(an\s+internal\s+error\s+has\s+occurred|internal\s+error\s+has\s+occurred|something\s+went\s+wrong|failed\s+to\s+generate\s+content)/i.test(
-                      t,
-                    ) &&
-                    !/permission\s+denied|caller\s+does\s+not\s+have\s+permission|quota\s+exceeded/i.test(t)
-                  ) {
-                    return t.slice(0, 160)
-                  }
-                  return null
-                }, [...STUDIO_SELECTORS.modelTurnContainers])
+                    // If a previous turn on the same page already had an internal error before we pressed Run,
+                    // wait until a new turn is added or generation has started & finished (or >= 8s elapsed)
+                    if (preHadErr && turns.length <= preCount && !stopSeen && elapsedSec < 8) {
+                      return null
+                    }
+                    const lastTurn = turns[turns.length - 1] as HTMLElement | undefined
+                    if (!lastTurn) return null
+                    const t = (lastTurn.innerText || lastTurn.textContent || '').trim()
+                    if (
+                      /(an\s+internal\s+error\s+has\s+occurred|internal\s+error(?:\s+has\s+occurred|\s+encountered)?|something\s+went\s+wrong|failed\s+to\s+generate\s+content)/i.test(
+                        t,
+                      ) &&
+                      !/permission\s+denied|caller\s+does\s+not\s+have\s+permission|quota\s+exceeded/i.test(t)
+                    ) {
+                      return t.slice(0, 160)
+                    }
+                    return null
+                  },
+                  {
+                    turnSels: [...STUDIO_SELECTORS.modelTurnContainers],
+                    preCount: preRunTurnSnap.count,
+                    preHadErr: preRunTurnSnap.lastHadInternalError,
+                    stopSeen: stopEverSeen,
+                    elapsedSec: elapsed,
+                  },
+                )
                 .catch(() => null)
 
               const netInternalError =
                 capturedRunError !== null &&
                 (capturedRunError.status === 500 ||
                   capturedRunError.status === 503 ||
-                  /\bINTERNAL\b|internal\s+error\s+has\s+occurred/i.test(capturedRunError.body))
+                  /\bINTERNAL\b|internal\s+error(?:\s+has\s+occurred|\s+encountered)?/i.test(
+                    capturedRunError.body,
+                  ))
 
-              if (turnInternalError || (netInternalError && !stopVisible && !spinnerVisible)) {
+              if (
+                (!stopVisible && !spinnerVisible && turnInternalError) ||
+                (netInternalError && !stopVisible && !spinnerVisible)
+              ) {
                 internalErrorDetected = true
                 transientBannerReason = `internal_error:${(turnInternalError || capturedRunError?.body || 'HTTP 500 INTERNAL').slice(0, 80)}`
                 break
@@ -5384,79 +5810,12 @@ export class StudioBrowserController {
               if (qMsg.startsWith('POLICY_BLOCKED:') || qMsg.startsWith('STOPPED')) {
                 throw qContErr
               }
-              if (/internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate/i.test(qMsg)) {
+              if (/CONTINUE_TURN_ERROR|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate/i.test(qMsg)) {
                 internalErrorDetected = true
+                internalErrorContinueTriedInChat = true
                 transientBannerReason = `internal_error:${qMsg.slice(0, 80)}`
               }
               break
-            }
-          }
-        }
-
-        // Requirement 6: "An internal error has occurred" handling:
-        // (a) Cancel stuck Stop button if visible, then try 1 Continue in the SAME chat ("internal error -> Continue (1/1)")
-        // (b) If internal error happens again or result is still invalid -> hard refresh (up to MAX_INTERNAL_ERROR_REFRESH = 3) without consuming normal attempt
-        if (internalErrorDetected && !rawAnswer) {
-          await cancelStuckStopButtonIfVisible()
-
-          if (!internalErrorContinueTriedInChat) {
-            internalErrorContinueTriedInChat = true
-            const partialBeforeErr = await this.extractFinalAnswerWithoutThoughts(page)
-            const hasValidPartialBeforeErr =
-              partialBeforeErr &&
-              /\bHISSA\s*1\b/i.test(partialBeforeErr) &&
-              !/^(?:an\s+internal\s+error|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i.test(
-                partialBeforeErr.trim(),
-              )
-
-            this.logStep(
-              'internal error -> Continue (1/1)',
-              `${jobLabel} [${activeModelName}] (${transientBannerReason || 'internal error'})`,
-              'warn',
-            )
-            onLog?.(
-              'warn',
-              `${jobLabel}: internal error -> Continue (1/1) in same chat`,
-            )
-
-            try {
-              const contAfterErr = await this.sendContinueFollowUpAndFetch(page, {
-                jobLabel,
-                activeModelName,
-                continueAttempt: 1,
-                scope,
-                onLog,
-              })
-              if (contAfterErr && contAfterErr.trim()) {
-                accumulatedUnshiftedText = hasValidPartialBeforeErr
-                  ? stitchContinuedStudioAnswer(partialBeforeErr, contAfterErr)
-                  : contAfterErr
-                shiftValidateAndCheckCoverage(accumulatedUnshiftedText)
-              }
-            } catch (ieContErr) {
-              const ieMsg = ieContErr instanceof Error ? ieContErr.message : String(ieContErr)
-              if (ieMsg.startsWith('POLICY_BLOCKED:') || ieMsg.startsWith('STOPPED')) {
-                throw ieContErr
-              }
-              this.logStep(
-                'internal error Continue failed',
-                `${jobLabel}: ${ieMsg.slice(0, 140)}`,
-                'warn',
-              )
-            }
-          }
-
-          if (!rawAnswer) {
-            await cancelStuckStopButtonIfVisible()
-            if (internalErrorRefreshes < MAX_INTERNAL_ERROR_REFRESH) {
-              internalErrorRefreshes += 1
-              const refreshLog = `internal error again -> hard refresh (${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
-              this.logStep(refreshLog, `${jobLabel} [${activeModelName}]`, 'warn')
-              onLog?.('warn', `${jobLabel}: ${refreshLog}`)
-              await this.saveRotatedSessionFromContext(username)
-              resetOnInternalError = true
-              attempt -= 1
-              continue
             }
           }
         }
@@ -5532,9 +5891,104 @@ export class StudioBrowserController {
                     `${jobLabel}: ${contMsg.slice(0, 160)}`,
                     'warn',
                   )
+                  if (
+                    /CONTINUE_TURN_ERROR|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate/i.test(
+                      contMsg,
+                    )
+                  ) {
+                    internalErrorDetected = true
+                    internalErrorContinueTriedInChat = true
+                    transientBannerReason = `internal_error:${contMsg.slice(0, 80)}`
+                  }
                   break
                 }
               }
+            }
+          }
+        }
+
+        // Requirement 6: "An internal error has occurred" / "Internal error encountered" / CONTINUE_TURN_ERROR handling:
+        // Escalation order:
+        // - 1st and 2nd time (refresh 1/3, 2/3): REAL Chrome hard refresh on the SAME page via CDP (Page.reload ignoreCache=true), verify state, re-press Run
+        // - 3rd time (refresh 3/3): Browser restart (persistent profile relaunch, cookies & origin storage preserved)
+        // - After 3rd time (last resort): New chat (retry same window)
+        if (internalErrorDetected && !rawAnswer) {
+          await cancelStuckStopButtonIfVisible()
+
+          if (!internalErrorContinueTriedInChat) {
+            internalErrorContinueTriedInChat = true
+            const partialBeforeErr = await this.extractFinalAnswerWithoutThoughts(page)
+            const hasValidPartialBeforeErr =
+              Boolean(
+                partialBeforeErr &&
+                  /\bHISSA\s*1\b/i.test(partialBeforeErr) &&
+                  !/^(?:an\s+internal\s+error|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i.test(
+                    partialBeforeErr.trim(),
+                  ),
+              )
+
+            if (hasValidPartialBeforeErr) {
+              this.logStep(
+                'internal error -> Continue (1/1)',
+                `${jobLabel} [${activeModelName}] (${transientBannerReason || 'internal error'})`,
+                'warn',
+              )
+              onLog?.('warn', `${jobLabel}: internal error -> Continue (1/1) in same chat`)
+
+              try {
+                const contAfterErr = await this.sendContinueFollowUpAndFetch(page, {
+                  jobLabel,
+                  activeModelName,
+                  continueAttempt: 1,
+                  scope,
+                  onLog,
+                })
+                if (contAfterErr && contAfterErr.trim()) {
+                  accumulatedUnshiftedText = stitchContinuedStudioAnswer(partialBeforeErr, contAfterErr)
+                  shiftValidateAndCheckCoverage(accumulatedUnshiftedText)
+                }
+              } catch (ieContErr) {
+                const ieMsg = ieContErr instanceof Error ? ieContErr.message : String(ieContErr)
+                if (ieMsg.startsWith('POLICY_BLOCKED:') || ieMsg.startsWith('STOPPED')) {
+                  throw ieContErr
+                }
+                this.logStep(
+                  'internal error Continue failed',
+                  `${jobLabel}: ${ieMsg.slice(0, 140)}`,
+                  'warn',
+                )
+              }
+            }
+          }
+
+          if (!rawAnswer) {
+            await cancelStuckStopButtonIfVisible()
+            if (internalErrorRefreshes < MAX_INTERNAL_ERROR_REFRESH) {
+              internalErrorRefreshes += 1
+              await this.saveRotatedSessionFromContext(username)
+              if (internalErrorRefreshes <= 2) {
+                const refreshLog = `internal error -> REAL hard refresh (${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
+                this.logStep(
+                  refreshLog,
+                  `${jobLabel} [${activeModelName}] (same page CDP Page.reload ignoreCache)`,
+                  'warn',
+                )
+                onLog?.('warn', `${jobLabel}: ${refreshLog} (same page CDP Page.reload ignoreCache)`)
+                pendingInternalErrorAction = 'same_page_hard_refresh'
+              } else {
+                const restartLog = `internal error -> browser restart (${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
+                this.logStep(
+                  restartLog,
+                  `${jobLabel} [${activeModelName}] (persistent profile relaunch)`,
+                  'warn',
+                )
+                onLog?.('warn', `${jobLabel}: ${restartLog} (persistent profile relaunch)`)
+                pendingInternalErrorAction = 'browser_restart'
+              }
+              attempt -= 1
+              continue
+            } else {
+              pendingInternalErrorAction = 'last_resort_new_chat'
             }
           }
         }
@@ -5553,9 +6007,13 @@ export class StudioBrowserController {
           const badDiagMsg = `BAD_RESULT_DIAG [reason=${badReason}] fetchedSource=${fetchedSource} finishReason=${capturedFinishReason || 'unknown'} prohibited=${prohibitedDetected} rawLength=${fetchedRawText.length} cleanedLength=${cleanedDiagText.length} newlines=${newlineCount} first300=${first300} last400=${last400}`
           this.logStep('BAD result diagnostic', badDiagMsg, 'warn')
           onLog?.('warn', `${badDiagMsg} on ${jobLabel}`)
+          const retryActionDesc =
+            pendingInternalErrorAction === 'last_resort_new_chat'
+              ? `internal error last resort (${badReason}) -> naya chat, same window retry`
+              : `result BAD: ${badReason} -> naya chat, same window retry`
           this.logStep(
             `RETRY [runWindowJob] (${invalidResultRetries}/${MAX_INVALID_RESULT_RETRIES})`,
-            `result BAD: ${badReason} -> naya chat, same window retry`,
+            retryActionDesc,
             'warn',
           )
           onLog?.(

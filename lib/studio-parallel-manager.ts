@@ -535,7 +535,9 @@ function mapStepToWindowStatus(step: string): ParallelWindowStatus {
   if (s.includes('permission denied') || s.includes('403 ->') || s.includes('403 permission_denied')) {
     return '403_WAIT'
   }
-  if (s.includes('retry [')) return 'RETRYING'
+  if (s.includes('retry [') || s.includes('internal error ->') || s.includes('real hard refresh')) {
+    return 'RETRYING'
+  }
   if (s.includes('validate') || s.includes('copy')) return 'VALIDATING'
   if (s.includes('running ')) return 'RUNNING'
   return 'SETUP'
@@ -553,6 +555,13 @@ export function classifyParallelLogLevel(
     combined.includes('page crashed')
   ) {
     return 'ERROR'
+  }
+  if (
+    combined.includes('internal error ->') ||
+    combined.includes('real hard refresh') ||
+    combined.includes('verify state after hard refresh')
+  ) {
+    return 'RETRY'
   }
   if (
     combined.includes('403') ||
