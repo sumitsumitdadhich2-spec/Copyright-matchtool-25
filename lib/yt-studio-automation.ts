@@ -20,6 +20,12 @@ export interface YtStepLog {
   status: 'info' | 'ok' | 'warn' | 'error';
 }
 
+export interface YtOpenTabInfo {
+  index: number;
+  url: string;
+  active: boolean;
+}
+
 export interface YtControllerSnapshot {
   status: 'idle' | 'starting' | 'ready' | 'uploading' | 'deleting' | 'paused' | 'assist' | 'error';
   assistMode: boolean;
@@ -31,6 +37,7 @@ export interface YtControllerSnapshot {
   lastError: string | null;
   screenshotBase64?: string | null;
   viewport: { width: number; height: number };
+  openTabs?: YtOpenTabInfo[];
 }
 
 class GlobalYtStudioUploadGate {
@@ -148,6 +155,8 @@ export class YtStudioBrowserController {
   private logs: YtStepLog[] = [];
   private viewport = { width: 1366, height: 820 };
   private actionLock: Promise<void> = Promise.resolve();
+  private boundContext: BrowserContext | null = null;
+  private manualTabSelection = false;
 
   private log(step: string, detail: string, status: YtStepLog['status'] = 'info'): void {
     this.currentStep = `${step}: ${detail}`;
@@ -186,8 +195,120 @@ export class YtStudioBrowserController {
     return dir;
   }
 
+  private async ensureXvfbDisplay(): Promise<string> {
+    const display = process.env.DISPLAY || ':99';
+    process.env.DISPLAY = display;
+    const displayNum = display.replace(/^:/, '').split('.')[0] || '99';
+    const xSocket = `/tmp/.X11-unix/X${displayNum}`;
+    if (fs.existsSync(xSocket)) {
+      return display;
+    }
+    if (fs.existsSync('/usr/bin/Xvfb')) {
+      try {
+        const { spawn } = await import('child_process');
+        try {
+          fs.mkdirSync('/tmp/.X11-unix', { recursive: true, mode: 0o1777 });
+        } catch {
+          // ignore
+        }
+        try {
+          const lockFile = `/tmp/.X${displayNum}-lock`;
+          if (fs.existsSync(lockFile)) fs.unlinkSync(lockFile);
+        } catch {
+          // ignore
+        }
+        const child = spawn(
+          '/usr/bin/Xvfb',
+          [`:${displayNum}`, '-screen', '0', '1920x1080x24', '-nolisten', 'tcp', '-ac'],
+          { detached: true, stdio: 'ignore' }
+        );
+        child.unref();
+        for (let i = 0; i < 25; i++) {
+          if (fs.existsSync(xSocket)) break;
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return display;
+  }
+
+  private bindContextPopupListeners(context: BrowserContext): void {
+    if (this.boundContext === context) return;
+    this.boundContext = context;
+
+    const attachPageCloseListener = (p: Page) => {
+      p.on('close', () => {
+        if (!this.context) return;
+        const remaining = this.context.pages().filter((pg) => !pg.isClosed());
+        if (remaining.length > 0) {
+          this.page = remaining[remaining.length - 1];
+          this.manualTabSelection = false;
+          this.log(
+            'popup closed',
+            `Popup window closed — switched back to ${this.page.url() || 'main tab'}`,
+            'ok'
+          );
+        } else {
+          this.page = null;
+        }
+      });
+    };
+
+    for (const existingPage of context.pages()) {
+      attachPageCloseListener(existingPage);
+    }
+
+    context.on('page', async (newPage: Page) => {
+      try {
+        await newPage.setViewportSize(this.viewport).catch(() => {});
+        await newPage.bringToFront().catch(() => {});
+      } catch {
+        // ignore
+      }
+      this.page = newPage;
+      this.manualTabSelection = false;
+      attachPageCloseListener(newPage);
+      await newPage.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
+      this.log(
+        'popup opened',
+        `Switched live screen to new popup/tab: ${newPage.url() || 'loading...'}`,
+        'ok'
+      );
+    });
+  }
+
+  private syncActivePopupPageIfNeeded(): void {
+    if (!this.context) return;
+    this.bindContextPopupListeners(this.context);
+    const openPages = this.context.pages().filter((p) => !p.isClosed());
+    if (openPages.length === 0) return;
+
+    // If current page was closed or not in openPages, pick the latest open page
+    if (!this.page || this.page.isClosed() || !openPages.includes(this.page)) {
+      this.page = openPages[openPages.length - 1];
+      return;
+    }
+
+    // If a Google verification / sign-in popup opened as a second tab and we haven't manually switched away,
+    // automatically focus the latest popup tab so the user sees "Verify it's you" / Google login immediately!
+    if (!this.manualTabSelection && openPages.length > 1) {
+      const latestPage = openPages[openPages.length - 1];
+      if (latestPage !== this.page) {
+        this.page = latestPage;
+        this.log(
+          'popup active',
+          `Focused popup window (${ openPages.length } tabs open): ${latestPage.url() || 'loading...'}`,
+          'ok'
+        );
+      }
+    }
+  }
+
   async ensurePage(username = 'admin'): Promise<Page> {
-    if (this.page && !this.page.isClosed() && this.context) {
+    if (this.context && this.page && !this.page.isClosed()) {
+      this.syncActivePopupPageIfNeeded();
       return this.page;
     }
     if (this.launchPromise) {
@@ -196,7 +317,7 @@ export class YtStudioBrowserController {
 
     this.launchPromise = (async () => {
       this.status = 'starting';
-      this.log('browser', 'Launching isolated YouTube Studio browser profile...', 'info');
+      const displayEnv = await this.ensureXvfbDisplay();
       const { chromium } = await import('playwright');
       const profileDir = this.getProfileDir();
       cleanStaleSingletonLocks(profileDir);
@@ -207,27 +328,50 @@ export class YtStudioBrowserController {
         '--disable-setuid-sandbox',
         '--disable-blink-features=AutomationControlled',
         '--disable-dev-shm-usage',
+        '--disable-background-timer-throttling',
+        '--disable-renderer-backgrounding',
+        '--disable-backgrounding-occluded-windows',
         `--window-size=${this.viewport.width},${this.viewport.height}`,
       ];
 
-      const hasDisplay = Boolean(process.env.DISPLAY);
-      const context = await chromium.launchPersistentContext(profileDir, {
-        headless: !hasDisplay,
-        executablePath,
-        viewport: this.viewport,
-        args,
-      });
+      this.log(
+        'browser launching',
+        `channel=chrome · mode=headed · profile=yt-studio-chrome-profile · path=${executablePath || 'system-chrome'} · display=${displayEnv}`,
+        'info'
+      );
+
+      let context: BrowserContext;
+      try {
+        context = await chromium.launchPersistentContext(profileDir, {
+          headless: false,
+          ...(executablePath ? { executablePath } : { channel: 'chrome' }),
+          viewport: this.viewport,
+          args,
+        });
+      } catch {
+        context = await chromium.launchPersistentContext(profileDir, {
+          headless: true,
+          ...(executablePath ? { executablePath } : {}),
+          viewport: this.viewport,
+          args,
+        });
+      }
 
       this.context = context;
-      const pages = context.pages();
-      const page = pages.length > 0 ? pages[0] : await context.newPage();
+      this.bindContextPopupListeners(context);
+      const pages = context.pages().filter((p) => !p.isClosed());
+      const page = pages.length > 0 ? pages[pages.length - 1] : await context.newPage();
       await page.setViewportSize(this.viewport).catch(() => {});
       this.page = page;
 
       await this.applySavedCookiesToContext(username);
 
       this.status = this.assistMode ? 'assist' : 'ready';
-      this.log('browser', 'YouTube Studio browser ready', 'ok');
+      this.log(
+        'browser launched',
+        `channel=chrome · mode=headed · profile=yt-studio-chrome-profile · path=${executablePath || '/usr/bin/google-chrome'} · display=${displayEnv}`,
+        'ok'
+      );
       return page;
     })();
 
@@ -927,10 +1071,131 @@ export class YtStudioBrowserController {
     }
   }
 
+  async switchTab(tabIndex: number): Promise<void> {
+    if (!this.context) return;
+    const pages = this.context.pages().filter((p) => !p.isClosed());
+    if (tabIndex >= 0 && tabIndex < pages.length) {
+      this.page = pages[tabIndex];
+      this.manualTabSelection = true;
+      await this.page.setViewportSize(this.viewport).catch(() => {});
+      await this.page.bringToFront().catch(() => {});
+      this.log('switch tab', `Switched to Tab #${tabIndex + 1}: ${this.page.url()}`, 'info');
+    }
+  }
+
+  async clickVerifyNext(username = 'admin'): Promise<void> {
+    const page = await this.ensurePage(username);
+    if (!this.context) return;
+    const pagesBefore = this.context.pages().filter((p) => !p.isClosed()).length;
+
+    const popupPromise = this.context.waitForEvent('page', { timeout: 5000 }).catch(() => null);
+
+    const verifySelectors = [
+      'tp-yt-paper-dialog:has-text("Verify it\'s you") ytcp-button:has-text("Next")',
+      'tp-yt-paper-dialog:has-text("Verify it\'s you") #confirm-button',
+      'ytcp-verify-user-dialog ytcp-button:has-text("Next")',
+      'ytcp-dialog ytcp-button:has-text("Next")',
+      'tp-yt-paper-dialog button:has-text("Next")',
+      'button:has-text("Next")',
+      'span:has-text("Next")',
+    ];
+
+    let clicked = false;
+    for (const sel of verifySelectors) {
+      const loc = page.locator(sel).last();
+      if (await loc.isVisible().catch(() => false)) {
+        await loc.click({ timeout: 4000 }).catch(() => {});
+        clicked = true;
+        break;
+      }
+    }
+
+    if (!clicked) {
+      await page.keyboard.press('Enter').catch(() => {});
+    }
+
+    const popup = await popupPromise;
+    if (popup) {
+      await popup.setViewportSize(this.viewport).catch(() => {});
+      await popup.bringToFront().catch(() => {});
+      this.page = popup;
+      this.manualTabSelection = false;
+      await popup.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
+      this.log('verify popup', `Opened Google verification window: ${popup.url()}`, 'ok');
+      return;
+    }
+
+    this.syncActivePopupPageIfNeeded();
+    const pagesAfter = this.context.pages().filter((p) => !p.isClosed()).length;
+    this.log(
+      'verify next',
+      `Clicked Next on verification dialog (tabs: ${pagesBefore} -> ${pagesAfter}, url=${this.page?.url() || ''})`,
+      'ok'
+    );
+  }
+
   async handleClick(x: number, y: number, username = 'admin'): Promise<void> {
     const page = await this.ensurePage(username);
+    if (this.context) {
+      this.bindContextPopupListeners(this.context);
+    }
+    const pagesBefore = this.context ? this.context.pages().filter((p) => !p.isClosed()).length : 1;
+
+    // Watch briefly in case this click opens a popup (e.g. "Verify it's you" -> "Next")
+    const popupWait = this.context
+      ? this.context.waitForEvent('page', { timeout: 1800 }).catch(() => null)
+      : Promise.resolve(null);
+
     await page.mouse.click(x, y);
     this.log('assist click', `Clicked (${Math.round(x)}, ${Math.round(y)})`, 'info');
+
+    // Also check if "Verify it's you" dialog is visible and click landed near Next
+    const verifyDialogVisible = await page
+      .locator('tp-yt-paper-dialog:has-text("Verify it\'s you"), ytcp-verify-user-dialog')
+      .first()
+      .isVisible()
+      .catch(() => false);
+
+    let popup = await popupWait;
+
+    if (!popup && verifyDialogVisible && x >= 760 && x <= 1020 && y >= 400 && y <= 620) {
+      const nextBtn = page
+        .locator(
+          'tp-yt-paper-dialog:has-text("Verify it\'s you") ytcp-button:has-text("Next"), tp-yt-paper-dialog:has-text("Verify it\'s you") #confirm-button, ytcp-verify-user-dialog ytcp-button:has-text("Next"), tp-yt-paper-dialog button:has-text("Next")'
+        )
+        .last();
+      if (await nextBtn.isVisible().catch(() => false)) {
+        const popupWait2 = this.context
+          ? this.context.waitForEvent('page', { timeout: 3500 }).catch(() => null)
+          : Promise.resolve(null);
+        await nextBtn.click({ force: true }).catch(() => {});
+        popup = await popupWait2;
+      }
+    }
+
+    if (popup) {
+      await popup.setViewportSize(this.viewport).catch(() => {});
+      await popup.bringToFront().catch(() => {});
+      this.page = popup;
+      this.manualTabSelection = false;
+      await popup.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
+      this.log(
+        'popup opened',
+        `Switched live screen to verification popup: ${popup.url() || 'loading...'}`,
+        'ok'
+      );
+    } else if (this.context) {
+      const openNow = this.context.pages().filter((p) => !p.isClosed());
+      if (openNow.length > pagesBefore) {
+        const newest = openNow[openNow.length - 1];
+        await newest.setViewportSize(this.viewport).catch(() => {});
+        this.page = newest;
+        this.manualTabSelection = false;
+        this.log('popup opened', `Switched to new tab: ${newest.url()}`, 'ok');
+      } else {
+        await page.waitForTimeout(350);
+      }
+    }
   }
 
   async handleType(text: string, username = 'admin'): Promise<void> {
@@ -953,6 +1218,7 @@ export class YtStudioBrowserController {
   }
 
   async getScreenshotJpeg(): Promise<Buffer | null> {
+    this.syncActivePopupPageIfNeeded();
     if (!this.page || this.page.isClosed()) return null;
     try {
       return await this.page.screenshot({ type: 'jpeg', quality: 65 });
@@ -962,6 +1228,7 @@ export class YtStudioBrowserController {
   }
 
   async getSnapshot(includeScreenshot = false): Promise<YtControllerSnapshot> {
+    this.syncActivePopupPageIfNeeded();
     let screenshotBase64: string | null = null;
     if (includeScreenshot && this.page && !this.page.isClosed()) {
       const buf = await this.getScreenshotJpeg();
@@ -969,6 +1236,17 @@ export class YtStudioBrowserController {
         screenshotBase64 = `data:image/jpeg;base64,${buf.toString('base64')}`;
       }
     }
+    const openTabs: YtOpenTabInfo[] = this.context
+      ? this.context
+          .pages()
+          .filter((p) => !p.isClosed())
+          .map((p, idx) => ({
+            index: idx,
+            url: p.url() || 'about:blank',
+            active: p === this.page,
+          }))
+      : [];
+
     return {
       status: this.status,
       assistMode: this.assistMode,
@@ -980,6 +1258,7 @@ export class YtStudioBrowserController {
       lastError: this.lastError,
       screenshotBase64,
       viewport: this.viewport,
+      openTabs,
     };
   }
 }
@@ -988,6 +1267,8 @@ function getGlobalYtStudioController(): YtStudioBrowserController {
   const g = globalThis as unknown as { __cmtYtStudioController?: YtStudioBrowserController };
   if (!g.__cmtYtStudioController) {
     g.__cmtYtStudioController = new YtStudioBrowserController();
+  } else {
+    Object.setPrototypeOf(g.__cmtYtStudioController, YtStudioBrowserController.prototype);
   }
   return g.__cmtYtStudioController;
 }

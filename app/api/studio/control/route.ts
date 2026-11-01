@@ -129,6 +129,7 @@ export async function POST(req: NextRequest) {
     windowId?: string
     workerId?: string
     windowNumber?: number
+    tabIndex?: number
     clipPath?: string
     ytVisibility?: 'unlisted' | 'private'
     ytAutoDeleteAtEnd?: boolean
@@ -859,6 +860,22 @@ export async function POST(req: NextRequest) {
         if (body.url) {
           await globalYtStudioController.handleNavigate(body.url, username)
         }
+        return NextResponse.json({
+          ok: true,
+          ytSnapshot: await globalYtStudioController.getSnapshot(true),
+        })
+      }
+      case 'yt_switch_tab': {
+        if (typeof body.tabIndex === 'number') {
+          await globalYtStudioController.switchTab(body.tabIndex)
+        }
+        return NextResponse.json({
+          ok: true,
+          ytSnapshot: await globalYtStudioController.getSnapshot(true),
+        })
+      }
+      case 'yt_verify_next': {
+        await globalYtStudioController.clickVerifyNext(username)
         return NextResponse.json({
           ok: true,
           ytSnapshot: await globalYtStudioController.getSnapshot(true),

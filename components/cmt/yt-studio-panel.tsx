@@ -150,7 +150,9 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
 
   function handleScreenClick(e: React.MouseEvent<HTMLDivElement>) {
     if (!snap?.assistMode) return
-    const rect = e.currentTarget.getBoundingClientRect()
+    const targetEl = imgRef.current || e.currentTarget
+    const rect = targetEl.getBoundingClientRect()
+    if (rect.width <= 0 || rect.height <= 0) return
     const xRatio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
     const yRatio = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height))
     setClickMarker({ x: xRatio * 100, y: yRatio * 100 })
@@ -441,6 +443,17 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
               <button
                 type="button"
                 disabled={busyAction !== null}
+                onClick={() => callYtControl({ action: 'yt_verify_next' }, 'verify_next')}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded text-[11px] font-medium bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 border border-cyan-500/40"
+                title="Click 'Next' on YouTube Studio 'Verify it's you' dialog and switch to the Google verification popup window"
+              >
+                <ShieldCheck className="size-3.5" />
+                Verify &ldquo;Next&rdquo; / Switch Popup
+              </button>
+
+              <button
+                type="button"
+                disabled={busyAction !== null}
                 onClick={() => callYtControl({ action: 'yt_save_session' }, 'save_session')}
                 className="inline-flex items-center gap-1 px-2.5 py-1 rounded text-[11px] font-medium bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40"
                 title="Save cookies directly from this live YouTube Studio browser"
@@ -544,12 +557,40 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
               </button>
             </div>
           </div>
+          {/* Open Tabs / Popup Switcher Bar (shows when Google Verify popup opens) */}
+          {snap?.openTabs && snap.openTabs.length > 1 && (
+            <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-zinc-800/80">
+              <span className="text-[10px] font-mono uppercase tracking-wider text-amber-300 font-semibold">
+                Open Browser Windows ({snap.openTabs.length}):
+              </span>
+              {snap.openTabs.map((t) => {
+                const isGooglePopup = t.url.includes('accounts.google.com')
+                return (
+                  <button
+                    key={t.index}
+                    type="button"
+                    onClick={() =>
+                      callYtControl({ action: 'yt_switch_tab', tabIndex: t.index }, 'switch_tab')
+                    }
+                    className={`px-2 py-0.5 rounded text-[10px] font-mono border transition ${
+                      t.active
+                        ? 'bg-rose-500/25 border-rose-400 text-rose-100 font-bold'
+                        : 'bg-zinc-900 border-zinc-700 text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    {t.index === 0 ? 'Tab 1: YT Studio' : `Popup #${t.index + 1}`}{' '}
+                    {isGooglePopup ? '(Google Verify)' : ''} — {t.url.slice(0, 42)}
+                  </button>
+                )
+              })}
+            </div>
+          )}
         </div>
 
         {/* BEECH ME LIVE SCREEN */}
         <div
           onClick={handleScreenClick}
-          className={`relative aspect-video w-full bg-zinc-950 flex items-center justify-center overflow-hidden ${
+          className={`relative aspect-[1366/820] w-full bg-zinc-950 flex items-center justify-center overflow-hidden ${
             isAssist ? 'cursor-crosshair' : 'cursor-default'
           }`}
         >
@@ -559,7 +600,7 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
               ref={imgRef}
               src={snap.screenshotBase64}
               alt="YouTube Studio Live Browser"
-              className="w-full h-full object-contain select-none"
+              className="w-full h-full object-fill select-none"
             />
           ) : (
             <div className="text-center space-y-1 p-6">
