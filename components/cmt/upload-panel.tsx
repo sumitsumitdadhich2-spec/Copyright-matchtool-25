@@ -2,10 +2,27 @@
 
 import { useEffect, useRef, useState, type DragEvent } from 'react'
 import { useSWRConfig } from 'swr'
-import { Film, Clapperboard, Loader2, CheckCircle2, X, RefreshCw, WifiOff, Zap, FolderOpen } from 'lucide-react'
+import { Film, Clapperboard, Loader2, CheckCircle2, X, RefreshCw, WifiOff, Zap, FolderOpen, Video } from 'lucide-react'
 import type { Scan } from '@/lib/types'
 import { fmtTime, fmtBytes } from '@/lib/format'
 import { uploadVideoStream, fmtMbps, fmtEta, UploadError, type UploadProgress, type UploadKind } from '@/lib/upload-client'
+
+function isValidYoutubeUrl(raw: string): boolean {
+  try {
+    const u = new URL(raw.trim())
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false
+    const host = u.hostname.toLowerCase().replace(/^www\./, '')
+    return (
+      host === 'youtube.com' ||
+      host === 'm.youtube.com' ||
+      host === 'music.youtube.com' ||
+      host === 'youtu.be' ||
+      host === 'youtube-nocookie.com'
+    )
+  } catch {
+    return false
+  }
+}
 
 interface Props {
   scan: Scan | null
@@ -267,6 +284,65 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
   }
 
   const [syncingDrive, setSyncingDrive] = useState(false)
+  const [shortYtInput, setShortYtInput] = useState(scan?.shortYoutubeUrl ?? '')
+  const [shortYtError, setShortYtError] = useState<string | null>(null)
+  const [savingShortYt, setSavingShortYt] = useState(false)
+
+  useEffect(() => {
+    setShortYtInput(scan?.shortYoutubeUrl ?? '')
+    setShortYtError(null)
+  }, [scan?.id, scan?.shortYoutubeUrl])
+
+  async function handleSaveShortYtLink() {
+    const trimmed = shortYtInput.trim()
+    if (!trimmed) {
+      setShortYtError('Please enter a YouTube link')
+      return
+    }
+    if (!isValidYoutubeUrl(trimmed)) {
+      setShortYtError('Invalid YouTube URL (must be youtube.com or youtu.be)')
+      return
+    }
+    setShortYtError(null)
+    setSavingShortYt(true)
+    try {
+      const id = await ensureScan()
+      const res = await fetch(`/api/scans/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ shortYoutubeUrl: trimmed }),
+      })
+      const data = (await res.json().catch(() => ({}))) as { error?: string }
+      if (!res.ok) {
+        setShortYtError(data.error || 'Failed to save link')
+        return
+      }
+      await Promise.all([mutateCache(`/api/scans/${id}`), mutateCache('/api/scans')])
+      refresh()
+    } catch (err) {
+      setShortYtError(err instanceof Error ? err.message : 'Failed to save link')
+    } finally {
+      setSavingShortYt(false)
+    }
+  }
+
+  async function handleRemoveShortYtLink() {
+    setShortYtInput('')
+    setShortYtError(null)
+    if (!scan?.id) return
+    setSavingShortYt(true)
+    try {
+      await fetch(`/api/scans/${scan.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ shortYoutubeUrl: null }),
+      })
+      await Promise.all([mutateCache(`/api/scans/${scan.id}`), mutateCache('/api/scans')])
+      refresh()
+    } finally {
+      setSavingShortYt(false)
+    }
+  }
 
   async function triggerStudioMovieSync() {
     if (!scan?.id) return
@@ -288,8 +364,6 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
     const visible = jobs.find((item) => item.scanId === selectedScanId && item.kind === kind)
     if (visible) controllers.current.get(visible.key)?.abort()
   }
-
-  const chunking = scan?.status === 'chunking'
 
   // Every card reads only its selected scan + media-kind job. Uploads for other
   // history entries keep running in the same component without leaking progress.
@@ -342,13 +416,71 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
             disabled={shortJob !== null || shortServer}
             onFile={(f) => uploadFile('short', f)}
             onCancel={() => cancelUpload('short')}
-            extraInfo={[
-              reused[shortKey] ? 'Already on server — linked instantly, nothing uploaded' : null,
-              scan?.shortSegments && scan.shortSegments.length > 1 ? `${scan.shortSegments.length} minutes — scanned minute-by-minute` : null,
-            ]
-              .filter(Boolean)
-              .join(' · ') || undefined}
+            extraInfo={
+              [
+                reused[shortKey] ? 'Already on server — linked instantly, nothing uploaded' : null,
+                scan?.shortSegments && scan.shortSegments.length > 1 ? `${scan.shortSegments.length} minutes — scanned minute-by-minute` : null,
+              ]
+                .filter(Boolean)
+                .join(' · ') || undefined
+            }
           />
+
+          {/* Short YouTube Link Option (for AI Studio window scan attach) */}
+          <div className="rounded-lg border border-border/80 bg-card/70 p-2.5 text-xs space-y-2">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <span className="font-medium text-foreground flex items-center gap-1.5">
+                <Video className="size-3.5 text-red-500" />
+                Short YouTube link (AI Studio attach):
+              </span>
+              {scan?.shortYoutubeUrl ? (
+                <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-400">
+                  <CheckCircle2 className="size-3" />
+                  Short link saved
+                </span>
+              ) : (
+                <span className="text-[10px] text-muted-foreground">Optional — attaches via YouTube link</span>
+              )}
+            </div>
+
+            <div className="flex items-center gap-1.5">
+              <input
+                type="url"
+                value={shortYtInput}
+                onChange={(e) => {
+                  setShortYtInput(e.target.value)
+                  if (shortYtError) setShortYtError(null)
+                }}
+                placeholder="https://youtu.be/... or https://www.youtube.com/watch?v=..."
+                className="flex-1 rounded-md border border-border bg-background px-2.5 py-1.5 text-xs font-mono text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-primary"
+              />
+              <button
+                type="button"
+                onClick={() => void handleSaveShortYtLink()}
+                disabled={savingShortYt || !shortYtInput.trim()}
+                className="rounded-md bg-primary px-2.5 py-1.5 text-[11px] font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
+              >
+                {savingShortYt ? 'Saving...' : 'Save link'}
+              </button>
+              {(shortYtInput.trim() || scan?.shortYoutubeUrl) && (
+                <button
+                  type="button"
+                  onClick={() => void handleRemoveShortYtLink()}
+                  disabled={savingShortYt}
+                  className="rounded-md border border-border bg-secondary px-2.5 py-1.5 text-[11px] font-medium text-foreground hover:bg-secondary/80 disabled:opacity-40"
+                >
+                  Cancel
+                </button>
+              )}
+            </div>
+
+            {shortYtError && <p className="text-[11px] text-destructive">{shortYtError}</p>}
+            {scan?.shortYoutubeUrl && !shortYtError && (
+              <p className="text-[10px] font-mono text-emerald-400/90 truncate">
+                Active link: {scan.shortYoutubeUrl}
+              </p>
+            )}
+          </div>
         </div>
 
         <div className="flex flex-col gap-2">

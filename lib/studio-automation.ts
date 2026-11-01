@@ -4053,6 +4053,7 @@ export class StudioBrowserController {
     page: Page,
     params: {
       label: 'short' | 'movie'
+      youtubeUrl?: string | null
       driveFileName?: string | null
       localFilePath?: string | null
       startSec: number
@@ -4061,11 +4062,12 @@ export class StudioBrowserController {
       scope?: { scanId?: string | null; username?: string | null }
     },
   ) {
-    const { label, driveFileName, localFilePath, startSec, endSec, fps, scope } = params
+    const { label, youtubeUrl, driveFileName, localFilePath, startSec, endSec, fps, scope } = params
     await this.waitIfPausedOrThrowIfStopped(scope)
     await this.closeModelSelectionPanelIfOpen(page)
 
     const uploadedBasename =
+      youtubeUrl ||
       driveFileName ||
       (localFilePath ? path.basename(localFilePath) : '')
 
@@ -4083,7 +4085,149 @@ export class StudioBrowserController {
     const removeBefore = await removeMediaBtnLocator.count().catch(() => 0)
     const headerTokensBefore = await this.readHeaderTokenCountSilent(page)
 
-    if (driveFileName) {
+    let chipCount = chipsBefore
+    let removeAfter = removeBefore
+    let headerTokensAfter = headerTokensBefore
+    let attachSucceeded = false
+
+    const waitForChipAfterAttach = async (waitTimeoutMs: number, isLocalFileUpload: boolean): Promise<boolean> => {
+      const uploadWaitStartedAt = Date.now()
+      const waitDeadline = uploadWaitStartedAt + waitTimeoutMs
+      let lastLoggedUploadSec = -1
+
+      while (Date.now() < waitDeadline) {
+        await this.waitIfPausedOrThrowIfStopped(scope)
+        await this.syncFallbackMediaChips(page)
+        chipCount = await chipsLocator.count()
+        removeAfter = await removeMediaBtnLocator.count().catch(() => 0)
+        headerTokensAfter = await this.readHeaderTokenCountSilent(page)
+
+        const primarySignal = chipCount > chipsBefore
+        const secondarySignal =
+          removeAfter > removeBefore || (headerTokensAfter > headerTokensBefore && headerTokensAfter > 0)
+
+        if (primarySignal || secondarySignal) {
+          if (chipCount > chipsBefore) {
+            const candidateChip = chipsLocator.nth(chipsBefore)
+            const chipText = ((await candidateChip.innerText().catch(() => '')) || '').trim()
+            const gearBtnCount = await candidateChip
+              .locator(
+                'button[aria-label*="Edit video options" i], button[aria-label*="Video options" i], button[aria-label*="Video settings" i]',
+              )
+              .count()
+              .catch(() => 0)
+            if (gearBtnCount > 0 || !/\bloading\b/i.test(chipText)) {
+              return true
+            }
+          } else {
+            const editBtnCountOnPage = await page
+              .locator('button[aria-label="Edit video options" i], button[aria-label*="Edit video options" i]')
+              .count()
+              .catch(() => 0)
+            if (editBtnCountOnPage > chipsBefore) {
+              await this.syncFallbackMediaChips(page)
+              chipCount = await chipsLocator.count()
+              return true
+            }
+          }
+        }
+
+        const elapsedUploadSec = Math.max(1, Math.floor((Date.now() - uploadWaitStartedAt) / 1000))
+        if (isLocalFileUpload && elapsedUploadSec !== lastLoggedUploadSec) {
+          lastLoggedUploadSec = elapsedUploadSec
+          this.logStep(
+            `uploading ${uploadedBasename || `${label}.mp4`} to AI Studio... ${elapsedUploadSec}s`,
+            label,
+          )
+        }
+
+        await new Promise((r) => setTimeout(r, 1000))
+      }
+
+      await this.syncFallbackMediaChips(page)
+      chipCount = await chipsLocator.count()
+      removeAfter = await removeMediaBtnLocator.count().catch(() => 0)
+      headerTokensAfter = await this.readHeaderTokenCountSilent(page)
+      return (
+        chipCount > chipsBefore ||
+        removeAfter > removeBefore ||
+        (headerTokensAfter > headerTokensBefore && headerTokensAfter > 0)
+      )
+    }
+
+    if (youtubeUrl && youtubeUrl.trim()) {
+      const cleanYtUrl = youtubeUrl.trim()
+      const maxYtAttempts = 3
+      for (let ytAttempt = 1; ytAttempt <= maxYtAttempts; ytAttempt++) {
+        await this.waitIfPausedOrThrowIfStopped(scope)
+        await this.closeModelSelectionPanelIfOpen(page)
+        this.logStep(
+          `attaching ${label} YouTube link (attempt ${ytAttempt}/${maxYtAttempts})`,
+          cleanYtUrl,
+          'info',
+        )
+
+        const insertBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.insertMediaButton, 4000)
+        if (!insertBtn) {
+          if (ytAttempt < maxYtAttempts) {
+            await new Promise((r) => setTimeout(r, 20_000))
+            continue
+          }
+          break
+        }
+        await insertBtn.click()
+        await new Promise((r) => setTimeout(r, 400))
+
+        const ytOpt = await findFirstVisibleLocator(page, STUDIO_SELECTORS.insertMenuYoutubeOption, 3000)
+        if (!ytOpt) {
+          await page.keyboard.press('Escape').catch(() => {})
+          if (ytAttempt < maxYtAttempts) {
+            await new Promise((r) => setTimeout(r, 20_000))
+            continue
+          }
+          break
+        }
+        await ytOpt.click()
+        await new Promise((r) => setTimeout(r, 500))
+
+        const ytInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.youtubeModalInput, 4000)
+        if (!ytInput) {
+          await page.keyboard.press('Escape').catch(() => {})
+          if (ytAttempt < maxYtAttempts) {
+            await new Promise((r) => setTimeout(r, 20_000))
+            continue
+          }
+          break
+        }
+
+        await ytInput.click()
+        await ytInput.fill(cleanYtUrl)
+        await new Promise((r) => setTimeout(r, 300))
+
+        const confirmBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.youtubeModalConfirm, 2500)
+        if (confirmBtn) {
+          await confirmBtn.click()
+        } else {
+          await ytInput.press('Enter')
+        }
+
+        attachSucceeded = await waitForChipAfterAttach(90_000, false)
+        if (attachSucceeded) {
+          this.logStep(`attached ${label} YouTube video`, cleanYtUrl, 'info')
+          break
+        }
+
+        this.logStep(
+          `YouTube attach attempt ${ytAttempt}/${maxYtAttempts} timed out`,
+          `Waiting 25s before retry (${cleanYtUrl})`,
+          'warn',
+        )
+        await page.keyboard.press('Escape').catch(() => {})
+        if (ytAttempt < maxYtAttempts) {
+          await new Promise((r) => setTimeout(r, 25_000))
+        }
+      }
+    } else if (driveFileName) {
       // Attach from Google Drive picker by file name (Insert -> Drive -> search driveFileName -> Select)
       let attachedFromDrive = false
       const insertBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.insertMediaButton, 3000)
@@ -4095,7 +4239,6 @@ export class StudioBrowserController {
           await driveOpt.click()
           await new Promise((r) => setTimeout(r, 1500))
 
-          // Locate the Google Drive Picker iframe
           const frames = page.frames()
           const pickerFrame = frames.find(
             (f) => f.url().includes('docs.google.com/picker') || f.url().includes('drive.google.com'),
@@ -4111,7 +4254,6 @@ export class StudioBrowserController {
               await searchBox.press('Enter')
               await new Promise((r) => setTimeout(r, 2000))
             }
-            // Click the matching file row inside the picker
             const row = pickerFrame.locator(`text="${driveFileName}"`).first()
             if ((await row.count()) > 0) {
               await row.click()
@@ -4135,101 +4277,23 @@ export class StudioBrowserController {
         }
       }
 
-      // Fallback if Drive picker iframe couldn't be interacted with and local file exists
       if (!attachedFromDrive && localFilePath && fs.existsSync(localFilePath)) {
         await this.uploadLocalFileToStudio(page, localFilePath)
+        attachSucceeded = await waitForChipAfterAttach(300_000, true)
+      } else {
+        attachSucceeded = await waitForChipAfterAttach(90_000, false)
       }
     } else if (localFilePath && fs.existsSync(localFilePath)) {
       await this.uploadLocalFileToStudio(page, localFilePath)
+      attachSucceeded = await waitForChipAfterAttach(300_000, true)
     } else {
       throw new Error(`No media source available to attach ${label} video in Studio`)
-    }
-
-    // FIX 1a: Wait for the new video chip to appear (via chip count increase OR second success signal:
-    // button[aria-label="Remove media" i] count increased OR header token count increased)
-    // AND wait until the chip finishes "Loading..." so its gear button ("Edit video options") is ready.
-    // A local 390 MB upload can take longer than 90s, so use a 5-minute (300_000ms) deadline for local file uploads.
-    const isLocalFileUpload = Boolean(!driveFileName && localFilePath)
-    const waitTimeoutMs = isLocalFileUpload ? 300_000 : 90_000
-    const uploadWaitStartedAt = Date.now()
-    const waitDeadline = uploadWaitStartedAt + waitTimeoutMs
-    let chipCount = chipsBefore
-    let removeAfter = removeBefore
-    let headerTokensAfter = headerTokensBefore
-    let attachSucceeded = false
-    let lastLoggedUploadSec = -1
-
-    while (Date.now() < waitDeadline) {
-      await this.waitIfPausedOrThrowIfStopped(scope)
-      await this.syncFallbackMediaChips(page)
-      chipCount = await chipsLocator.count()
-      removeAfter = await removeMediaBtnLocator.count().catch(() => 0)
-      headerTokensAfter = await this.readHeaderTokenCountSilent(page)
-
-      const primarySignal = chipCount > chipsBefore
-      const secondarySignal =
-        removeAfter > removeBefore || (headerTokensAfter > headerTokensBefore && headerTokensAfter > 0)
-
-      if (primarySignal || secondarySignal) {
-        if (chipCount > chipsBefore) {
-          const candidateChip = chipsLocator.nth(chipsBefore)
-          const chipText = ((await candidateChip.innerText().catch(() => '')) || '').trim()
-          const gearBtnCount = await candidateChip
-            .locator(
-              'button[aria-label*="Edit video options" i], button[aria-label*="Video options" i], button[aria-label*="Video settings" i]',
-            )
-            .count()
-            .catch(() => 0)
-          // As shown in video 01:54 -> 01:56, while "Loading..." is displayed the gear icon is not ready yet
-          if (gearBtnCount > 0 || !/\bloading\b/i.test(chipText)) {
-            attachSucceeded = true
-            break
-          }
-        } else {
-          // Secondary signal triggered while chip is still Loading... — wait until Edit video options button appears and syncs
-          const editBtnCountOnPage = await page
-            .locator('button[aria-label="Edit video options" i], button[aria-label*="Edit video options" i]')
-            .count()
-            .catch(() => 0)
-          if (editBtnCountOnPage > chipsBefore) {
-            await this.syncFallbackMediaChips(page)
-            chipCount = await chipsLocator.count()
-            attachSucceeded = true
-            break
-          }
-        }
-      }
-
-      const elapsedUploadSec = Math.max(1, Math.floor((Date.now() - uploadWaitStartedAt) / 1000))
-      if (isLocalFileUpload && elapsedUploadSec !== lastLoggedUploadSec) {
-        lastLoggedUploadSec = elapsedUploadSec
-        this.logStep(
-          `uploading ${uploadedBasename || `${label}.mp4`} to AI Studio... ${elapsedUploadSec}s`,
-          label,
-        )
-      }
-
-      await new Promise((r) => setTimeout(r, 1000))
-    }
-
-    if (!attachSucceeded) {
-      await this.syncFallbackMediaChips(page)
-      chipCount = await chipsLocator.count()
-      removeAfter = await removeMediaBtnLocator.count().catch(() => 0)
-      headerTokensAfter = await this.readHeaderTokenCountSilent(page)
-      if (
-        chipCount > chipsBefore ||
-        removeAfter > removeBefore ||
-        (headerTokensAfter > headerTokensBefore && headerTokensAfter > 0)
-      ) {
-        attachSucceeded = true
-      }
     }
 
     if (!attachSucceeded) {
       await this.dumpChipAttachDiagnostics(page, label, uploadedBasename)
       throw new Error(
-        `Studio video attach failed for ${label}: media chip count did not increase within ${Math.round(waitTimeoutMs / 1000)}s (before=${chipsBefore}, after=${chipCount}, removeBefore=${removeBefore}, removeAfter=${removeAfter}, tokensBefore=${headerTokensBefore}, tokensAfter=${headerTokensAfter})`,
+        `Studio video attach failed for ${label}: media chip count did not increase (before=${chipsBefore}, after=${chipCount}, removeBefore=${removeBefore}, removeAfter=${removeAfter}, tokensBefore=${headerTokensBefore}, tokensAfter=${headerTokensAfter})`,
       )
     }
 
@@ -5514,10 +5578,12 @@ export class StudioBrowserController {
     pageRecycleInterval?: number
     shortDriveFileName?: string | null
     shortLocalPath?: string | null
+    shortYoutubeUrl?: string | null
     shortStartSec: number
     shortEndSec: number
     movieDriveFileName?: string | null
     movieLocalPath?: string | null
+    movieYoutubeUrl?: string | null
     movieStartSec: number
     movieEndSec: number
     windowClip?: {
@@ -5551,10 +5617,12 @@ export class StudioBrowserController {
       maxOutputTokens,
       shortDriveFileName,
       shortLocalPath,
+      shortYoutubeUrl = null,
       shortStartSec,
       shortEndSec,
       movieDriveFileName,
       movieLocalPath,
+      movieYoutubeUrl = null,
       movieStartSec,
       movieEndSec,
       windowClip = null,
@@ -6001,10 +6069,16 @@ export class StudioBrowserController {
         }
 
         if (needAttachShort || needAttachMovie) {
-          await waitUntilRamSafeForAttach(needAttachShort ? 'attach_short' : 'attach_movie')
+          const isShortLocalAttach = Boolean(needAttachShort && !shortYoutubeUrl && !shortDriveFileName)
+          const isMovieLocalAttach = Boolean(needAttachMovie && !movieYoutubeUrl && !movieDriveFileName)
+          const usesAnyLocalFileUpload = isShortLocalAttach || isMovieLocalAttach
+
+          if (usesAnyLocalFileUpload) {
+            await waitUntilRamSafeForAttach(isShortLocalAttach ? 'attach_short' : 'attach_movie')
+          }
 
           let releaseUploadGate: (() => void) | null = null
-          if (parallelMode) {
+          if (parallelMode && usesAnyLocalFileUpload) {
             currentStage = 'WAITING FOR UPLOAD GATE'
             const holderKey = `${this.workerTag || this.profileDirName}:${scanId}`
             releaseUploadGate = await globalStudioUploadGate.acquire(holderKey, {
@@ -6022,11 +6096,14 @@ export class StudioBrowserController {
           try {
             await this.closeModelSelectionPanelIfOpen(page)
             if (needAttachShort) {
-              await waitUntilRamSafeForAttach('attach_short')
+              if (!shortYoutubeUrl) {
+                await waitUntilRamSafeForAttach('attach_short')
+              }
               await this.closeModelSelectionPanelIfOpen(page)
               currentStage = 'setup/attach_short'
               await this.attachVideoAndConfigureRange(page, {
                 label: 'short',
+                youtubeUrl: shortYoutubeUrl,
                 driveFileName: shortDriveFileName,
                 localFilePath: shortLocalPath,
                 startSec: shortStartSec,
@@ -6037,7 +6114,9 @@ export class StudioBrowserController {
             }
 
             if (needAttachMovie) {
-              await waitUntilRamSafeForAttach('attach_movie')
+              if (!movieYoutubeUrl) {
+                await waitUntilRamSafeForAttach('attach_movie')
+              }
               await this.closeModelSelectionPanelIfOpen(page)
               currentStage = 'setup/attach_movie'
               const attachMovieFilePath = windowClip?.clipPath || movieLocalPath
@@ -6079,7 +6158,18 @@ export class StudioBrowserController {
                 }
               }, 3000)
               try {
-                if (windowClip) {
+                if (movieYoutubeUrl) {
+                  await this.attachVideoAndConfigureRange(page, {
+                    label: 'movie',
+                    youtubeUrl: movieYoutubeUrl,
+                    driveFileName: null,
+                    localFilePath: windowClip?.clipPath || movieLocalPath,
+                    startSec: 0,
+                    endSec: windowClip ? windowClip.durationSec : movieEndSec - movieStartSec,
+                    fps: 24,
+                    scope,
+                  })
+                } else if (windowClip) {
                   await this.attachVideoAndConfigureRange(page, {
                     label: 'movie',
                     driveFileName: null,
@@ -6277,7 +6367,7 @@ export class StudioBrowserController {
         }
         page.on('response', onRunResponse)
 
-        let runStarted = Date.now()
+        const runStarted = Date.now()
         const TIMEOUT_MS = 10 * 60_000
         const INCOMPLETE_REASONS = new Set([
           'empty',
@@ -6298,7 +6388,6 @@ export class StudioBrowserController {
         let permissionDeniedTriggered = false
         let internalErrorDetected = false
         let internalErrorContinueTriedInChat = false
-        let internalErrorSameChatRetries = 0
         let quotaContinuePartialText: string | null = null
         let quotaSwitchRetryNewChat = false
         let transientBannerReason: string | null = null
@@ -7224,32 +7313,10 @@ export class StudioBrowserController {
           }
         }
 
-        // Requirement: When an internal error occurs (or fake running is detected), do NOT stay on the broken chat page.
-        // Switch to an unleased available model, perform Hard Refresh + New Page (prompts/new_chat), Save Cookies, and retry cleanly!
+        // Requirement 6.5: On internal error, do NOT switch models!
+        // Keep the same model and perform Hard Refresh + New Page -> Browser Restart -> new_chat retry.
         if (internalErrorDetected && !rawAnswer) {
           await cancelStuckStopButtonIfVisible()
-          const prevMod = activeModelName
-          const nextMod =
-            (await getEffectiveModel(
-              chosenModel,
-              MODEL_FALLBACK_CHAIN,
-              Date.now(),
-              this.profileDirName,
-              [prevMod],
-            )) || prevMod
-          if (nextMod.toLowerCase() !== prevMod.toLowerCase()) {
-            this.logStep(
-              'internal error -> switch model',
-              `${jobLabel}: switching ${prevMod} -> ${nextMod} before hard refresh + new page`,
-              'warn',
-            )
-            onLog?.(
-              'warn',
-              `${jobLabel}: switching model ${prevMod} -> ${nextMod} after internal error`,
-            )
-            activeModelName = nextMod
-            this.activeModelName = activeModelName
-          }
 
           if (internalErrorRefreshes < MAX_INTERNAL_ERROR_REFRESH) {
             internalErrorRefreshes += 1

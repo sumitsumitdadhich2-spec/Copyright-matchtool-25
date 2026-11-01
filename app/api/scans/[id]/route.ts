@@ -82,12 +82,32 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
   }
 
-  const body = (await req.json().catch(() => ({}))) as { verifierEnabled?: boolean; autoMode?: boolean; customName?: string }
+  const body = (await req.json().catch(() => ({}))) as {
+    verifierEnabled?: boolean
+    autoMode?: boolean
+    customName?: string
+    shortYoutubeUrl?: string | null
+  }
   let updated = false
 
   if (body.customName !== undefined) {
     scan.customName = typeof body.customName === 'string' ? body.customName.trim() || null : null
     updated = true
+  }
+
+  if (body.shortYoutubeUrl !== undefined) {
+    if (body.shortYoutubeUrl === null || body.shortYoutubeUrl === '') {
+      scan.shortYoutubeUrl = null
+      updated = true
+    } else if (typeof body.shortYoutubeUrl === 'string') {
+      const { isValidYoutubeUrl } = await import('@/lib/yt-dlp')
+      const trimmed = body.shortYoutubeUrl.trim()
+      if (!isValidYoutubeUrl(trimmed)) {
+        return NextResponse.json({ error: 'Invalid YouTube URL' }, { status: 400 })
+      }
+      scan.shortYoutubeUrl = trimmed
+      updated = true
+    }
   }
 
   if (body.verifierEnabled !== undefined) {
@@ -108,6 +128,12 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
     saveScan(scan, { immediate: true })
   }
 
-  return NextResponse.json({ ok: true, customName: scan.customName, verifierEnabled: scan.verifierEnabled, autoMode: scan.autoMode })
+  return NextResponse.json({
+    ok: true,
+    customName: scan.customName,
+    verifierEnabled: scan.verifierEnabled,
+    autoMode: scan.autoMode,
+    shortYoutubeUrl: scan.shortYoutubeUrl ?? null,
+  })
 }
 

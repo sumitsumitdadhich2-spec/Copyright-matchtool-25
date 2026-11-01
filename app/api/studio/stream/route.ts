@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { studioController } from '@/lib/studio-automation'
 import { getStudioParallelManager } from '@/lib/studio-parallel-manager'
+import { globalYtStudioController } from '@/lib/yt-studio-automation'
 import { getSession } from '@/lib/users'
 
 export const runtime = 'nodejs'
@@ -19,9 +20,14 @@ export async function GET(req: NextRequest) {
   }
 
   const scanId = (req.nextUrl.searchParams.get('scanId') || '').trim()
+  const target = (req.nextUrl.searchParams.get('target') || '').trim()
   const once = req.nextUrl.searchParams.get('once') === '1'
 
   const getSnapshotsForRequest = async () => {
+    if (target === 'yt') {
+      const ytSnapshot = await globalYtStudioController.getSnapshot(true)
+      return { ok: true, ytSnapshot }
+    }
     const [snap, parallelSnapshot] = await Promise.all([
       studioController.getSnapshot(true),
       getStudioParallelManager(scanId || 'default').getLiveSnapshot(true),

@@ -9,11 +9,11 @@ export const STUDIO_MODEL_OPTIONS = [
 export type StudioModelOption = (typeof STUDIO_MODEL_OPTIONS)[number]
 
 /**
- * Since 1 Window = 1 Model is strictly enforced and only 3 models exist
- * ('Argon', 'Gemini 3.8 Flash', 'Gemini 3.6 Flash'), at most 3 parallel windows
- * can run simultaneously without two windows sharing the same model.
+ * Up to 10 parallel windows can run simultaneously on the same configured model.
+ * Model switches only when quota/daily-limit is reached.
  */
-export const MAX_CONCURRENT_MODEL_WINDOWS = STUDIO_MODEL_OPTIONS.length
+export const MAX_CONCURRENT_MODEL_WINDOWS = 10
+export const MAX_PARALLEL_CONCURRENCY = 10
 
 export const DEFAULT_STUDIO_MODEL_NAME: StudioModelOption = 'Argon'
 
@@ -120,51 +120,23 @@ export function buildStudioFallbackCycle(chosenModel?: string | null): StudioMod
   return full
 }
 
-/**
- * Global in-memory active window model lease registry to enforce:
- * 1 Window = 1 Model across concurrent parallel windows.
- * If Window A is running on 'Gemini 3.6 Flash', Window B will pick 'Gemini 3.8 Flash' or 'Argon'.
- */
-const globalForActiveModelLeases = globalThis as unknown as {
-  __cmtActiveWindowModelLeases?: Map<string, StudioModelOption>
-}
-
-function getActiveModelLeaseMap(): Map<string, StudioModelOption> {
-  if (!globalForActiveModelLeases.__cmtActiveWindowModelLeases) {
-    globalForActiveModelLeases.__cmtActiveWindowModelLeases = new Map<string, StudioModelOption>()
-  }
-  return globalForActiveModelLeases.__cmtActiveWindowModelLeases
-}
-
-export function getActiveLeasedModelsByOtherHolders(excludeHolderKey?: string): Map<StudioModelOption, number> {
-  const map = getActiveModelLeaseMap()
-  const counts = new Map<StudioModelOption, number>()
-  for (const [holder, mod] of map.entries()) {
-    if (excludeHolderKey && holder === excludeHolderKey) continue
-    const canon = canonicalizeStudioModelName(mod)
-    counts.set(canon, (counts.get(canon) || 0) + 1)
-  }
-  return counts
+export function getActiveLeasedModelsByOtherHolders(): Map<StudioModelOption, number> {
+  return new Map<StudioModelOption, number>()
 }
 
 export function updateExclusiveStudioModelLease(
-  holderKey: string,
+  _holderKey: string,
   modelName: string,
 ): StudioModelOption {
-  const canon = canonicalizeStudioModelName(modelName)
-  if (holderKey) {
-    getActiveModelLeaseMap().set(holderKey, canon)
-  }
-  return canon
+  return canonicalizeStudioModelName(modelName)
 }
 
-export function releaseExclusiveStudioModel(holderKey: string): void {
-  if (!holderKey) return
-  getActiveModelLeaseMap().delete(holderKey)
+export function releaseExclusiveStudioModel(_holderKey?: string): void {
+  // No-op: multiple windows share the same model
 }
 
 export function orderChainByUnleasedFirst(
-  holderKey: string | undefined,
+  _holderKey: string | undefined,
   chain: readonly string[],
 ): StudioModelOption[] {
   const normalizedChain: StudioModelOption[] = []
@@ -176,33 +148,19 @@ export function orderChainByUnleasedFirst(
       normalizedChain.push(canon)
     }
   }
-  const otherCounts = getActiveLeasedModelsByOtherHolders(holderKey)
-  return [...normalizedChain].sort((a, b) => {
-    const countA = otherCounts.get(a) || 0
-    const countB = otherCounts.get(b) || 0
-    if (countA !== countB) return countA - countB
-    return normalizedChain.indexOf(a) - normalizedChain.indexOf(b)
-  })
+  return normalizedChain
 }
 
-/**
- * Keep `targetModelName` strictly at index 0 (so an explicit model switch e.g. Argon -> Gemini 3.6 Flash
- * is never reversed by `selectModelInRunSettings`), while ordering all remaining fallback candidates
- * with unleased models first.
- */
 export function orderFallbacksKeepingTargetFirst(
-  holderKey: string | undefined,
+  _holderKey: string | undefined,
   targetModelName: string,
   chain: readonly string[],
 ): StudioModelOption[] {
   const targetCanon = canonicalizeStudioModelName(targetModelName)
-  const rest = chain.filter(
-    (m) => canonicalizeStudioModelName(m).toLowerCase() !== targetCanon.toLowerCase(),
-  )
-  const orderedRest = orderChainByUnleasedFirst(holderKey, rest).filter(
+  const rest = orderChainByUnleasedFirst(undefined, chain).filter(
     (m) => m.toLowerCase() !== targetCanon.toLowerCase(),
   )
-  return [targetCanon, ...orderedRest]
+  return [targetCanon, ...rest]
 }
 
 function getTzWallParts(
@@ -366,7 +324,7 @@ export async function getEffectiveModel(
   chosenModel?: string | null,
   chain?: string[],
   nowMs: number = Date.now(),
-  holderKey?: string,
+  _holderKey?: string,
   excludeModels?: string[],
 ): Promise<string> {
   const state = await loadStudioModelQuotaState(nowMs)
@@ -380,36 +338,26 @@ export async function getEffectiveModel(
       ? [...baseChain.slice(startIdx), ...baseChain.slice(0, startIdx)]
       : [...baseChain]
 
-  const orderedCandidates = holderKey
-    ? orderChainByUnleasedFirst(holderKey, rotatedChain)
-    : rotatedChain.map((c) => canonicalizeStudioModelName(c))
+  const orderedCandidates = rotatedChain.map((c) => canonicalizeStudioModelName(c))
 
   const excludedSet = new Set(
     (excludeModels || []).map((m) => canonicalizeStudioModelName(m).toLowerCase()),
   )
 
-  // Pass 1: non-exhausted and not in excludedSet
   for (const candidate of orderedCandidates) {
     const canon = canonicalizeStudioModelName(candidate)
     if (excludedSet.has(canon.toLowerCase())) continue
     const untilTs = state.exhausted[canon]
     if (!untilTs || untilTs <= nowMs) {
-      if (holderKey) {
-        updateExclusiveStudioModelLease(holderKey, canon)
-      }
       return canon
     }
   }
 
-  // Pass 2: if excludedSet filtered out the only non-exhausted model(s), allow any non-exhausted model
   if (excludedSet.size > 0) {
     for (const candidate of orderedCandidates) {
       const canon = canonicalizeStudioModelName(candidate)
       const untilTs = state.exhausted[canon]
       if (!untilTs || untilTs <= nowMs) {
-        if (holderKey) {
-          updateExclusiveStudioModelLease(holderKey, canon)
-        }
         return canon
       }
     }

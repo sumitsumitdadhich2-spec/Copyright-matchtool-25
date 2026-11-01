@@ -49,13 +49,12 @@ async function runTests() {
     assert.deepEqual(buildStudioModelChain('Argon'), [
       'Argon',
       'Gemini 3.8 Flash',
-      'Gemini 3.7 Flash',
       'Gemini 3.6 Flash',
     ])
     assert.deepEqual(buildStudioModelChain('Gemini 3.8 Flash'), [
       'Gemini 3.8 Flash',
-      'Gemini 3.7 Flash',
       'Gemini 3.6 Flash',
+      'Argon',
     ])
 
     // 3. Test getEffectiveModel: Argon exhausted -> Gemini 3.8 Flash; after reset time -> back to Argon

@@ -261,7 +261,7 @@ export function StudioParallelGrid({
   const [minuteInputSource, setMinuteInputSource] = useState<'auto' | 'manual'>(initialSource)
   const [minuteInput, setMinuteInput] = useState<string>(resolveInitialMinutes)
   const [concurrency, setConcurrency] = useState<number>(
-    Math.min(3, snap?.concurrency || scanConcurrency || 3),
+    Math.min(10, snap?.concurrency || scanConcurrency || 10),
   )
   const [confirmClearStateOpen, setConfirmClearStateOpen] = useState<boolean>(false)
   const [busyAction, setBusyAction] = useState<string | null>(null)
@@ -301,7 +301,7 @@ export function StudioParallelGrid({
       } else {
         setMinuteInput(effectiveFoundMinutes)
       }
-      setConcurrency(snap?.concurrency || scanConcurrency || 4)
+      setConcurrency(Math.min(10, snap?.concurrency || scanConcurrency || 10))
       setConfirmClearStateOpen(false)
       setSelectedWorkerId(null)
       setErrorMsg(null)
@@ -954,9 +954,9 @@ export function StudioParallelGrid({
             <input
               type="number"
               min={1}
-              max={20}
+              max={10}
               value={concurrency}
-              onChange={(e) => setConcurrency(Math.max(1, Math.min(20, Number(e.target.value) || 4)))}
+              onChange={(e) => setConcurrency(Math.max(1, Math.min(10, Number(e.target.value) || 10)))}
               className="w-16 rounded bg-zinc-950 border border-zinc-800 px-2 py-1 text-xs font-mono text-zinc-200 text-center focus:outline-none focus:border-cyan-500/50"
             />
             <button

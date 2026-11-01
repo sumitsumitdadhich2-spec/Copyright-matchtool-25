@@ -14,6 +14,7 @@ import {
 } from 'lucide-react'
 import type { PublicStudioSettings } from '@/lib/studio-settings'
 import type { StudioThinkingLevel } from '@/lib/studio-model-state'
+import { YtStudioPanel } from './yt-studio-panel'
 
 const STUDIO_MODEL_DROPDOWN_OPTIONS = [
   'Argon',
@@ -730,6 +731,9 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
       </div>
 
       {error && <p className="text-xs text-destructive font-medium">{error}</p>}
+
+      {/* YouTube Studio — Clip Uploader & Login Assist */}
+      <YtStudioPanel studio={studio} onRefresh={onRefresh} />
     </div>
   )
 }

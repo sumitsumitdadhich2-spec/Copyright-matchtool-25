@@ -34,6 +34,10 @@ export interface WindowClipSidecar {
   size: number
   mtime: number
   createdAt: number
+  ytUrl?: string
+  ytVideoId?: string
+  ytUploadedAt?: number
+  ytDeleted?: boolean
 }
 
 const globalForWindowClips = globalThis as unknown as {
@@ -309,5 +313,170 @@ export async function ensureWindowClip(
     return await jobPromise
   } finally {
     inflight.delete(clipPath)
+  }
+}
+
+export function resolveClipSidecarPath(
+  clipPathOrScanId: string,
+  windowNumber?: number,
+): string | null {
+  if (typeof windowNumber === 'number') {
+    const clipsDir = getScanWindowClipsDir(clipPathOrScanId)
+    if (!fs.existsSync(clipsDir)) return null
+    try {
+      const files = fs.readdirSync(clipsDir)
+      const prefix = `win-${windowNumber}-`
+      const match = files.find((f) => f.startsWith(prefix) && f.endsWith('.json'))
+      if (match) return path.join(clipsDir, match)
+      const ytDirect = path.join(clipsDir, `win-${windowNumber}-yt.json`)
+      if (fs.existsSync(ytDirect)) return ytDirect
+    } catch {
+      return null
+    }
+    return null
+  }
+  return getWindowClipSidecarPath(clipPathOrScanId)
+}
+
+export function readClipYtSidecar(
+  clipPathOrScanId: string,
+  windowNumber?: number,
+): {
+  ytUrl?: string
+  ytVideoId?: string
+  ytUploadedAt?: number
+  ytDeleted?: boolean
+} | null {
+  const sidecarPath = resolveClipSidecarPath(clipPathOrScanId, windowNumber)
+  if (!sidecarPath || !fs.existsSync(sidecarPath)) return null
+  try {
+    const raw = JSON.parse(fs.readFileSync(sidecarPath, 'utf8')) as Partial<WindowClipSidecar>
+    if (raw && raw.ytUrl && !raw.ytDeleted) {
+      // If called with a direct clip file path that exists on disk, verify size/mtime if recorded
+      if (typeof windowNumber !== 'number' && fs.existsSync(clipPathOrScanId)) {
+        const st = fs.statSync(clipPathOrScanId)
+        const recordedSize = raw.size ?? raw.movieSize
+        if (typeof recordedSize === 'number' && recordedSize > 0 && st.size !== recordedSize) {
+          return null
+        }
+      }
+      return {
+        ytUrl: raw.ytUrl,
+        ytVideoId: raw.ytVideoId,
+        ytUploadedAt: raw.ytUploadedAt,
+        ytDeleted: Boolean(raw.ytDeleted),
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return null
+}
+
+export function saveClipYtSidecar(
+  clipPathOrScanId: string,
+  windowNumberOrYtUrlOrData:
+    | number
+    | string
+    | {
+        scanId?: string
+        windowNumber?: number
+        ytUrl: string
+        ytVideoId?: string
+        ytUploadedAt?: number
+        ytDeleted?: boolean
+      },
+  dataOrVideoId?: { ytUrl: string; ytVideoId?: string; ytUploadedAt?: number } | string,
+): boolean {
+  let targetSidecarPath: string | null = null
+  let ytUrl = ''
+  let ytVideoId = ''
+  let ytUploadedAt = Date.now()
+  let clipSize = 0
+  let clipMtime = 0
+
+  if (typeof windowNumberOrYtUrlOrData === 'number') {
+    const scanId = clipPathOrScanId
+    const winNum = windowNumberOrYtUrlOrData
+    const data = typeof dataOrVideoId === 'object' ? dataOrVideoId : { ytUrl: String(dataOrVideoId || '') }
+    ytUrl = data.ytUrl
+    ytVideoId = data.ytVideoId || ''
+    ytUploadedAt = data.ytUploadedAt || Date.now()
+
+    const clipsDir = getScanWindowClipsDir(scanId)
+    try {
+      fs.mkdirSync(clipsDir, { recursive: true })
+    } catch {
+      /* ignore */
+    }
+    const existingSidecar = resolveClipSidecarPath(scanId, winNum)
+    targetSidecarPath = existingSidecar || path.join(clipsDir, `win-${winNum}-yt.json`)
+  } else if (typeof windowNumberOrYtUrlOrData === 'object' && windowNumberOrYtUrlOrData !== null) {
+    targetSidecarPath = getWindowClipSidecarPath(clipPathOrScanId)
+    ytUrl = windowNumberOrYtUrlOrData.ytUrl
+    ytVideoId = windowNumberOrYtUrlOrData.ytVideoId || ''
+    ytUploadedAt = windowNumberOrYtUrlOrData.ytUploadedAt || Date.now()
+    if (fs.existsSync(clipPathOrScanId)) {
+      try {
+        const st = fs.statSync(clipPathOrScanId)
+        clipSize = st.size
+        clipMtime = Math.round(st.mtimeMs)
+      } catch {
+        /* ignore */
+      }
+    }
+  } else {
+    targetSidecarPath = getWindowClipSidecarPath(clipPathOrScanId)
+    ytUrl = windowNumberOrYtUrlOrData
+    ytVideoId = typeof dataOrVideoId === 'string' ? dataOrVideoId : ''
+    if (fs.existsSync(clipPathOrScanId)) {
+      try {
+        const st = fs.statSync(clipPathOrScanId)
+        clipSize = st.size
+        clipMtime = Math.round(st.mtimeMs)
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  if (!targetSidecarPath) return false
+  try {
+    let existing: Record<string, unknown> = {}
+    if (fs.existsSync(targetSidecarPath)) {
+      try {
+        existing = JSON.parse(fs.readFileSync(targetSidecarPath, 'utf8')) as Record<string, unknown>
+      } catch {
+        existing = {}
+      }
+    }
+    const updated = {
+      ...existing,
+      ytUrl,
+      ytVideoId,
+      ytUploadedAt,
+      ytDeleted: false,
+      ...(clipSize > 0 ? { size: clipSize, mtime: clipMtime } : {}),
+    }
+    const tmp = `${targetSidecarPath}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(updated, null, 2), 'utf8')
+    fs.renameSync(tmp, targetSidecarPath)
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function markClipYtDeleted(clipPathOrScanId: string, windowNumber?: number): void {
+  const sidecarPath = resolveClipSidecarPath(clipPathOrScanId, windowNumber)
+  if (!sidecarPath || !fs.existsSync(sidecarPath)) return
+  try {
+    const existing = JSON.parse(fs.readFileSync(sidecarPath, 'utf8')) as Record<string, unknown>
+    existing.ytDeleted = true
+    const tmpPath = `${sidecarPath}.tmp`
+    fs.writeFileSync(tmpPath, JSON.stringify(existing, null, 2), 'utf8')
+    fs.renameSync(tmpPath, sidecarPath)
+  } catch {
+    /* ignore */
   }
 }

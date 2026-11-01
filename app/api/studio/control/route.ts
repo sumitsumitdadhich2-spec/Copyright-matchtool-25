@@ -15,10 +15,14 @@ import { prepareStudioMovie360pAndDrive, ensureStudioShortReady } from '@/lib/me
 import { getScan, saveScan } from '@/lib/store'
 import { MEDIA_DIR } from '@/lib/paths'
 import {
+  clearUserYtCookies,
+  getPublicStudioSettings,
   loadStudioUserConfig,
   saveStudioUserConfig,
   saveUserGoogleCookies,
+  saveUserYtCookies,
 } from '@/lib/studio-settings'
+import { globalYtStudioController, globalYtStudioUploadGate } from '@/lib/yt-studio-automation'
 import { DEFAULT_STUDIO_MODEL_NAME } from '@/lib/studio-model-state'
 import {
   buildStudioScanPlan,
@@ -124,6 +128,11 @@ export async function POST(req: NextRequest) {
     resumeExisting?: boolean
     windowId?: string
     workerId?: string
+    windowNumber?: number
+    clipPath?: string
+    ytVisibility?: 'unlisted' | 'private'
+    ytAutoDeleteAtEnd?: boolean
+    ytUploadConcurrency?: number
     subAction?:
       | 'stop'
       | 'retry'
@@ -747,6 +756,177 @@ export async function POST(req: NextRequest) {
           ok: workerRes.ok,
           message: workerRes.message,
           parallelSnapshot: await parallelMgr.getLiveSnapshot(true),
+        })
+      }
+      case 'yt_save_cookies': {
+        if (!body.cookiesJson || !body.cookiesJson.trim()) {
+          return NextResponse.json({ ok: false, error: 'Paste Cookie-Editor JSON first' }, { status: 400 })
+        }
+        const saved = await saveUserYtCookies(username, body.cookiesJson)
+        await globalYtStudioController.applySavedCookiesToContext(username)
+        return NextResponse.json({
+          ok: true,
+          cookieCount: saved.count,
+          studio: await getPublicStudioSettings(username),
+          ytSnapshot: await globalYtStudioController.getSnapshot(false),
+        })
+      }
+      case 'yt_clear_cookies': {
+        await clearUserYtCookies(username)
+        await globalYtStudioController.close()
+        return NextResponse.json({
+          ok: true,
+          studio: await getPublicStudioSettings(username),
+          ytSnapshot: await globalYtStudioController.getSnapshot(false),
+        })
+      }
+      case 'yt_save_session': {
+        const res = await globalYtStudioController.saveSessionFromContext(username)
+        return NextResponse.json({
+          ok: true,
+          savedCount: res.savedCount,
+          studio: await getPublicStudioSettings(username),
+          ytSnapshot: await globalYtStudioController.getSnapshot(true),
+        })
+      }
+      case 'yt_test_login': {
+        const res = await globalYtStudioController.testLogin(username)
+        return NextResponse.json({
+          ok: true,
+          ...res,
+          studio: await getPublicStudioSettings(username),
+          ytSnapshot: await globalYtStudioController.getSnapshot(true),
+        })
+      }
+      case 'yt_assist_toggle': {
+        const assistMode = await globalYtStudioController.toggleAssistMode(body.enabled, username)
+        return NextResponse.json({
+          ok: true,
+          assistMode,
+          ytSnapshot: await globalYtStudioController.getSnapshot(true),
+        })
+      }
+      case 'yt_pause': {
+        globalYtStudioController.pause()
+        return NextResponse.json({
+          ok: true,
+          ytSnapshot: await globalYtStudioController.getSnapshot(false),
+        })
+      }
+      case 'yt_resume': {
+        globalYtStudioController.resume()
+        return NextResponse.json({
+          ok: true,
+          ytSnapshot: await globalYtStudioController.getSnapshot(false),
+        })
+      }
+      case 'yt_stop': {
+        await globalYtStudioController.stop()
+        return NextResponse.json({
+          ok: true,
+          ytSnapshot: await globalYtStudioController.getSnapshot(false),
+        })
+      }
+      case 'yt_click': {
+        const snap = await globalYtStudioController.getSnapshot(false)
+        const x = Math.round((body.xRatio ?? 0.5) * snap.viewport.width)
+        const y = Math.round((body.yRatio ?? 0.5) * snap.viewport.height)
+        await globalYtStudioController.handleClick(x, y, username)
+        return NextResponse.json({
+          ok: true,
+          ytSnapshot: await globalYtStudioController.getSnapshot(true),
+        })
+      }
+      case 'yt_type': {
+        if (body.text) {
+          await globalYtStudioController.handleType(body.text, username)
+        }
+        return NextResponse.json({
+          ok: true,
+          ytSnapshot: await globalYtStudioController.getSnapshot(true),
+        })
+      }
+      case 'yt_key': {
+        if (body.key) {
+          await globalYtStudioController.handleKey(body.key, username)
+        }
+        return NextResponse.json({
+          ok: true,
+          ytSnapshot: await globalYtStudioController.getSnapshot(true),
+        })
+      }
+      case 'yt_navigate': {
+        if (body.url) {
+          await globalYtStudioController.handleNavigate(body.url, username)
+        }
+        return NextResponse.json({
+          ok: true,
+          ytSnapshot: await globalYtStudioController.getSnapshot(true),
+        })
+      }
+      case 'yt_save_settings': {
+        if (body.ytUploadConcurrency !== undefined) {
+          globalYtStudioUploadGate.setMaxConcurrent(Number(body.ytUploadConcurrency))
+        }
+        await saveStudioUserConfig(username, {
+          ...(body.ytVisibility === 'unlisted' || body.ytVisibility === 'private'
+            ? { ytVisibility: body.ytVisibility }
+            : {}),
+          ...(body.ytAutoDeleteAtEnd !== undefined
+            ? { ytAutoDeleteAtEnd: Boolean(body.ytAutoDeleteAtEnd) }
+            : {}),
+          ...(body.ytUploadConcurrency !== undefined
+            ? { ytUploadConcurrency: Math.max(1, Math.min(5, Math.floor(Number(body.ytUploadConcurrency) || 3))) }
+            : {}),
+        })
+        return NextResponse.json({
+          ok: true,
+          studio: await getPublicStudioSettings(username),
+        })
+      }
+      case 'yt_cleanup_now': {
+        const res = await globalYtStudioController.deleteAllChannelVideos(username)
+        return NextResponse.json({
+          ok: true,
+          ...res,
+          ytSnapshot: await globalYtStudioController.getSnapshot(true),
+        })
+      }
+      case 'yt_upload_test': {
+        const targetScanId = (body.scanId || '').trim() || 'test'
+        let testClipPath = (body.clipPath || '').trim()
+        if (!testClipPath && targetScanId !== 'test') {
+          const clipsDir = path.join(MEDIA_DIR, targetScanId, 'clips')
+          if (fs.existsSync(clipsDir)) {
+            const mp4s = fs.readdirSync(clipsDir).filter((f) => f.endsWith('.mp4'))
+            if (mp4s.length > 0) {
+              testClipPath = path.join(clipsDir, mp4s[0])
+            }
+          }
+        }
+        if (!testClipPath || !fs.existsSync(testClipPath)) {
+          const fallbackTestShort = path.join(process.cwd(), 'test-data', 'TEST_short.mp4')
+          if (fs.existsSync(fallbackTestShort)) {
+            testClipPath = fallbackTestShort
+          } else {
+            return NextResponse.json(
+              { ok: false, error: 'No window clip or test-data/TEST_short.mp4 found for test upload.' },
+              { status: 400 },
+            )
+          }
+        }
+        const cfg = await loadStudioUserConfig(username)
+        const upRes = await globalYtStudioController.uploadWindowClip({
+          clipPath: testClipPath,
+          scanId: targetScanId,
+          windowNumber: body.windowNumber || 1,
+          visibility: cfg.ytVisibility || 'unlisted',
+          username,
+        })
+        return NextResponse.json({
+          ok: true,
+          ...upRes,
+          ytSnapshot: await globalYtStudioController.getSnapshot(true),
         })
       }
       default:

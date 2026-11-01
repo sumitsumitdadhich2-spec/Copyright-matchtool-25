@@ -57,6 +57,15 @@ export interface StudioUserConfig {
   studioDisableDevShmUsage?: boolean
   /** Attach movie_360p from Google Drive Picker instead of uploading 378 MB locally in browser (default false / OFF) */
   studioAttachMovieFromDrive?: boolean
+  /** Encrypted YouTube Studio cookies JSON — NEVER sent to client */
+  encryptedYtCookies?: string
+  ytChannelId?: string | null
+  ytChannelHandle?: string | null
+  ytLastLoginStatus?: 'logged_in' | 'logged_out' | 'untested'
+  ytLastLoginTestedAt?: number | null
+  ytVisibility?: 'unlisted' | 'public'
+  ytAutoDeleteAtEnd?: boolean
+  ytUploadConcurrency?: number
   updatedAt: number
 }
 
@@ -87,6 +96,15 @@ export interface PublicStudioSettings {
   lastLoginEmail: string | null
   lastLoginStatus: 'logged_in' | 'logged_out' | 'untested'
   lastLoginTestedAt: number | null
+  hasYtCookies: boolean
+  ytCookieCount: number
+  ytChannelId: string | null
+  ytChannelHandle: string | null
+  ytLastLoginStatus: 'logged_in' | 'logged_out' | 'untested'
+  ytLastLoginTestedAt: number | null
+  ytVisibility: 'unlisted' | 'public'
+  ytAutoDeleteAtEnd: boolean
+  ytUploadConcurrency: number
   driveConnected: boolean
   driveConnectedEmail: string | null
   driveConnectedAt: number | null
@@ -134,8 +152,9 @@ export function computeEffectiveMaxInputTokens(
   return STUDIO_CONTEXT_WINDOW_TOKENS - out - STUDIO_SAFETY_MARGIN_TOKENS
 }
 
-export const DEFAULT_STUDIO_CONCURRENCY = 3
+export const DEFAULT_STUDIO_CONCURRENCY = 10
 export const DEFAULT_STUDIO_UPLOAD_GATE = 2
+export const DEFAULT_YT_UPLOAD_CONCURRENCY = 3
 export const DEFAULT_STUDIO_RUN_STAGGER_SEC = 20
 export const DEFAULT_STUDIO_MINUTE_INPUT =
   '7,8,9,10,14,15,16,17,19,20,21,25-41,48-54,56,57,58,63-67,71-100'
@@ -160,6 +179,10 @@ export const DEFAULT_STUDIO_CONFIG: StudioUserConfig = {
   studioDisableDevShmUsage: true,
   studioAttachMovieFromDrive: false,
   lastLoginStatus: 'untested',
+  ytLastLoginStatus: 'untested',
+  ytVisibility: 'unlisted',
+  ytAutoDeleteAtEnd: true,
+  ytUploadConcurrency: DEFAULT_YT_UPLOAD_CONCURRENCY,
   updatedAt: 0,
 }
 
@@ -237,7 +260,7 @@ export async function loadStudioUserConfig(username: string): Promise<StudioUser
         : 'auto',
     studioConcurrency: Math.max(
       1,
-      Math.min(20, Math.round(Number(raw?.studioConcurrency) || DEFAULT_STUDIO_CONCURRENCY)),
+      Math.min(10, Math.round(Number(raw?.studioConcurrency) || DEFAULT_STUDIO_CONCURRENCY)),
     ),
     studioUploadGateConcurrency: Math.max(
       1,
@@ -262,6 +285,19 @@ export async function loadStudioUserConfig(username: string): Promise<StudioUser
     studioDisableDevShmUsage:
       raw?.studioDisableDevShmUsage !== undefined ? Boolean(raw.studioDisableDevShmUsage) : true,
     studioAttachMovieFromDrive: Boolean(raw?.studioAttachMovieFromDrive ?? false),
+    ytVisibility: raw?.ytVisibility === 'public' ? 'public' : 'unlisted',
+    ytAutoDeleteAtEnd: raw?.ytAutoDeleteAtEnd !== undefined ? Boolean(raw.ytAutoDeleteAtEnd) : true,
+    ytUploadConcurrency: Math.max(
+      1,
+      Math.min(10, Math.round(Number(raw?.ytUploadConcurrency) || DEFAULT_YT_UPLOAD_CONCURRENCY)),
+    ),
+    ytLastLoginStatus:
+      raw?.ytLastLoginStatus === 'logged_in' || raw?.ytLastLoginStatus === 'logged_out'
+        ? raw.ytLastLoginStatus
+        : 'untested',
+    ytChannelId: raw?.ytChannelId || null,
+    ytChannelHandle: raw?.ytChannelHandle || null,
+    ytLastLoginTestedAt: raw?.ytLastLoginTestedAt ?? null,
   }
 }
 
@@ -279,11 +315,18 @@ export async function saveStudioUserConfig(
       ? patch.studioMaxOutputTokens
       : current.studioMaxOutputTokens,
   )
+  const nextConcurrency =
+    patch.studioConcurrency !== undefined
+      ? Number.isFinite(Number(patch.studioConcurrency))
+        ? Math.max(1, Math.min(10, Math.round(Number(patch.studioConcurrency))))
+        : DEFAULT_STUDIO_CONCURRENCY
+      : current.studioConcurrency
   const next: StudioUserConfig = {
     ...current,
     ...patch,
     studioModelName: nextModelName,
     studioMaxOutputTokens: nextMaxOut,
+    studioConcurrency: nextConcurrency,
     chunkScanEngine: 'studio',
     updatedAt: Date.now(),
   }
@@ -383,6 +426,41 @@ export async function loadDecryptedPlaywrightCookies(username: string): Promise<
   return []
 }
 
+export async function saveUserYtCookies(username: string, rawCookieJson: string): Promise<{ count: number }> {
+  const cookies = parseCookieInputToPlaywright(rawCookieJson)
+  const encryptedYtCookies = encryptSecret(JSON.stringify(cookies))
+  await saveStudioUserConfig(username, {
+    encryptedYtCookies,
+    ytLastLoginStatus: 'untested',
+    ytLastLoginTestedAt: null,
+  })
+  return { count: cookies.length }
+}
+
+export async function loadDecryptedPlaywrightYtCookies(username: string): Promise<PlaywrightCookie[]> {
+  const cfg = await loadStudioUserConfig(username)
+  if (cfg.encryptedYtCookies) {
+    try {
+      const plain = decryptSecret(cfg.encryptedYtCookies)
+      const parsed = parseCookieInputToPlaywright(plain)
+      if (parsed.length > 0) return parsed
+    } catch {
+      return []
+    }
+  }
+  return []
+}
+
+export async function clearUserYtCookies(username: string): Promise<void> {
+  await saveStudioUserConfig(username, {
+    encryptedYtCookies: undefined,
+    ytChannelId: null,
+    ytChannelHandle: null,
+    ytLastLoginStatus: 'untested',
+    ytLastLoginTestedAt: null,
+  })
+}
+
 export async function getSettingsCookieFingerprint(username: string): Promise<string> {
   const cookies = await loadDecryptedPlaywrightCookies(username)
   if (cookies.length === 0) return 'NONE'
@@ -423,6 +501,15 @@ export async function getPublicStudioSettings(username: string): Promise<PublicS
       if (Array.isArray(cookies)) cookieCount = cookies.length
     } catch {
       cookieCount = 0
+    }
+  }
+  let ytCookieCount = 0
+  if (cfg.encryptedYtCookies) {
+    try {
+      const ytCookies = JSON.parse(decryptSecret(cfg.encryptedYtCookies))
+      if (Array.isArray(ytCookies)) ytCookieCount = ytCookies.length
+    } catch {
+      ytCookieCount = 0
     }
   }
   let driveConnected = false
@@ -470,6 +557,15 @@ export async function getPublicStudioSettings(username: string): Promise<PublicS
     lastLoginEmail: cfg.lastLoginEmail ?? null,
     lastLoginStatus: cfg.lastLoginStatus ?? 'untested',
     lastLoginTestedAt: cfg.lastLoginTestedAt ?? null,
+    hasYtCookies: ytCookieCount > 0,
+    ytCookieCount,
+    ytChannelId: cfg.ytChannelId ?? null,
+    ytChannelHandle: cfg.ytChannelHandle ?? null,
+    ytLastLoginStatus: cfg.ytLastLoginStatus ?? 'untested',
+    ytLastLoginTestedAt: cfg.ytLastLoginTestedAt ?? null,
+    ytVisibility: cfg.ytVisibility ?? 'unlisted',
+    ytAutoDeleteAtEnd: cfg.ytAutoDeleteAtEnd !== undefined ? Boolean(cfg.ytAutoDeleteAtEnd) : true,
+    ytUploadConcurrency: cfg.ytUploadConcurrency ?? DEFAULT_YT_UPLOAD_CONCURRENCY,
     driveConnected,
     driveConnectedEmail: cfg.driveConnectedEmail ?? null,
     driveConnectedAt: cfg.driveConnectedAt ?? null,

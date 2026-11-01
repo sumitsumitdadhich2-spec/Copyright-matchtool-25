@@ -47,7 +47,9 @@ import { GapBackupPanel } from './gap-backup-panel'
 import { LiveActivityBar } from './live-activity-bar'
 import { TopMilestoneBanner } from './top-milestone-banner'
 import { StudioLivePanel } from './studio-live-panel'
+import { YtStudioPanel } from './yt-studio-panel'
 import { ErrorBoundary } from './error-boundary'
+import type { PublicStudioSettings } from '@/lib/studio-settings'
 
 interface ScanResponse {
   scan: Scan
@@ -80,6 +82,7 @@ export function Dashboard() {
     minuteFinder?: MinuteFinderMode
     autoMode?: boolean
     verifierEnabled?: boolean
+    studio?: PublicStudioSettings
   }>('/api/settings', fetcher)
   const minuteFinderMode: MinuteFinderMode = settings?.minuteFinder ?? 'gemini'
 
@@ -600,6 +603,11 @@ export function Dashboard() {
             <ScanTimeline scan={scan || emptyScan()} />
             <VerifierTimeline scan={scan || emptyScan()} />
             <StudioLivePanel scan={scan} />
+            <YtStudioPanel
+              studio={settings?.studio}
+              scanId={scan?.id || scanId}
+              onRefresh={() => void mutateSettings()}
+            />
             <ModelBoard scan={scan} usage={data?.usage || null} />
             {scan && <CandidatesPanel scan={scan} />}
             {scan && scan.report && <ReportPanel scan={scan} />}

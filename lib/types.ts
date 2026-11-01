@@ -959,6 +959,10 @@ export interface Scan {
   shortSegments?: ShortSegmentState[]
   /** index of the short segment currently being scanned/verified */
   currentShortSegment?: number
+  /** Optional YouTube link for the short video (used in AI Studio attach step) */
+  shortYoutubeUrl?: string | null
+  /** Optional YouTube link for the movie video (used in AI Studio attach step) */
+  movieYoutubeUrl?: string | null
   /** background cutting of the short into 1-minute segment files (0-100) */
   shortSegmentingProgress?: number
   /** render/export job state (present after a render is started) */

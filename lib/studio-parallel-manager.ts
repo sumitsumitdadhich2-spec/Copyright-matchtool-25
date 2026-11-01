@@ -24,8 +24,14 @@ import { CancelToken, FfmpegCancelled } from './ffmpeg-pool'
 import {
   cleanStaleWindowClipPartials,
   ensureWindowClip,
+  markClipYtDeleted,
+  readClipYtSidecar,
   type WindowClipResult,
 } from './studio-window-clips'
+import {
+  globalYtStudioController,
+  globalYtStudioUploadGate,
+} from './yt-studio-automation'
 import {
   buildParallelWindowsFromMinuteInput,
   clipMatchToShortSegment,
@@ -1881,6 +1887,14 @@ export class StudioParallelManager {
         throw new Error('Pehle window scan poora chalao (Minutes found khali hai)')
       }
 
+      if (!cfg.encryptedYtCookies || cfg.ytLastLoginStatus === 'logged_out') {
+        throw new Error(
+          'YT Studio login required: Please save YT Studio cookies and pass Test Login before starting scan.',
+        )
+      }
+
+      globalYtStudioUploadGate.setMaxConcurrent(cfg.ytUploadConcurrency || 3)
+
       const globalMaxSlots = Math.max(
         1,
         Math.min(
@@ -2101,6 +2115,70 @@ export class StudioParallelManager {
                 : `Window #${w.windowNumber} (${winRange}): Clip ready (extracted, ${sizeMb} MB, ${extractSec} s, frames ${clipRes.clipStartFrame}-${endFrame}) -> ${path.basename(clipRes.clipPath)}`,
             })
             this.persistStateToDisk()
+
+            // Trigger background upload to YouTube Studio via globalYtStudioUploadGate
+            void (async () => {
+              if (this.stoppingAll || this.stoppedWindowIds.has(w.id)) return
+              const existingYt = readClipYtSidecar(clipRes.clipPath)
+              if (existingYt?.ytUrl && !existingYt.ytDeleted) {
+                if (w.status === 'QUEUED') {
+                  w.stage = 'link ready'
+                  w.summaryText = `YT link ready (${existingYt.ytUrl})`
+                  this.persistStateToDisk()
+                }
+                return
+              }
+              const releaseYt = await globalYtStudioUploadGate.acquire()
+              try {
+                if (this.stoppingAll || this.stoppedWindowIds.has(w.id)) return
+                if (w.status === 'QUEUED') {
+                  w.stage = 'uploading to YT'
+                  w.summaryText = 'Uploading window clip to YouTube Studio...'
+                  this.persistStateToDisk()
+                }
+                const ytRes = await globalYtStudioController.uploadWindowClip({
+                  clipPath: clipRes.clipPath,
+                  scanId: this.scanId,
+                  windowNumber: w.windowNumber,
+                  visibility: cfg.ytVisibility || 'unlisted',
+                  username: this.username || 'admin',
+                  onProgress: (stg) => {
+                    if (w.status === 'QUEUED') {
+                      w.stage = stg
+                      this.persistStateToDisk()
+                    }
+                  },
+                })
+                if (w.status === 'QUEUED') {
+                  w.stage = 'link ready'
+                  w.summaryText = `YT link ready (${ytRes.ytUrl})`
+                }
+                this.appendCombinedLog({
+                  workerId: 'SYS',
+                  windowId: w.id,
+                  windowNumber: w.windowNumber,
+                  windowRange: winRange,
+                  level: 'INFO',
+                  step: ytRes.reused ? 'YT link reused' : 'YT link ready',
+                  message: `Window #${w.windowNumber} (${winRange}) YouTube link ready: ${ytRes.ytUrl}`,
+                })
+                this.persistStateToDisk()
+              } catch (ytErr: unknown) {
+                const ytMsg = ytErr instanceof Error ? ytErr.message : String(ytErr)
+                this.appendCombinedLog({
+                  workerId: 'SYS',
+                  windowId: w.id,
+                  windowNumber: w.windowNumber,
+                  windowRange: winRange,
+                  level: 'RETRY',
+                  step: 'YT pre-upload warning',
+                  message: `Window #${w.windowNumber} (${winRange}) background YT upload deferred to worker: ${ytMsg}`,
+                })
+              } finally {
+                releaseYt()
+              }
+            })()
+
             return clipRes
           } finally {
             this.releaseClipExtractSlot()
@@ -2771,6 +2849,43 @@ export class StudioParallelManager {
       // Finalize scan record (status='done', report built, verifier OFF, key pair released)
       this.finalizeScanRecordOnCompletion()
 
+      // End-of-scan YouTube Studio auto-delete cleanup (if enabled and no other parallel scan is active)
+      try {
+        const cleanupCfg = await loadStudioUserConfig(this.username || 'admin')
+        if (
+          cleanupCfg.encryptedYtCookies &&
+          (cleanupCfg.ytAutoDeleteAtEnd ?? true) &&
+          !isAnyOtherParallelScanActive(this.scanId)
+        ) {
+          this.appendCombinedLog({
+            workerId: 'SYS',
+            level: 'INFO',
+            step: 'YT cleanup start',
+            message: 'Running end-of-scan YouTube Studio channel cleanup (Delete all videos)...',
+          })
+          const delRes = await globalYtStudioController.deleteAllChannelVideos(
+            this.username || 'admin',
+          )
+          for (const w of this.windows) {
+            markClipYtDeleted(this.scanId, w.windowNumber)
+          }
+          this.appendCombinedLog({
+            workerId: 'SYS',
+            level: 'SUCCESS',
+            step: 'YT cleanup done',
+            message: delRes.message,
+          })
+        }
+      } catch (cleanupErr: unknown) {
+        const cMsg = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)
+        this.appendCombinedLog({
+          workerId: 'SYS',
+          level: 'ERROR',
+          step: 'YT cleanup failed',
+          message: `YouTube Studio end-of-scan cleanup failed: ${cMsg}`,
+        })
+      }
+
       // Immediately release chunk scan lock so the next ticket in queue starts with zero delay!
       if (releaseChunkLock) {
         try {
@@ -2847,34 +2962,11 @@ export class StudioParallelManager {
         })
       }
 
-      // 4b. Only start a new worker/Chrome when RAM < 70% (was 85%)
-      let ramPct = readSystemRamUsedPercent()
-      let loggedWaitingForRam = false
-      while (ramPct >= 70 && !this.stoppingAll && !this.paused) {
-        const totalInUseAcrossScans = globalProfileSlotPool.getSummary(this.maxTotalPoolSlots).inUseSlots
-        // If 0 workers are running anywhere and baseline OS RAM is between 70-88%, allow 1 worker so scan doesn't deadlock
-        if (totalInUseAcrossScans === 0 && ramPct < 88) {
-          break
-        }
-        claimedWin.status = 'WAITING_FOR_RAM'
-        claimedWin.stage = `WAITING FOR RAM (${ramPct}% >= 70%)`
-        claimedWin.summaryText = `WAITING FOR RAM (${ramPct}%)`
-        this.resourceWarning = `WAITING FOR RAM: ${ramPct}% used (threshold 70% for new worker launch)`
+      // 4b. Check RAM and record non-blocking UI warning if high (do not block worker launch)
+      const ramPct = readSystemRamUsedPercent()
+      if (ramPct >= 75) {
+        this.resourceWarning = `WARN: High RAM usage (${ramPct}% used) — running ${this.concurrency} parallel workers`
         this.recordResourceSnapshotIfNeeded(false, this.resourceWarning)
-        if (!loggedWaitingForRam) {
-          loggedWaitingForRam = true
-          this.appendCombinedLog({
-            workerId: 'SYS',
-            windowId: claimedWin.id,
-            windowNumber: claimedWin.windowNumber,
-            windowRange: `${claimedWin.startFormatted}–${claimedWin.endFormatted}`,
-            level: 'INFO',
-            step: 'WAITING FOR RAM',
-            message: `RAM is ${ramPct}% (>= 70%) — waiting before starting worker for Window #${claimedWin.windowNumber}`,
-          })
-        }
-        await new Promise((r) => setTimeout(r, 2500))
-        ramPct = readSystemRamUsedPercent()
       }
 
       if (this.stoppingAll || this.stoppedWindowIds.has(claimedWin.id)) {
@@ -3172,6 +3264,48 @@ export class StudioParallelManager {
         DEFAULT_STUDIO_MODEL_NAME
       win.modelName = effectiveWinModel
 
+      // Resolve Short YouTube URL (if saved on scan) and Movie Window YouTube URL (via YT Studio upload or sidecar)
+      const latestScanRecord = getScan(this.scanId)
+      const shortYoutubeUrl = latestScanRecord?.shortYoutubeUrl || null
+      let movieYoutubeUrl: string | null = latestScanRecord?.movieYoutubeUrl || null
+
+      if (windowClip && cfg.encryptedYtCookies) {
+        const cachedSidecar = readClipYtSidecar(windowClip.clipPath)
+        if (cachedSidecar?.ytUrl && !cachedSidecar.ytDeleted) {
+          movieYoutubeUrl = cachedSidecar.ytUrl
+          win.stage = 'link ready'
+          win.summaryText = `YT link ready (${movieYoutubeUrl})`
+          this.persistStateToDisk()
+        } else {
+          win.stage = 'uploading to YT'
+          win.summaryText = `Uploading clip to YouTube Studio on ${workerId}...`
+          this.persistStateToDisk()
+          const releaseYt = await globalYtStudioUploadGate.acquire()
+          try {
+            const upRes = await globalYtStudioController.uploadWindowClip({
+              clipPath: windowClip.clipPath,
+              scanId: this.scanId,
+              windowNumber: win.windowNumber,
+              visibility: cfg.ytVisibility || 'unlisted',
+              username: this.username || 'admin',
+              onProgress: (stg) => {
+                win.stage = stg
+                this.persistStateToDisk()
+              },
+            })
+            movieYoutubeUrl = upRes.ytUrl
+            win.stage = 'link ready'
+            win.summaryText = `YT link ready (${movieYoutubeUrl})`
+            this.persistStateToDisk()
+          } finally {
+            releaseYt()
+          }
+        }
+      }
+
+      win.stage = 'attaching'
+      this.persistStateToDisk()
+
       const result = await ctrl.runWindowJob({
         username: this.username || 'admin',
         scanId: jobScanScope,
@@ -3184,10 +3318,12 @@ export class StudioParallelManager {
         ),
         maxInputTokens: cfg.studioMaxInputTokens,
         pageRecycleInterval: cfg.studioPageRecycleInterval || 5,
+        shortYoutubeUrl,
         shortDriveFileName: null,
         shortLocalPath: this.shortLocalPath,
         shortStartSec: 0,
         shortEndSec: this.shortDurationSec,
+        movieYoutubeUrl,
         movieDriveFileName: effectiveMovieDriveFileName,
         movieLocalPath: windowClip ? windowClip.clipPath : this.movieLocalPath,
         movieStartSec: win.startSec,
@@ -4211,6 +4347,15 @@ export function getStudioParallelManager(scanId?: string | null): StudioParallel
     Object.setPrototypeOf(mgr, StudioParallelManager.prototype)
   }
   return mgr
+}
+
+export function isAnyOtherParallelScanActive(excludeScanId?: string | null): boolean {
+  const map = getManagersMap()
+  for (const [id, mgr] of map.entries()) {
+    if (excludeScanId && id === excludeScanId) continue
+    if (mgr.isRunning()) return true
+  }
+  return false
 }
 
 export function stopAndDeleteStudioParallelManager(scanId: string): void {

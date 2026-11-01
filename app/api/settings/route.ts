@@ -183,6 +183,13 @@ export async function PUT(req: Request) {
       ...(st.studioRunStaggerSec !== undefined
         ? { studioRunStaggerSec: Math.max(0, Math.min(300, Math.floor(Number(st.studioRunStaggerSec) || 0))) }
         : {}),
+      ...(st.ytVisibility === 'unlisted' || st.ytVisibility === 'private'
+        ? { ytVisibility: st.ytVisibility }
+        : {}),
+      ...(st.ytAutoDeleteAtEnd !== undefined ? { ytAutoDeleteAtEnd: Boolean(st.ytAutoDeleteAtEnd) } : {}),
+      ...(st.ytUploadConcurrency !== undefined
+        ? { ytUploadConcurrency: Math.max(1, Math.min(5, Math.floor(Number(st.ytUploadConcurrency) || 3))) }
+        : {}),
     })
     return NextResponse.json({ ok: true, studio: await getPublicStudioSettings(session.username) })
   }
