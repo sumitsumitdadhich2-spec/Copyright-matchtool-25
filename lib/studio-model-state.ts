@@ -68,6 +68,27 @@ export function buildStudioModelChain(chosenModel?: string | null): string[] {
   return [canonical, ...STUDIO_MODEL_OPTIONS]
 }
 
+/**
+ * Build a complete fallback list starting with `buildStudioModelChain(chosenModel)`
+ * and appending any remaining Flash models in `STUDIO_MODEL_OPTIONS` not yet in the chain,
+ * so if the user chose "Gemini 3.6 Flash" or "Gemini 3.7 Flash" and it hits a daily limit
+ * or is unavailable, the worker can still fall back to another non-exhausted Flash model.
+ */
+export function buildStudioFallbackCycle(chosenModel?: string | null): string[] {
+  const primary = buildStudioModelChain(chosenModel)
+  const seen = new Set(primary.map((m) => canonicalizeStudioModelName(m).toLowerCase()))
+  const full = [...primary]
+  for (const opt of STUDIO_MODEL_OPTIONS) {
+    if (opt === 'Argon') continue
+    const key = opt.toLowerCase()
+    if (!seen.has(key)) {
+      seen.add(key)
+      full.push(opt)
+    }
+  }
+  return full
+}
+
 function getTzWallParts(
   utcMs: number,
   timeZone: string,

@@ -541,9 +541,14 @@ export async function findFirstVisibleLocator(
   while (Date.now() < deadline) {
     for (const sel of selectors) {
       try {
-        const loc = root.locator(sel).first()
-        if ((await loc.count()) > 0 && (await loc.isVisible())) {
-          return loc
+        const list = root.locator(sel)
+        const count = await list.count()
+        const checkCount = Math.min(count, 12)
+        for (let i = 0; i < checkCount; i++) {
+          const item = list.nth(i)
+          if (await item.isVisible()) {
+            return item
+          }
         }
       } catch {
         /* try next selector */

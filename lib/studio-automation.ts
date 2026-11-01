@@ -20,6 +20,7 @@ import {
 } from './studio-settings'
 import {
   DEFAULT_STUDIO_MODEL_NAME,
+  buildStudioFallbackCycle,
   buildStudioModelChain,
   canonicalizeStudioModelName,
   getEffectiveModel,
@@ -2169,7 +2170,8 @@ export class StudioBrowserController {
 
   /**
    * Read the currently visible model card text at the top of the Run Settings panel.
-   * Excludes the center-page welcome heading ("Start building with Gemini 3.8 Flash").
+   * Excludes the center-page welcome heading ("Start building with Gemini 3.8 Flash")
+   * and excludes cards inside an open "Model selection" drawer/dialog.
    */
   private async readVisibleModelCardText(page: Page): Promise<string> {
     try {
@@ -2181,12 +2183,20 @@ export class StudioBrowserController {
           return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
         }
 
+        const isInsideModelSelectionDrawer = (el: Element | null): boolean => {
+          if (!el) return false
+          const drawer = el.closest(
+            '.ms-sliding-right-panel-dialog, [class*="ms-sliding-right-panel-dialog" i], ms-model-picker, ms-model-selection, .model-selection-panel, [class*="model-picker" i], [class*="model-selection" i], mat-dialog-container, [role="dialog"], [role="listbox"]',
+          )
+          return Boolean(drawer)
+        }
+
         const isWelcomeHeading = (txt: string) => /^start\s+building\s+with\b/i.test(txt)
 
         for (const sel of triggerSels) {
           const nodes = Array.from(document.querySelectorAll(sel))
           for (const node of nodes) {
-            if (!isVisible(node)) continue
+            if (!isVisible(node) || isInsideModelSelectionDrawer(node)) continue
             const t = (node.innerText || node.textContent || '').trim().replace(/\s+/g, ' ')
             if (
               t &&
@@ -2204,8 +2214,12 @@ export class StudioBrowserController {
             document.querySelectorAll(
               'ms-run-settings, ms-runsettings, ms-run-settings-panel, ms-runsettings-panel, [class*="runsettings-panel" i], [class*="run-settings-panel" i], [class*="runsettings" i]:not(button):not([class*="toggle" i]), [class*="run-settings" i]:not(button):not([class*="toggle" i])',
             ),
-          ).find((el) => isVisible(el) && el.getBoundingClientRect().width >= 150) as HTMLElement | undefined) ||
-          null
+          ).find(
+            (el) =>
+              isVisible(el) &&
+              !isInsideModelSelectionDrawer(el) &&
+              el.getBoundingClientRect().width >= 150,
+          ) as HTMLElement | undefined) || null
 
         const searchRoot = panelRoot || document.body
         const all = Array.from(
@@ -2214,7 +2228,7 @@ export class StudioBrowserController {
           ),
         )
         for (const node of all) {
-          if (!isVisible(node)) continue
+          if (!isVisible(node) || isInsideModelSelectionDrawer(node)) continue
           const r = node.getBoundingClientRect()
           // If searching document.body, restrict to right-hand Run Settings area and exclude center welcome card
           if (!panelRoot && r.left < window.innerWidth * 0.45) continue
@@ -2241,19 +2255,376 @@ export class StudioBrowserController {
    * Select a specific model ("Argon", "Gemini 3.8 Flash", "Gemini 3.7 Flash", "Gemini 3.6 Flash")
    * in the Run Settings panel.
    * - Supports name-based matching for "Argon" (/argon/i) and version+flash matching for 3.8/3.7/3.6.
-   * - If a paid API key / billing popup appears when selecting "Argon", closes it ONLY via its X button,
-   *   reads back the active model, and if "Argon" is not selected, treats Argon as unavailable for this window
-   *   and falls back to the next model in the chain.
+   * - In AI Studio's "Model selection" drawer, clicks the "All" / "Gemini" category filter chip first
+   *   (because "Featured" is active by default and hides Gemini 3.7 Flash & Gemini 3.6 Flash).
+   * - Clicks the exact model card using both real Playwright mouse click and DOM click.
+   * - Strictly verifies read-back in Run Settings after closing the drawer.
    */
   private async selectModelInRunSettings(
     page: Page,
     targetModelName: string,
     fallbackChain?: string[],
   ): Promise<{ selectedModelName: string; visibleCardText: string }> {
-    const chain =
+    const baseChain =
       fallbackChain && fallbackChain.length > 0
         ? fallbackChain
-        : buildStudioModelChain(targetModelName || DEFAULT_STUDIO_MODEL_NAME)
+        : buildStudioFallbackCycle(targetModelName || DEFAULT_STUDIO_MODEL_NAME)
+
+    // Ensure full fallback cycle is available if primary chain models are unavailable/exhausted
+    const extraFlashModels = buildStudioFallbackCycle(targetModelName || DEFAULT_STUDIO_MODEL_NAME)
+    const chain: string[] = [...baseChain]
+    for (const extra of extraFlashModels) {
+      if (!chain.some((m) => canonicalizeStudioModelName(m).toLowerCase() === canonicalizeStudioModelName(extra).toLowerCase())) {
+        chain.push(extra)
+      }
+    }
+
+    const matchesModelText = (text: string, desiredRaw: string): boolean => {
+      if (!text) return false
+      const desired = (desiredRaw || DEFAULT_STUDIO_MODEL_NAME).trim()
+      const isArgon = /\bargon\b/i.test(desired)
+      const versionMatch = isArgon ? null : desired.match(/(\d+\.\d+)/)
+      const desiredVersion = versionMatch ? versionMatch[1] : ''
+      const isFlash = /flash/i.test(desired)
+
+      // Never match TTS, Lite, Image, Audio, Live, or Pro when selecting standard Argon / Flash
+      if (/\b(tts|lite|image|audio|live)\b/i.test(text)) return false
+      if (isFlash && /\bpro\b/i.test(text) && !/\bflash\b/i.test(text)) return false
+
+      if (isArgon) {
+        return /\bargon\b/i.test(text)
+      }
+      if (desiredVersion) {
+        const hasVer = text.includes(desiredVersion)
+        const hasVariant = !isFlash || /flash/i.test(text)
+        return hasVer && hasVariant
+      }
+      return text.toLowerCase().includes(desired.toLowerCase())
+    }
+
+    const openModelSelectionDrawer = async (): Promise<boolean> => {
+      const checkDrawerOpen = async (): Promise<boolean> => {
+        return await page
+          .evaluate(() => {
+            const isVis = (el: Element | null): boolean => {
+              if (!el) return false
+              const r = (el as HTMLElement).getBoundingClientRect()
+              return r.width > 0 && r.height > 0 && window.getComputedStyle(el as HTMLElement).visibility !== 'hidden'
+            }
+            const searchIn = document.querySelector(
+              'input[placeholder*="Search for a model" i], input[placeholder*="Search models" i], input[aria-label*="Search for a model" i]',
+            )
+            if (isVis(searchIn)) return true
+            const dialog = document.querySelector(
+              '.ms-sliding-right-panel-dialog, ms-model-picker, ms-model-selection, .model-selection-panel',
+            )
+            if (isVis(dialog)) return true
+            const titles = Array.from(document.querySelectorAll('h1, h2, h3, [class*="dialog-title" i], span, div'))
+            return titles.some(
+              (el) => isVis(el) && el.children.length === 0 && /^model\s+selection$/i.test((el.textContent || '').trim()),
+            )
+          })
+          .catch(() => false)
+      }
+
+      if (await checkDrawerOpen()) return true
+
+      const trigger = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSelectorTrigger, 2500)
+      if (trigger) {
+        await trigger.click({ timeout: 2000 }).catch(() => {})
+        await new Promise((r) => setTimeout(r, 450))
+      }
+
+      if (await checkDrawerOpen()) return true
+
+      // Fallback: click ms-model-selector or its inner button/card directly via DOM + Playwright
+      await page
+        .evaluate((sels) => {
+          for (const sel of sels) {
+            const nodes = Array.from(document.querySelectorAll(sel)) as HTMLElement[]
+            for (const n of nodes) {
+              const r = n.getBoundingClientRect()
+              if (r.width > 20 && r.height > 14) {
+                n.click()
+                return true
+              }
+            }
+          }
+          return false
+        }, [...STUDIO_SELECTORS.modelSelectorTrigger])
+        .catch(() => false)
+      await new Promise((r) => setTimeout(r, 500))
+      return await checkDrawerOpen()
+    }
+
+    const selectCategoryChipInDrawer = async (chipLabel: 'All' | 'Gemini'): Promise<void> => {
+      try {
+        const tagged = await page.evaluate((targetLabel) => {
+          document
+            .querySelectorAll('[data-cmt-model-filter-chip]')
+            .forEach((el) => el.removeAttribute('data-cmt-model-filter-chip'))
+
+          const isVis = (el: Element | null): el is HTMLElement => {
+            if (!el) return false
+            const h = el as HTMLElement
+            const r = h.getBoundingClientRect()
+            return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+          }
+
+          // Find drawer root
+          const searchInput = document.querySelector(
+            'input[placeholder*="Search for a model" i], input[placeholder*="Search models" i], input[aria-label*="Search for a model" i]',
+          )
+          let drawerRoot: HTMLElement | null =
+            (document.querySelector(
+              '.ms-sliding-right-panel-dialog, [class*="ms-sliding-right-panel-dialog" i], ms-model-picker, ms-model-selection, .model-selection-panel',
+            ) as HTMLElement | null) || null
+          if (!drawerRoot && searchInput) {
+            let curr: HTMLElement | null = searchInput as HTMLElement
+            for (let d = 0; d < 8 && curr && curr !== document.body; d++) {
+              const r = curr.getBoundingClientRect()
+              if (r.height >= 250 && r.width >= 240) {
+                drawerRoot = curr
+                break
+              }
+              curr = curr.parentElement
+            }
+          }
+
+          const root = drawerRoot || document.body
+          const buttons = Array.from(
+            root.querySelectorAll('button, mat-chip-option, mat-chip, [role="tab"], [role="button"], span'),
+          )
+          const re = new RegExp(`^${targetLabel}$`, 'i')
+          for (const b of buttons) {
+            if (!isVis(b)) continue
+            const r = b.getBoundingClientRect()
+            if (r.height > 55 || r.width > 140 || r.width < 24) continue
+            const txt = (b.innerText || b.textContent || '').trim()
+            if (re.test(txt)) {
+              const clickEl = (b.closest('button, mat-chip-option, mat-chip, [role="tab"], [role="button"]') as HTMLElement) || b
+              clickEl.setAttribute('data-cmt-model-filter-chip', 'true')
+              clickEl.click()
+              return true
+            }
+          }
+          return false
+        }, chipLabel)
+
+        if (tagged) {
+          const chipLoc = page.locator('[data-cmt-model-filter-chip="true"]').first()
+          if ((await chipLoc.count()) > 0 && (await chipLoc.isVisible().catch(() => false))) {
+            await chipLoc.click({ timeout: 1500 }).catch(() => {})
+          }
+          await new Promise((r) => setTimeout(r, 350))
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const tagAndClickModelInDrawer = async (params: {
+      ver: string
+      wantFlash: boolean
+      wantArgon: boolean
+      fullLabel: string
+    }): Promise<string | null> => {
+      const taggedText = await page
+        .evaluate(({ ver, wantFlash, wantArgon, fullLabel }) => {
+          document
+            .querySelectorAll('[data-cmt-pick-model-title], [data-cmt-pick-model-card]')
+            .forEach((el) => {
+              el.removeAttribute('data-cmt-pick-model-title')
+              el.removeAttribute('data-cmt-pick-model-card')
+            })
+
+          const isVis = (el: Element | null): el is HTMLElement => {
+            if (!el) return false
+            const h = el as HTMLElement
+            const r = h.getBoundingClientRect()
+            return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+          }
+
+          // Locate the open Model selection drawer container
+          const searchInput = document.querySelector(
+            'input[placeholder*="Search for a model" i], input[placeholder*="Search models" i], input[aria-label*="Search for a model" i]',
+          )
+          let drawerRoot: HTMLElement | null =
+            (document.querySelector(
+              '.ms-sliding-right-panel-dialog, [class*="ms-sliding-right-panel-dialog" i], ms-model-picker, ms-model-selection, .model-selection-panel, .cdk-overlay-pane mat-dialog-container, .cdk-overlay-pane [role="listbox"]',
+            ) as HTMLElement | null) || null
+
+          if (!drawerRoot && searchInput) {
+            let curr: HTMLElement | null = searchInput as HTMLElement
+            for (let d = 0; d < 9 && curr && curr !== document.body; d++) {
+              const r = curr.getBoundingClientRect()
+              if (r.height >= 260 && r.width >= 240) {
+                drawerRoot = curr
+                break
+              }
+              curr = curr.parentElement
+            }
+          }
+
+          const roots: HTMLElement[] = []
+          if (drawerRoot && isVis(drawerRoot)) roots.push(drawerRoot)
+          Array.from(
+            document.querySelectorAll(
+              '.ms-sliding-right-panel-dialog, .cdk-overlay-pane, mat-dialog-container, [role="dialog"], [role="listbox"], ms-model-picker, ms-model-selection, .model-selection-panel',
+            ),
+          ).forEach((el) => {
+            if (isVis(el) && !roots.includes(el as HTMLElement)) {
+              roots.push(el as HTMLElement)
+            }
+          })
+
+          const targetSlug = wantArgon
+            ? 'gemini-4-argon'
+            : ver && wantFlash
+              ? `gemini-${ver}-flash`
+              : ''
+
+          const isExcludedText = (txt: string): boolean => {
+            if (/\b(tts|lite|image|audio|live)\b/i.test(txt)) return true
+            if (wantFlash && /\bpro\b/i.test(txt) && !/\bflash\b/i.test(txt)) return true
+            return false
+          }
+
+          const matchesModel = (txt: string): boolean => {
+            if (!txt || isExcludedText(txt)) return false
+            if (wantArgon) {
+              return /\bargon\b/i.test(txt)
+            }
+            if (ver) {
+              return txt.includes(ver) && (!wantFlash || /flash/i.test(txt))
+            }
+            return txt.toLowerCase().includes(fullLabel.toLowerCase())
+          }
+
+          // Pass A: Look for exact slug or title leaf element inside the drawer
+          const allNodes: HTMLElement[] = []
+          for (const root of roots) {
+            root.querySelectorAll('*').forEach((n) => {
+              if (isVis(n)) allNodes.push(n as HTMLElement)
+            })
+          }
+
+          let matchedTitleEl: HTMLElement | null = null
+          let matchedCardEl: HTMLElement | null = null
+          let bestScore = -1
+
+          for (const el of allNodes) {
+            // Skip inputs, close buttons, filter chips, and icon-only buttons
+            const tag = el.tagName.toLowerCase()
+            if (tag === 'input' || tag === 'mat-icon') continue
+            const r = el.getBoundingClientRect()
+            if (r.height < 12 || r.height > 230 || r.width < 45) continue
+
+            const txt = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ')
+            if (!txt || txt.length > 360) continue
+            if (/^search\s+for\s+a\s+model/i.test(txt) || /^model\s+selection/i.test(txt)) continue
+            if (!matchesModel(txt)) continue
+
+            // Ensure this node does not wrap MULTIPLE different model cards
+            const slugMatches = txt.match(/\bgemini-[0-9a-z.-]+\b/gi) || []
+            const uniqueSlugs = new Set(slugMatches.map((s) => s.toLowerCase()))
+            if (uniqueSlugs.size > 1) continue
+
+            let score = 0
+            if (targetSlug && txt.toLowerCase() === targetSlug) score += 100
+            else if (targetSlug && uniqueSlugs.has(targetSlug)) score += 80
+            if (wantArgon && /^gemini\s*4\s*argon$/i.test(txt)) score += 95
+            if (ver && new RegExp(`^gemini\\s*${ver.replace('.', '\\.')}\\s*flash$`, 'i').test(txt)) {
+              score += 95
+            }
+            // Prefer compact leaf/title or single card over huge container
+            if (el.children.length <= 2 && r.height <= 45) score += 30
+            else if (r.height >= 45 && r.height <= 160 && r.width >= 200) score += 20
+
+            if (score > bestScore) {
+              bestScore = score
+              matchedTitleEl = el
+            }
+          }
+
+          if (!matchedTitleEl) return null
+
+          // Climb from matchedTitleEl to find the single model card/row container
+          let curr: HTMLElement | null = matchedTitleEl
+          for (let d = 0; d < 7 && curr && curr !== document.body; d++) {
+            const r = curr.getBoundingClientRect()
+            const txt = (curr.innerText || curr.textContent || '').trim().replace(/\s+/g, ' ')
+            const slugMatches = txt.match(/\bgemini-[0-9a-z.-]+\b/gi) || []
+            const uniqueSlugs = new Set(slugMatches.map((s) => s.toLowerCase()))
+            if (uniqueSlugs.size > 1 || r.height > 220) break
+            if (
+              !isExcludedText(txt) &&
+              r.height >= 42 &&
+              r.height <= 200 &&
+              r.width >= 180
+            ) {
+              matchedCardEl = curr
+            }
+            curr = curr.parentElement
+          }
+
+          matchedTitleEl.scrollIntoView({ block: 'center', inline: 'nearest' })
+          matchedTitleEl.setAttribute('data-cmt-pick-model-title', 'true')
+          if (matchedCardEl) {
+            matchedCardEl.setAttribute('data-cmt-pick-model-card', 'true')
+          }
+
+          const cardText = (
+            (matchedCardEl || matchedTitleEl).innerText ||
+            (matchedCardEl || matchedTitleEl).textContent ||
+            ''
+          )
+            .trim()
+            .replace(/\s+/g, ' ')
+          return cardText || fullLabel
+        }, params)
+        .catch(() => null)
+
+      if (!taggedText) return null
+
+      // Perform real Playwright mouse click on the title element and card container
+      const titleLoc = page.locator('[data-cmt-pick-model-title="true"]').first()
+      const cardLoc = page.locator('[data-cmt-pick-model-card="true"]').first()
+
+      if ((await titleLoc.count()) > 0 && (await titleLoc.isVisible().catch(() => false))) {
+        await titleLoc.click({ timeout: 2000 }).catch(() => {})
+      } else if ((await cardLoc.count()) > 0 && (await cardLoc.isVisible().catch(() => false))) {
+        await cardLoc.click({ timeout: 2000 }).catch(() => {})
+      }
+
+      await new Promise((r) => setTimeout(r, 250))
+
+      // If the Model selection drawer is still open, also click the card container directly
+      const stillOpenAfterTitleClick = await page
+        .evaluate(() => {
+          const inp = document.querySelector(
+            'input[placeholder*="Search for a model" i], input[placeholder*="Search models" i]',
+          ) as HTMLElement | null
+          return Boolean(inp && inp.getBoundingClientRect().height > 0)
+        })
+        .catch(() => false)
+
+      if (stillOpenAfterTitleClick) {
+        if ((await cardLoc.count()) > 0 && (await cardLoc.isVisible().catch(() => false))) {
+          await cardLoc.click({ position: { x: 40, y: 24 }, timeout: 2000 }).catch(() => {})
+        }
+        await page
+          .evaluate(() => {
+            const titleEl = document.querySelector('[data-cmt-pick-model-title="true"]') as HTMLElement | null
+            const cardEl = document.querySelector('[data-cmt-pick-model-card="true"]') as HTMLElement | null
+            if (titleEl) titleEl.click()
+            if (cardEl) cardEl.click()
+          })
+          .catch(() => {})
+      }
+
+      return taggedText
+    }
 
     const trySelectSingleModel = async (
       desiredRaw: string,
@@ -2264,21 +2635,8 @@ export class StudioBrowserController {
       const desiredVersion = versionMatch ? versionMatch[1] : ''
       const isFlash = /flash/i.test(desired)
 
-      const matchesDesired = (text: string): boolean => {
-        if (!text) return false
-        if (isArgon) {
-          return /\bargon\b/i.test(text)
-        }
-        if (desiredVersion) {
-          const hasVer = text.includes(desiredVersion)
-          const hasVariant = !isFlash || /flash/i.test(text)
-          return hasVer && hasVariant
-        }
-        return text.toLowerCase().includes(desired.toLowerCase())
-      }
-
       const currentCardText = await this.readVisibleModelCardText(page)
-      if (matchesDesired(currentCardText)) {
+      if (matchesModelText(currentCardText, desired)) {
         return { matched: true, cardText: currentCardText }
       }
 
@@ -2288,20 +2646,23 @@ export class StudioBrowserController {
         'info',
       )
 
-      const trigger = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSelectorTrigger, 2500)
-      if (!trigger) {
-        return { matched: matchesDesired(currentCardText), cardText: currentCardText || desired }
+      const opened = await openModelSelectionDrawer()
+      if (!opened) {
+        const recheck = await this.readVisibleModelCardText(page)
+        return { matched: matchesModelText(recheck, desired), cardText: recheck }
       }
 
-      await trigger.click().catch(() => {})
-      await new Promise((r) => setTimeout(r, 450))
+      // CRITICAL: Click "All" category filter chip inside the Model selection drawer first!
+      // By default, "Featured" is selected in AI Studio, which hides Gemini 3.7 Flash & Gemini 3.6 Flash.
+      await selectCategoryChipInDrawer('All')
 
-      // If search input exists in the opened model picker, type the query to filter the cards
+      // Pass 1: Filter via search input + click model card
       try {
-        const searchInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSearchInput, 800)
+        const searchInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSearchInput, 1000)
         if (searchInput) {
-          const searchQuery = isArgon ? 'Argon' : desiredVersion ? `${desiredVersion}` : desired
-          await searchInput.click().catch(() => {})
+          const searchQuery = isArgon ? 'argon' : desiredVersion ? `${desiredVersion}` : desired
+          await searchInput.click({ timeout: 1500 }).catch(() => {})
+          await searchInput.fill('').catch(() => {})
           await searchInput.fill(searchQuery).catch(() => {})
           await searchInput.dispatchEvent('input').catch(() => {})
           await searchInput.dispatchEvent('change').catch(() => {})
@@ -2311,56 +2672,34 @@ export class StudioBrowserController {
         /* ignore */
       }
 
-      const clickedModel = await page
-        .evaluate(
-          ({ ver, wantFlash, wantArgon, fullLabel }) => {
-            const isVisible = (el: Element | null): el is HTMLElement => {
-              if (!el) return false
-              const h = el as HTMLElement
-              const r = h.getBoundingClientRect()
-              return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
-            }
+      let clickedModel = await tagAndClickModelInDrawer({
+        ver: desiredVersion,
+        wantFlash: isFlash,
+        wantArgon: isArgon,
+        fullLabel: desired,
+      })
 
-            const roots = Array.from(
-              document.querySelectorAll(
-                '.cdk-overlay-pane, mat-dialog-container, [role="dialog"], [role="listbox"], [role="menu"], ms-model-carousel, ms-model-picker, ms-model-selection, .model-selection-panel, [class*="model-list" i], [class*="model-picker" i], [class*="model-selection" i], mat-drawer, mat-sidenav, aside',
-              ),
-            ).filter((el) => isVisible(el))
-
-            const candidates: HTMLElement[] = []
-            for (const root of roots) {
-              root
-                .querySelectorAll(
-                  'mat-card, ms-model-card, [class*="model-card" i], [class*="model-item" i], [class*="model-row" i], [class*="card" i], button, [role="button"], mat-option, [role="option"], [role="menuitem"], div[jslog]',
-                )
-                .forEach((n) => {
-                  if (isVisible(n)) candidates.push(n as HTMLElement)
-                })
-            }
-
-            for (const c of candidates) {
-              const txt = (c.innerText || c.textContent || '').trim().replace(/\s+/g, ' ')
-              if (!txt) continue
-              if (wantArgon) {
-                if (/\bargon\b/i.test(txt)) {
-                  c.click()
-                  return txt
-                }
-              } else if (ver) {
-                if (txt.includes(ver) && (!wantFlash || /flash/i.test(txt)) && !/lite/i.test(txt) && !/\btts\b/i.test(txt)) {
-                  c.click()
-                  return txt
-                }
-              } else if (txt.toLowerCase().includes(fullLabel.toLowerCase())) {
-                c.click()
-                return txt
-              }
-            }
-            return null
-          },
-          { ver: desiredVersion, wantFlash: isFlash, wantArgon: isArgon, fullLabel: desired },
-        )
-        .catch(() => null)
+      // Pass 2: If not found with search query (or if search filter hid results), clear search, click "Gemini" / "All", and scan drawer list
+      if (!clickedModel) {
+        try {
+          const searchInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSearchInput, 800)
+          if (searchInput) {
+            await searchInput.fill('').catch(() => {})
+            await searchInput.dispatchEvent('input').catch(() => {})
+            await searchInput.dispatchEvent('change').catch(() => {})
+            await new Promise((r) => setTimeout(r, 350))
+          }
+        } catch {
+          /* ignore */
+        }
+        await selectCategoryChipInDrawer('Gemini')
+        clickedModel = await tagAndClickModelInDrawer({
+          ver: desiredVersion,
+          wantFlash: isFlash,
+          wantArgon: isArgon,
+          fullLabel: desired,
+        })
+      }
 
       await new Promise((r) => setTimeout(r, 450))
 
@@ -2372,21 +2711,40 @@ export class StudioBrowserController {
       await this.dismissOpenOverlayIfAny(page)
 
       const updatedCardText = (await this.readVisibleModelCardText(page)) || ''
-      const verified = matchesDesired(updatedCardText) || (!isArgon && Boolean(clickedModel))
+      // STRICT verification: the Run Settings model card MUST actually match the desired model!
+      const verified = matchesModelText(updatedCardText, desired)
       return {
         matched: verified,
-        cardText: updatedCardText || (verified ? clickedModel || desired : ''),
+        cardText: updatedCardText,
       }
     }
 
+    const quotaStateNow = await loadStudioModelQuotaState()
     const startCanonical = canonicalizeStudioModelName(targetModelName)
     const startIdx = Math.max(
       0,
       chain.findIndex((m) => canonicalizeStudioModelName(m).toLowerCase() === startCanonical.toLowerCase()),
     )
 
+    // Order candidates starting from targetModelName, skipping models already marked quota-exhausted
+    const orderedCandidates: string[] = []
     for (let i = startIdx; i < chain.length; i++) {
-      const candidateModel = chain[i]
+      orderedCandidates.push(chain[i])
+    }
+    for (let i = 0; i < startIdx; i++) {
+      if (chain[i] !== 'Argon') orderedCandidates.push(chain[i])
+    }
+
+    const nonExhaustedCandidates = orderedCandidates.filter((m) => {
+      const canon = canonicalizeStudioModelName(m)
+      const untilTs = quotaStateNow.exhausted[canon]
+      return !untilTs || untilTs <= Date.now()
+    })
+    const candidatesToTry =
+      nonExhaustedCandidates.length > 0 ? nonExhaustedCandidates : orderedCandidates
+
+    for (let i = 0; i < candidatesToTry.length; i++) {
+      const candidateModel = candidatesToTry[i]
       const res = await trySelectSingleModel(candidateModel)
       if (res.matched) {
         this.logStep('model selected', `Active model in Run Settings: ${res.cardText || candidateModel}`, 'info')
@@ -2397,7 +2755,7 @@ export class StudioBrowserController {
         }
       }
 
-      const nextFallback = chain[i + 1]
+      const nextFallback = candidatesToTry[i + 1]
       if (nextFallback) {
         this.logStep(
           'model unavailable',
@@ -2408,10 +2766,13 @@ export class StudioBrowserController {
     }
 
     await this.closeModelSelectionPanelIfOpen(page)
-    const fallbackCard = (await this.readVisibleModelCardText(page)) || targetModelName
+    const fallbackCard = (await this.readVisibleModelCardText(page)) || ''
+    const actualSelectedCanonical = fallbackCard
+      ? canonicalizeStudioModelName(fallbackCard)
+      : canonicalizeStudioModelName(targetModelName)
     return {
-      selectedModelName: canonicalizeStudioModelName(targetModelName),
-      visibleCardText: fallbackCard,
+      selectedModelName: actualSelectedCanonical,
+      visibleCardText: fallbackCard || targetModelName,
     }
   }
 
@@ -2780,9 +3141,9 @@ export class StudioBrowserController {
    * Tags each detected chip with `data-cmt-fallback-chip="true"` (keeping ms-* CSS selectors as primary).
    * No filename or "N tokens" text dependency.
    */
-  private async syncFallbackMediaChips(page: Page, _uploadedBasename?: string): Promise<void> {
+  private async syncFallbackMediaChips(page: Page, _uploadedBasename?: string): Promise<number> {
     const primarySelector = STUDIO_SELECTORS.videoMediaChipsCss.join(', ')
-    await page
+    return await page
       .evaluate((primarySel) => {
         try {
           document
@@ -2887,9 +3248,12 @@ export class StudioBrowserController {
             chip.setAttribute('data-cmt-fallback-chip', 'true')
           }
         }
+
+        return Math.max(foundChips.length, primarySet.size)
       }, primarySelector)
       .catch((err: unknown) => {
         this.logStep('chip sync error', (err as Error)?.message || String(err), 'warn')
+        return 0
       })
   }
 
@@ -4037,6 +4401,78 @@ export class StudioBrowserController {
   }
 
   /**
+   * Detect whether an error banner, toast, turn text, or HTTP response body indicates
+   * a model quota / daily token limit / rate limit error (e.g. "You reached your daily limits",
+   * "quota exceeded: you have reached the daily limit of tokens for this model. Please select another model").
+   */
+  private isQuotaOrDailyLimitErrorText(text: string | null | undefined): boolean {
+    if (!text) return false
+    return /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|rateLimitExceeded|too\s+many\s+requests|you\s+have\s+exceeded\s+your\s+quota|exceeded\s+your\s+(?:current\s+)?quota|reached\s+(?:the|your)\s+daily\s+limits?|you(?:'ve|\s+have)?\s+reached\s+(?:the|your)\s+daily\s+limits?|daily\s+limits?\s+(?:of\s+tokens|reached|exceeded)|daily\s+quota|please\s+select\s+another\s+model)/i.test(
+      text,
+    )
+  }
+
+  /**
+   * Mark any currently visible error banners / snackbars / quota error turns as handled
+   * (`data-cmt-handled-error="true"`) and click any dismiss button on them so a stale error
+   * banner does not re-trigger on subsequent polls or continuation turns in the same chat.
+   */
+  private async markPageErrorBannersHandled(page: Page): Promise<void> {
+    try {
+      await page.evaluate(
+        ({ bannerSels, turnSels }) => {
+          for (const s of bannerSels) {
+            if (s.includes(':has-text(')) continue
+            try {
+              const nodes = Array.from(document.querySelectorAll(s))
+              for (const node of nodes) {
+                const el = node as HTMLElement
+                if (!el) continue
+                el.setAttribute('data-cmt-handled-error', 'true')
+                const dismissBtn = el.querySelector(
+                  'button[aria-label*="Close" i], button[aria-label*="Dismiss" i], button',
+                ) as HTMLElement | null
+                if (dismissBtn) {
+                  try {
+                    dismissBtn.click()
+                  } catch {
+                    /* ignore */
+                  }
+                }
+              }
+            } catch {
+              /* ignore */
+            }
+          }
+          const quotaRe =
+            /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|reached\s+(?:the|your)\s+daily\s+limits?|daily\s+limits?\s+(?:of\s+tokens|reached|exceeded)|please\s+select\s+another\s+model)/i
+          for (const ts of turnSels) {
+            if (ts.includes(':has-text(')) continue
+            try {
+              const turns = Array.from(document.querySelectorAll(ts))
+              const lastTurn = turns[turns.length - 1] as HTMLElement | undefined
+              if (lastTurn) {
+                const txt = (lastTurn.innerText || lastTurn.textContent || '').trim()
+                if (txt.length <= 500 && quotaRe.test(txt)) {
+                  lastTurn.setAttribute('data-cmt-handled-error', 'true')
+                }
+              }
+            } catch {
+              /* ignore */
+            }
+          }
+        },
+        {
+          bannerSels: [...STUDIO_SELECTORS.errorBanners],
+          turnSels: [...STUDIO_SELECTORS.modelTurnContainers],
+        },
+      )
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /**
    * FIX 3(c): Send a follow-up "Continue EXACTLY from where you stopped..." message in the same AI Studio chat,
    * wait for the new model turn to finish streaming, and fetch its text.
    */
@@ -4119,17 +4555,23 @@ export class StudioBrowserController {
           throw new Error('POLICY_BLOCKED: Gemini prohibited content')
         }
 
-        // Check if an internal error or quota error occurred during continuation turn
+        // Check if an internal error or quota/daily-limit error occurred during continuation turn
         const contErrDetected = await page
           .evaluate((sels) => {
             const re =
-              /(an\s+internal\s+error\s+has\s+occurred|internal\s+error\s+has\s+occurred|something\s+went\s+wrong|failed\s+to\s+generate|quota\s+exceeded|resource[_\s]+exhausted)/i
+              /(an\s+internal\s+error\s+has\s+occurred|internal\s+error\s+has\s+occurred|something\s+went\s+wrong|failed\s+to\s+generate|quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|reached\s+(?:the|your)\s+daily\s+limits?|daily\s+limits?\s+(?:of\s+tokens|reached|exceeded)|please\s+select\s+another\s+model)/i
             for (const s of sels) {
               if (s.includes(':has-text(')) continue
               try {
                 for (const node of Array.from(document.querySelectorAll(s))) {
                   const el = node as HTMLElement
                   if (!el || !el.innerText) continue
+                  if (
+                    el.getAttribute('data-cmt-handled-error') === 'true' ||
+                    el.closest('[data-cmt-handled-error="true"]')
+                  ) {
+                    continue
+                  }
                   if (el.offsetParent !== null || el.getClientRects().length > 0) {
                     const t = el.innerText.trim()
                     if (re.test(t)) return t
@@ -4144,6 +4586,10 @@ export class StudioBrowserController {
           .catch(() => null)
 
         if (contErrDetected) {
+          if (this.isQuotaOrDailyLimitErrorText(contErrDetected)) {
+            await this.markPageErrorBannersHandled(page)
+            throw new Error(`QUOTA_EXCEEDED_ERROR: ${contErrDetected.slice(0, 160)}`)
+          }
           throw new Error(`CONTINUE_TURN_ERROR: ${contErrDetected.slice(0, 160)}`)
         }
 
@@ -4163,6 +4609,10 @@ export class StudioBrowserController {
           .catch(() => prevTurnCount)
 
         const candidate = await this.extractFinalAnswerWithoutThoughts(page)
+        if (curTurnCount > prevTurnCount && this.isQuotaOrDailyLimitErrorText(candidate.trim())) {
+          await this.markPageErrorBannersHandled(page)
+          throw new Error(`QUOTA_EXCEEDED_ERROR: ${candidate.trim().slice(0, 160)}`)
+        }
         if (
           curTurnCount > prevTurnCount &&
           /^(?:an\s+internal\s+error\s+has\s+occurred|internal\s+error\s+has\s+occurred|something\s+went\s+wrong|failed\s+to\s+generate)\b/i.test(
@@ -4653,11 +5103,11 @@ export class StudioBrowserController {
     let invalidResultRetries = 0
 
     // Requirement 1 & 5: Build model fallback chain starting from user's chosen model:
-    // Argon -> Gemini 3.8 Flash -> Gemini 3.7 Flash -> Gemini 3.6 Flash
+    // Argon -> Gemini 3.8 Flash -> Gemini 3.7 Flash -> Gemini 3.6 Flash (with full Flash fallback cycle)
     const chosenModel = canonicalizeStudioModelName(
       modelName || userCfg.studioModelName || DEFAULT_STUDIO_MODEL_NAME,
     )
-    const MODEL_FALLBACK_CHAIN = buildStudioModelChain(chosenModel)
+    const MODEL_FALLBACK_CHAIN = buildStudioFallbackCycle(chosenModel)
     const formatQuotaResetTime = async (): Promise<string> => {
       const qState = await loadStudioModelQuotaState()
       const timestamps = Object.values(qState.exhausted).filter((t) => Number.isFinite(t) && t > 0)
@@ -5164,7 +5614,13 @@ export class StudioBrowserController {
               runOrRerunEnabled: false,
             }))
 
-          const effectiveChipCount = Math.max(syncedComposerChips.length, pageState.chipCount)
+          const syncedCount =
+            typeof syncedComposerChips === 'number'
+              ? syncedComposerChips
+              : Array.isArray(syncedComposerChips)
+                ? (syncedComposerChips as unknown[]).length
+                : 0
+          const effectiveChipCount = Math.max(syncedCount, pageState.chipCount)
           const tokensShowBothAttached =
             currentTokensAfterReload !== null &&
             currentTokensAfterReload >= minPlausible24FpsTokens
@@ -5537,6 +5993,7 @@ export class StudioBrowserController {
         let internalErrorDetected = false
         let internalErrorContinueTriedInChat = false
         let quotaContinuePartialText: string | null = null
+        let quotaSwitchRetryNewChat = false
         let transientBannerReason: string | null = null
 
         const cancelStuckStopButtonIfVisible = async () => {
@@ -5588,6 +6045,9 @@ export class StudioBrowserController {
         try {
           // Ensure Model selection panel is closed before clicking Run
           await this.closeModelSelectionPanelIfOpen(page)
+
+          // Clear/mark any stale error banners before pressing Run
+          await this.markPageErrorBannersHandled(page)
 
           // 20-second Run Stagger Gate across all windows:
           // If any window pressed Run (e.g. 3.8 Flash), wait at least 20s before another window presses Run
@@ -5728,50 +6188,95 @@ export class StudioBrowserController {
             const ss = String(elapsed % 60).padStart(2, '0')
             this.logStep(`running ${mm}:${ss}`, `${jobLabel} [${activeModelName}]`)
 
-            // Error/quota/alert banner detection + last model turn error detection
-            const errBannerText = await page.evaluate((sels) => {
-              const strictRegex =
-                /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|try\s+again\s+later|you\s+have\s+exceeded\s+your\s+quota|prohibited_content|blocked\s+due\s+to\s+safety|an\s+internal\s+error\s+has\s+occurred|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i
-              for (const s of sels) {
-                if (s.includes(':has-text(')) continue
-                try {
-                  const nodes = Array.from(document.querySelectorAll(s))
-                  for (const node of nodes) {
-                    const el = node as HTMLElement
-                    if (!el || !el.innerText) continue
-                    const visible = el.offsetParent !== null || el.getClientRects().length > 0
-                    if (!visible) continue
-                    const t = el.innerText.trim()
-                    if (strictRegex.test(t)) {
-                      return t
+            // Error/quota/daily-limit alert banner detection + last model turn error detection
+            const errBannerText = await page.evaluate(
+              ({ sels, turnSels }) => {
+                const strictRegex =
+                  /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|rateLimitExceeded|too\s+many\s+requests|try\s+again\s+later|you\s+have\s+exceeded\s+your\s+quota|exceeded\s+your\s+(?:current\s+)?quota|reached\s+(?:the|your)\s+daily\s+limits?|you(?:'ve|\s+have)?\s+reached\s+(?:the|your)\s+daily\s+limits?|daily\s+limits?\s+(?:of\s+tokens|reached|exceeded)|daily\s+quota|please\s+select\s+another\s+model|prohibited_content|blocked\s+due\s+to\s+safety|an\s+internal\s+error\s+has\s+occurred|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i
+                for (const s of sels) {
+                  if (s.includes(':has-text(')) continue
+                  try {
+                    const nodes = Array.from(document.querySelectorAll(s))
+                    for (const node of nodes) {
+                      const el = node as HTMLElement
+                      if (!el || !el.innerText) continue
+                      if (
+                        el.getAttribute('data-cmt-handled-error') === 'true' ||
+                        el.closest('[data-cmt-handled-error="true"]')
+                      ) {
+                        continue
+                      }
+                      const visible = el.offsetParent !== null || el.getClientRects().length > 0
+                      if (!visible) continue
+                      const t = el.innerText.trim()
+                      if (strictRegex.test(t)) {
+                        return t
+                      }
                     }
+                  } catch {
+                    // ignore invalid selector
                   }
-                } catch {
-                  // ignore invalid selector
                 }
-              }
-              return null
-            }, [...STUDIO_SELECTORS.errorBanners])
+                // Also check if the latest model turn itself contains a daily limit / quota error message
+                const quotaTurnRe =
+                  /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|reached\s+(?:the|your)\s+daily\s+limits?|you(?:'ve|\s+have)?\s+reached\s+(?:the|your)\s+daily\s+limits?|daily\s+limits?\s+(?:of\s+tokens|reached|exceeded)|please\s+select\s+another\s+model)/i
+                for (const ts of turnSels) {
+                  if (ts.includes(':has-text(')) continue
+                  try {
+                    const turns = Array.from(document.querySelectorAll(ts))
+                    const lastTurn = turns[turns.length - 1] as HTMLElement | undefined
+                    if (
+                      lastTurn &&
+                      lastTurn.getAttribute('data-cmt-handled-error') !== 'true' &&
+                      !lastTurn.closest('[data-cmt-handled-error="true"]')
+                    ) {
+                      const txt = (lastTurn.innerText || lastTurn.textContent || '').trim()
+                      if (txt.length <= 500 && quotaTurnRe.test(txt)) {
+                        return txt
+                      }
+                    }
+                  } catch {
+                    // ignore
+                  }
+                }
+                return null
+              },
+              {
+                sels: [...STUDIO_SELECTORS.errorBanners],
+                turnSels: [...STUDIO_SELECTORS.modelTurnContainers],
+              },
+            )
 
             const netQuotaExceeded =
               capturedRunError !== null &&
               (capturedRunError.status === 429 ||
-                /RESOURCE_EXHAUSTED|quota\s+exceeded|rateLimitExceeded/i.test(capturedRunError.body))
+                this.isQuotaOrDailyLimitErrorText(capturedRunError.body))
 
             const domQuotaExceeded =
-              errBannerText !== null &&
-              /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|you\s+have\s+exceeded\s+your\s+quota)/i.test(
-                errBannerText,
-              )
+              errBannerText !== null && this.isQuotaOrDailyLimitErrorText(errBannerText)
 
-            // Requirement 4 & 5: Quota Exceeded -> mark model exhausted, switch model in Run Settings, continue in SAME chat
+            // Requirement 4 & 5: Quota / Daily Limit Exceeded -> mark the ACTUAL running UI model exhausted, switch model in Run Settings, continue/rerun
             if (domQuotaExceeded || netQuotaExceeded) {
               const quotaDetail = errBannerText || capturedRunError?.body || 'HTTP 429 RESOURCE_EXHAUSTED'
               await cancelStuckStopButtonIfVisible()
-              const exhaustedModel = activeModelName
-              await markModelExhausted(exhaustedModel)
+              await this.markPageErrorBannersHandled(page)
 
-              const nextAvailableModel = await getEffectiveModel(chosenModel, MODEL_FALLBACK_CHAIN)
+              // Check what model was actually active in the Run Settings card so we mark the truly exhausted model
+              const currentUiCard = await this.readVisibleModelCardText(page)
+              const actualUiModel = currentUiCard
+                ? canonicalizeStudioModelName(currentUiCard)
+                : activeModelName
+              const exhaustedModel = actualUiModel || activeModelName
+              await markModelExhausted(exhaustedModel)
+              if (
+                activeModelName &&
+                activeModelName.toLowerCase() !== exhaustedModel.toLowerCase() &&
+                !currentUiCard
+              ) {
+                await markModelExhausted(activeModelName)
+              }
+
+              let nextAvailableModel = await getEffectiveModel(chosenModel, MODEL_FALLBACK_CHAIN)
               if (!nextAvailableModel) {
                 const resetTimeStr = await formatQuotaResetTime()
                 const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`
@@ -5797,16 +6302,44 @@ export class StudioBrowserController {
                 this.activeModelName = activeModelName
               }
 
+              // If the UI is still stuck on the exhausted model (e.g. target fallback model wasn't selectable),
+              // mark the attempted fallback exhausted too and pick the next available model
+              if (activeModelName.toLowerCase() === exhaustedModel.toLowerCase()) {
+                await markModelExhausted(nextAvailableModel)
+                nextAvailableModel = await getEffectiveModel(chosenModel, MODEL_FALLBACK_CHAIN)
+                if (!nextAvailableModel) {
+                  const resetTimeStr = await formatQuotaResetTime()
+                  const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`
+                  this.logStep('all models quota exhausted', allExhaustedMsg, 'error')
+                  onLog?.('error', `${allExhaustedMsg} (${jobLabel})`)
+                  throw new Error(allExhaustedMsg)
+                }
+                const secondSwitchRes = await this.selectModelInRunSettings(
+                  page,
+                  nextAvailableModel,
+                  MODEL_FALLBACK_CHAIN,
+                )
+                activeModelName = secondSwitchRes.selectedModelName || nextAvailableModel
+                this.activeModelName = activeModelName
+              }
+
+              await this.markPageErrorBannersHandled(page)
+
               const partialNow = await this.extractFinalAnswerWithoutThoughts(page)
               const hasPartialHissa =
-                Boolean(partialNow && /\bHISSA\s*1\b/i.test(partialNow) && !isThinkingOnlyText(partialNow))
+                Boolean(
+                  partialNow &&
+                    /\bHISSA\s*1\b/i.test(partialNow) &&
+                    !isThinkingOnlyText(partialNow) &&
+                    !this.isQuotaOrDailyLimitErrorText(partialNow),
+                )
 
               if (hasPartialHissa) {
                 quotaContinuePartialText = partialNow
                 break
               }
 
-              // No partial answer yet -> re-run in the SAME chat
+              // No partial HISSA 1 output yet -> try re-pressing Run or Rerun in the SAME chat
               capturedRunError = null
               capturedFinishReason = null
               runStarted = Date.now()
@@ -5815,7 +6348,7 @@ export class StudioBrowserController {
               stableSeconds = 0
               lastCandidateText = ''
 
-              const retryRunBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 2500)
+              const retryRunBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 2000)
               const retryRunBtnEnabled = retryRunBtn
                 ? await retryRunBtn.isEnabled().catch(() => false)
                 : false
@@ -5823,11 +6356,30 @@ export class StudioBrowserController {
                 await retryRunBtn.click().catch(() => {})
                 this.logStep('re-press Run (same chat)', `${jobLabel} [${activeModelName}]`, 'info')
                 continue
-              } else {
-                // Prompt was already submitted as a turn -> send Continue in same chat
-                quotaContinuePartialText = ''
-                break
               }
+
+              const retryRerunBtn = await findFirstVisibleLocator(
+                page,
+                [
+                  'button[aria-label*="Rerun" i]',
+                  'button[mattooltip*="Rerun" i]',
+                  'ms-chat-turn button:has-text("Rerun")',
+                ],
+                2000,
+              )
+              const retryRerunEnabled = retryRerunBtn
+                ? await retryRerunBtn.isEnabled().catch(() => false)
+                : false
+              if (retryRerunBtn && retryRerunEnabled) {
+                await retryRerunBtn.click().catch(() => {})
+                this.logStep('re-press Rerun (same chat)', `${jobLabel} [${activeModelName}]`, 'info')
+                continue
+              }
+
+              // Neither Run nor Rerun is enabled and there is no partial HISSA 1 output:
+              // retry the window cleanly with the newly switched model in a fresh chat
+              quotaSwitchRetryNewChat = true
+              break
             }
 
             if (errBannerText) {
@@ -5909,7 +6461,9 @@ export class StudioBrowserController {
                       /(an\s+internal\s+error\s+has\s+occurred|internal\s+error(?:\s+has\s+occurred|\s+encountered)?|something\s+went\s+wrong|failed\s+to\s+generate\s+content)/i.test(
                         t,
                       ) &&
-                      !/permission\s+denied|caller\s+does\s+not\s+have\s+permission|quota\s+exceeded/i.test(t)
+                      !/permission\s+denied|caller\s+does\s+not\s+have\s+permission|quota\s+exceeded|daily\s+limits?|please\s+select\s+another\s+model/i.test(
+                        t,
+                      )
                     ) {
                       return t.slice(0, 160)
                     }
@@ -5927,6 +6481,7 @@ export class StudioBrowserController {
 
               const netInternalError =
                 capturedRunError !== null &&
+                !this.isQuotaOrDailyLimitErrorText(capturedRunError.body) &&
                 (capturedRunError.status === 500 ||
                   capturedRunError.status === 503 ||
                   /\bINTERNAL\b|internal\s+error(?:\s+has\s+occurred|\s+encountered)?/i.test(
@@ -6042,6 +6597,21 @@ export class StudioBrowserController {
           await this.saveRotatedSessionFromContext(username)
           resetOnPermissionDenied = true
           // Do NOT consume normal MAX_ATTEMPTS = 3; perform hard page reset or browser restart at the top of the loop and redo the full window setup
+          attempt -= 1
+          continue
+        }
+
+        if (quotaSwitchRetryNewChat) {
+          await this.saveRotatedSessionFromContext(username)
+          this.logStep(
+            'quota switch -> retry in new chat',
+            `${jobLabel}: retrying window with switched model "${activeModelName}" in a fresh chat`,
+            'info',
+          )
+          onLog?.(
+            'info',
+            `${jobLabel}: retrying window with switched model "${activeModelName}" in a fresh chat`,
+          )
           attempt -= 1
           continue
         }
@@ -6190,6 +6760,28 @@ export class StudioBrowserController {
               if (qMsg.startsWith('POLICY_BLOCKED:') || qMsg.startsWith('STOPPED')) {
                 throw qContErr
               }
+              if (qMsg.startsWith('QUOTA_EXCEEDED_ERROR:') || this.isQuotaOrDailyLimitErrorText(qMsg)) {
+                const uiCardNow = await this.readVisibleModelCardText(page)
+                const exhaustedMod = uiCardNow ? canonicalizeStudioModelName(uiCardNow) : activeModelName
+                await markModelExhausted(exhaustedMod)
+                const nextMod = await getEffectiveModel(chosenModel, MODEL_FALLBACK_CHAIN)
+                if (!nextMod) {
+                  const resetTimeStr = await formatQuotaResetTime()
+                  const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`
+                  this.logStep('all models quota exhausted', allExhaustedMsg, 'error')
+                  onLog?.('error', `${allExhaustedMsg} (${jobLabel})`)
+                  throw new Error(allExhaustedMsg)
+                }
+                this.logStep(
+                  'quota exhausted -> switch model',
+                  `${jobLabel}: ${exhaustedMod} quota exhausted during Continue -> ${nextMod} par switch (${qMsg.slice(0, 120)})`,
+                  'warn',
+                )
+                activeModelName = nextMod
+                this.activeModelName = activeModelName
+                quotaSwitchRetryNewChat = true
+                break
+              }
               if (/CONTINUE_TURN_ERROR|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate/i.test(qMsg)) {
                 internalErrorDetected = true
                 internalErrorContinueTriedInChat = true
@@ -6197,6 +6789,11 @@ export class StudioBrowserController {
               }
               break
             }
+          }
+          if (quotaSwitchRetryNewChat) {
+            await this.saveRotatedSessionFromContext(username)
+            attempt -= 1
+            continue
           }
         }
 
@@ -6271,6 +6868,23 @@ export class StudioBrowserController {
                     `${jobLabel}: ${contMsg.slice(0, 160)}`,
                     'warn',
                   )
+                  if (contMsg.startsWith('QUOTA_EXCEEDED_ERROR:') || this.isQuotaOrDailyLimitErrorText(contMsg)) {
+                    const uiCardNow = await this.readVisibleModelCardText(page)
+                    const exhaustedMod = uiCardNow ? canonicalizeStudioModelName(uiCardNow) : activeModelName
+                    await markModelExhausted(exhaustedMod)
+                    const nextMod = await getEffectiveModel(chosenModel, MODEL_FALLBACK_CHAIN)
+                    if (!nextMod) {
+                      const resetTimeStr = await formatQuotaResetTime()
+                      const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`
+                      this.logStep('all models quota exhausted', allExhaustedMsg, 'error')
+                      onLog?.('error', `${allExhaustedMsg} (${jobLabel})`)
+                      throw new Error(allExhaustedMsg)
+                    }
+                    activeModelName = nextMod
+                    this.activeModelName = activeModelName
+                    quotaSwitchRetryNewChat = true
+                    break
+                  }
                   if (
                     /CONTINUE_TURN_ERROR|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate/i.test(
                       contMsg,
@@ -6282,6 +6896,11 @@ export class StudioBrowserController {
                   }
                   break
                 }
+              }
+              if (quotaSwitchRetryNewChat) {
+                await this.saveRotatedSessionFromContext(username)
+                attempt -= 1
+                continue
               }
             }
           }
