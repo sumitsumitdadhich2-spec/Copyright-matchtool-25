@@ -429,7 +429,7 @@ export function Dashboard() {
             type="button"
             onClick={() => setChatOpen(true)}
             aria-label="Open Gemini AI Chat"
-            title="AI Chat — Manual Gemini chat & video analysis (3.6 / 3.7 / 3.8 Flash, custom FPS)"
+            title="AI Chat — Manual Gemini chat & video analysis (Argon / 3.8 / 3.6 Flash, custom FPS)"
             className="btn-press flex items-center gap-1.5 rounded-lg border border-amber-400/70 bg-gradient-to-r from-amber-500/20 via-orange-500/20 to-amber-500/20 px-3 py-2 text-xs sm:text-sm font-bold text-amber-300 hover:border-amber-300 hover:from-amber-500/30 hover:to-orange-500/30 shadow-md shadow-amber-500/10 transition-all ring-1 ring-amber-400/30"
           >
             <Sparkles className="size-4 text-amber-400 animate-pulse shrink-0" aria-hidden />
@@ -638,13 +638,13 @@ export function Dashboard() {
           type="button"
           onClick={() => setChatOpen(true)}
           aria-label="Open Gemini AI Chat"
-          title="Open Gemini AI Studio Chat & Video Analysis (3.6 · 3.7 · 3.8 Flash)"
+          title="Open Gemini AI Studio Chat & Video Analysis (Argon · 3.8 · 3.6 Flash)"
           className="btn-press group flex items-center gap-2 rounded-full border border-amber-400/80 bg-gradient-to-r from-amber-500 via-orange-500 to-amber-500 px-4 py-2.5 text-zinc-950 font-bold shadow-xl shadow-amber-500/30 hover:scale-105 hover:shadow-2xl hover:shadow-amber-500/40 active:scale-95 transition-all"
         >
           <Sparkles className="size-5 shrink-0 text-zinc-950 animate-pulse group-hover:rotate-12 transition-transform" />
           <span className="text-xs sm:text-sm font-extrabold tracking-wide text-zinc-950">AI Chat</span>
           <span className="hidden sm:inline-block rounded-full bg-zinc-950/20 px-1.5 py-0.5 text-[10px] font-mono text-zinc-950 font-semibold">
-            3.6 · 3.7 · 3.8
+            Argon · 3.8 · 3.6
           </span>
         </button>
       </div>

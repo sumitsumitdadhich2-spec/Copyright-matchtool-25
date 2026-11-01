@@ -20,14 +20,18 @@ import {
 } from './studio-settings'
 import {
   DEFAULT_STUDIO_MODEL_NAME,
-  buildStudioFallbackCycle,
+   buildStudioFallbackCycle,
   buildStudioModelChain,
   canonicalizeStudioModelName,
   getEffectiveModel,
   loadStudioModelQuotaState,
   markModelExhausted,
   normalizeStudioThinkingLevel,
+  orderChainByUnleasedFirst,
+  releaseExclusiveStudioModel,
+  resolveEffectiveMaxOutputTokensForModel,
   thinkingLevelToDisplayLabel,
+  updateExclusiveStudioModelLease,
   type StudioThinkingLevel,
 } from './studio-model-state'
 import { buildStudioChunkPrompt } from './studio-prompt'
@@ -1208,8 +1212,9 @@ export class StudioBrowserController {
       return
     }
 
-    // Only wipe existing origin storage if switching to a DIFFERENT cookie fingerprint from what was previously on disk
-    if (diskFp && diskFp !== 'NONE' && diskFp !== 'ASSIST' && diskFp !== fingerprint && !this.assistMode) {
+    // Do not wipe existing origin storage when another worker saves rotated live cookies to Settings;
+    // simply apply the latest cookies into the browser context so active sessions stay intact.
+    if (diskFp && diskFp !== 'NONE' && diskFp !== 'ASSIST' && diskFp !== fingerprint && !this.assistMode && cookies.length === 0) {
       await this.clearAllBrowserCookiesAndStorage()
     }
 
@@ -2925,13 +2930,13 @@ export class StudioBrowserController {
       chain.findIndex((m) => canonicalizeStudioModelName(m).toLowerCase() === startCanonical.toLowerCase()),
     )
 
-    // Order candidates starting from targetModelName, skipping models already marked quota-exhausted
+    // Order candidates starting from targetModelName (including Argon, Gemini 3.8 Flash, Gemini 3.6 Flash)
     const orderedCandidates: string[] = []
     for (let i = startIdx; i < chain.length; i++) {
       orderedCandidates.push(chain[i])
     }
     for (let i = 0; i < startIdx; i++) {
-      if (chain[i] !== 'Argon') orderedCandidates.push(chain[i])
+      orderedCandidates.push(chain[i])
     }
 
     const nonExhaustedCandidates = orderedCandidates.filter((m) => {
@@ -2939,17 +2944,26 @@ export class StudioBrowserController {
       const untilTs = quotaStateNow.exhausted[canon]
       return !untilTs || untilTs <= Date.now()
     })
-    const candidatesToTry =
+    const baseCandidates =
       nonExhaustedCandidates.length > 0 ? nonExhaustedCandidates : orderedCandidates
+    // Prioritize models not currently leased by another active window (1 window = 1 model)
+    const candidatesToTry = orderChainByUnleasedFirst(this.profileDirName, baseCandidates)
 
     for (let i = 0; i < candidatesToTry.length; i++) {
       const candidateModel = candidatesToTry[i]
       const res = await trySelectSingleModel(candidateModel)
       if (res.matched) {
+        const selectedCanon = canonicalizeStudioModelName(candidateModel)
+        updateExclusiveStudioModelLease(this.profileDirName, selectedCanon)
         this.logStep('model selected', `Active model in Run Settings: ${res.cardText || candidateModel}`, 'info')
         await this.closeModelSelectionPanelIfOpen(page)
+        await this.setOutputLengthInRunSettings(
+          page,
+          resolveEffectiveMaxOutputTokensForModel(selectedCanon),
+          selectedCanon,
+        )
         return {
-          selectedModelName: canonicalizeStudioModelName(candidateModel),
+          selectedModelName: selectedCanon,
           visibleCardText: res.cardText || candidateModel,
         }
       }
@@ -2969,6 +2983,12 @@ export class StudioBrowserController {
     const actualSelectedCanonical = fallbackCard
       ? canonicalizeStudioModelName(fallbackCard)
       : canonicalizeStudioModelName(targetModelName)
+    updateExclusiveStudioModelLease(this.profileDirName, actualSelectedCanonical)
+    await this.setOutputLengthInRunSettings(
+      page,
+      resolveEffectiveMaxOutputTokensForModel(actualSelectedCanonical),
+      actualSelectedCanonical,
+    )
     return {
       selectedModelName: actualSelectedCanonical,
       visibleCardText: fallbackCard || targetModelName,
@@ -3235,41 +3255,15 @@ export class StudioBrowserController {
       }
     }
 
-    // 3. Ensure Advanced Settings is expanded if needed for Output length (do not collapse if already expanded)
-    try {
-      const outputLengthVisible = await page
-        .evaluate(() => /output\s+length/i.test(document.body.innerText || ''))
-        .catch(() => false)
-
-      if (!outputLengthVisible) {
-        const advBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.advancedSettingsToggle, 1000)
-        if (advBtn) {
-          const expanded = await advBtn.getAttribute('aria-expanded')
-          if (expanded === 'false') {
-            await advBtn.click()
-            await new Promise((r) => setTimeout(r, 300))
-          }
-        }
-      }
-    } catch {
-      /* ignore */
-    }
-
-    // 4. Set Output length (maxOutputTokens) if needed
-    try {
-      const maxOutInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.maxOutputTokensInput, 1200)
-      if (maxOutInput) {
-        const currentMaxOut = await maxOutInput.inputValue().catch(() => '')
-        const desiredMaxOut = String(config.maxOutputTokens || 65536)
-        if (currentMaxOut.trim() !== desiredMaxOut) {
-          await maxOutInput.click({ clickCount: 3 })
-          await maxOutInput.fill(desiredMaxOut)
-          await maxOutInput.press('Enter')
-        }
-      }
-    } catch {
-      /* ignore */
-    }
+    // 3 & 4. Set Output length (maxOutputTokens): 1,000,000 when Argon is active, 65,536 for Flash models
+    const activeCanonicalModel = canonicalizeStudioModelName(
+      modelSelection.selectedModelName || config.modelName || DEFAULT_STUDIO_MODEL_NAME,
+    )
+    const effectiveMaxOutTokens = resolveEffectiveMaxOutputTokensForModel(
+      activeCanonicalModel,
+      config.maxOutputTokens,
+    )
+    await this.setOutputLengthInRunSettings(page, effectiveMaxOutTokens, activeCanonicalModel)
 
     // 5. Optional: Turn OFF "Grounding with Google Search" in Run Settings if it is currently ON
     try {
@@ -3325,10 +3319,157 @@ export class StudioBrowserController {
 
     this.logStep(
       'model set',
-      `thinking=${desiredThinkingLabel} · model=${activeModelText || modelSelection.selectedModelName || config.modelName || 'default'}`,
+      `thinking=${desiredThinkingLabel} · outputTokens=${effectiveMaxOutTokens} · model=${activeModelText || modelSelection.selectedModelName || config.modelName || 'default'}`,
       'success',
     )
     return modelSelection
+  }
+
+  /**
+   * Reliably set "Output length" (maxOutputTokens) in AI Studio's Run Settings panel.
+   * For Argon this sets 1000000 (1,000,000); for Gemini 3.8 / 3.6 Flash this sets 65536.
+   */
+  private async setOutputLengthInRunSettings(
+    page: Page,
+    desiredTokens: number,
+    modelLabel?: string,
+  ): Promise<void> {
+    const desiredMaxOut = String(desiredTokens)
+    try {
+      await this.ensureRunSettingsPanelOpen(page)
+
+      // 1. Expand Advanced settings if Output length is not visible yet
+      const outputLengthVisible = await page
+        .evaluate(() => /output\s+length/i.test(document.body.innerText || ''))
+        .catch(() => false)
+
+      if (!outputLengthVisible) {
+        const advBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.advancedSettingsToggle, 1200)
+        if (advBtn) {
+          const expanded = await advBtn.getAttribute('aria-expanded')
+          if (expanded !== 'true') {
+            await advBtn.click().catch(() => {})
+            await new Promise((r) => setTimeout(r, 350))
+          }
+        } else {
+          // DOM fallback: click any collapsible button/header mentioning "Advanced settings"
+          await page
+            .evaluate(() => {
+              const all = Array.from(document.querySelectorAll('button, mat-expansion-panel-header, [role="button"]'))
+              for (const el of all) {
+                const h = el as HTMLElement
+                const txt = (h.innerText || h.textContent || '').trim()
+                if (/^advanced\s+settings$/i.test(txt) || /advanced\s+settings/i.test(h.getAttribute('aria-label') || '')) {
+                  if (h.getAttribute('aria-expanded') !== 'true') {
+                    h.click()
+                    return true
+                  }
+                }
+              }
+              return false
+            })
+            .catch(() => false)
+          await new Promise((r) => setTimeout(r, 350))
+        }
+      }
+
+      // 2. Scroll the Run Settings panel and tag the Output length <input>
+      await page
+        .evaluate((sels) => {
+          const isVis = (el: Element | null): el is HTMLElement => {
+            if (!el) return false
+            const h = el as HTMLElement
+            const r = h.getBoundingClientRect()
+            return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+          }
+
+          for (const prev of Array.from(document.querySelectorAll('[data-cmt-output-length-input]'))) {
+            prev.removeAttribute('data-cmt-output-length-input')
+          }
+
+          for (const sel of sels) {
+            try {
+              const found = Array.from(document.querySelectorAll(sel))
+              for (const node of found) {
+                if (isVis(node) && node.tagName.toLowerCase() === 'input') {
+                  ;(node as HTMLElement).scrollIntoView({ block: 'center', inline: 'nearest' })
+                  node.setAttribute('data-cmt-output-length-input', 'true')
+                  return
+                }
+              }
+            } catch {
+              /* ignore */
+            }
+          }
+
+          // Row-scoped lookup for "Output length" label
+          const all = Array.from(document.body.querySelectorAll('*'))
+          for (const el of all) {
+            if (!isVis(el)) continue
+            const t = ((el as HTMLElement).innerText || el.textContent || '').trim()
+            if (/^output\s+length$/i.test(t) || /^max\s+output\s+tokens$/i.test(t)) {
+              let row: Element | null = el.parentElement
+              for (let depth = 0; depth < 6 && row; depth++) {
+                const inp = row.querySelector('input[type="number"], input:not([type="checkbox"]):not([type="radio"])') as HTMLInputElement | null
+                if (inp && isVis(inp)) {
+                  inp.scrollIntoView({ block: 'center', inline: 'nearest' })
+                  inp.setAttribute('data-cmt-output-length-input', 'true')
+                  return
+                }
+                row = row.parentElement
+              }
+            }
+          }
+        }, [...STUDIO_SELECTORS.maxOutputTokensInput])
+        .catch(() => {})
+
+      await new Promise((r) => setTimeout(r, 150))
+
+      const maxOutInput = await findFirstVisibleLocator(
+        page,
+        ['input[data-cmt-output-length-input="true"]', ...STUDIO_SELECTORS.maxOutputTokensInput],
+        1500,
+      )
+
+      if (maxOutInput) {
+        const currentMaxOut = (await maxOutInput.inputValue().catch(() => '')).replace(/,/g, '').trim()
+        if (currentMaxOut !== desiredMaxOut) {
+          await maxOutInput.click({ clickCount: 3 }).catch(() => {})
+          await page.keyboard.press('Backspace').catch(() => {})
+          await maxOutInput.fill(desiredMaxOut).catch(async () => {
+            await page.keyboard.type(desiredMaxOut, { delay: 15 })
+          })
+          await maxOutInput
+            .evaluate((el, val) => {
+              const input = el as HTMLInputElement
+              const setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype,
+                'value',
+              )?.set
+              if (setter) {
+                setter.call(input, val)
+              } else {
+                input.value = val
+              }
+              input.dispatchEvent(new Event('input', { bubbles: true }))
+              input.dispatchEvent(new Event('change', { bubbles: true }))
+              input.dispatchEvent(new Event('blur', { bubbles: true }))
+            }, desiredMaxOut)
+            .catch(() => {})
+          await maxOutInput.press('Enter').catch(() => {})
+          await new Promise((r) => setTimeout(r, 200))
+        }
+
+        const verifiedMaxOut = (await maxOutInput.inputValue().catch(() => '')).replace(/,/g, '').trim()
+        this.logStep(
+          'output tokens set',
+          `Output length=${verifiedMaxOut || desiredMaxOut} (target=${desiredMaxOut}, model=${modelLabel || 'default'})`,
+          'info',
+        )
+      }
+    } catch {
+      /* ignore non-fatal output length input error */
+    }
   }
 
   /**
@@ -5301,8 +5442,8 @@ export class StudioBrowserController {
     const MAX_INVALID_RESULT_RETRIES = parallelMode ? MAX_ATTEMPTS : 3
     let invalidResultRetries = 0
 
-    // Requirement 1 & 5: Build model fallback chain starting from user's chosen model:
-    // Argon -> Gemini 3.8 Flash -> Gemini 3.7 Flash -> Gemini 3.6 Flash (with full Flash fallback cycle)
+    // Requirement: Only 3 models exist: Argon, Gemini 3.8 Flash, Gemini 3.6 Flash (never 3.7).
+    // Enforce 1 window = 1 model across concurrent active windows via this.profileDirName lease.
     const chosenModel = canonicalizeStudioModelName(
       modelName || userCfg.studioModelName || DEFAULT_STUDIO_MODEL_NAME,
     )
@@ -5318,7 +5459,12 @@ export class StudioBrowserController {
       })
     }
 
-    const initialEffectiveModel = await getEffectiveModel(chosenModel, MODEL_FALLBACK_CHAIN)
+    const initialEffectiveModel = await getEffectiveModel(
+      chosenModel,
+      MODEL_FALLBACK_CHAIN,
+      Date.now(),
+      this.profileDirName,
+    )
     if (!initialEffectiveModel) {
       const resetTimeStr = await formatQuotaResetTime()
       throw new Error(`NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`)
@@ -5333,14 +5479,13 @@ export class StudioBrowserController {
       const canon = canonicalizeStudioModelName(mName || '')
       if (/argon/i.test(canon)) return `${STUDIO_URLS.newChat}?model=gemini-4-argon`
       if (/3\.8/i.test(canon)) return `${STUDIO_URLS.newChat}?model=gemini-3.8-flash`
-      if (/3\.7/i.test(canon)) return `${STUDIO_URLS.newChat}?model=gemini-3.7-flash`
       if (/3\.6/i.test(canon)) return `${STUDIO_URLS.newChat}?model=gemini-3.6-flash`
       return STUDIO_URLS.newChat
     }
     let resetOnPermissionDenied = false
     let pendingInternalErrorAction:
       | 'none'
-      | 'same_page_hard_refresh'
+      | 'hard_refresh_new_page'
       | 'browser_restart'
       | 'last_resort_new_chat' = 'none'
     let lastKnownSettledTokens: number | null = null
@@ -5349,95 +5494,182 @@ export class StudioBrowserController {
     this.activeModelName = activeModelName
     this.activePermRetry = 0
 
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      this.activeAttempt = attempt
-      this.activeModelName = activeModelName
-      this.activePermRetry = permissionDeniedRetries
-      this.suppressDiagDumps = Boolean(parallelMode && attempt < MAX_ATTEMPTS)
-      this.activeChromeLogPath = resolveWorkerChromeLogFilePath(
-        scanId,
-        this.profileDirName,
-        attempt,
-      )
-      this.lastSampledWorkerRssMb = 0
-      this.peakWorkerRssMb = 0
-      try {
-        fs.mkdirSync(path.dirname(this.activeChromeLogPath), { recursive: true })
-        fs.appendFileSync(
-          this.activeChromeLogPath,
-          `\n=== [${new Date().toISOString()}] Worker=${this.workerTag || this.profileDirName} profile=${this.profileDirName} job=${jobLabel} attempt=${attempt}/${MAX_ATTEMPTS} ===\n`,
-          'utf8',
+    try {
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        this.activeAttempt = attempt
+        this.activeModelName = activeModelName
+        this.activePermRetry = permissionDeniedRetries
+        this.suppressDiagDumps = Boolean(parallelMode && attempt < MAX_ATTEMPTS)
+        this.activeChromeLogPath = resolveWorkerChromeLogFilePath(
+          scanId,
+          this.profileDirName,
+          attempt,
         )
-      } catch {
-        /* ignore log header error */
-      }
-      let currentStage = 'setup/ensure_page'
-      await this.waitIfPausedOrThrowIfStopped(scope)
-
-      const currentInternalErrorAction = pendingInternalErrorAction
-      pendingInternalErrorAction = 'none'
-      const isSamePageHardRefresh = currentInternalErrorAction === 'same_page_hard_refresh'
-      const isInternalErrorBrowserRestart = currentInternalErrorAction === 'browser_restart'
-      const isInternalErrorLastResortNewChat = currentInternalErrorAction === 'last_resort_new_chat'
-
-      try {
-        let page = await this.ensurePage(username)
-        if (this.browserLaunchInfo && attempt === 1 && permissionDeniedRetries === 0 && internalErrorRefreshes === 0) {
-          const isFallbackWarn = /WARN|mode=headless/i.test(this.browserLaunchInfo)
-          this.logStep('browser info', this.browserLaunchInfo, isFallbackWarn ? 'warn' : 'info')
+        this.lastSampledWorkerRssMb = 0
+        this.peakWorkerRssMb = 0
+        try {
+          fs.mkdirSync(path.dirname(this.activeChromeLogPath), { recursive: true })
+          fs.appendFileSync(
+            this.activeChromeLogPath,
+            `\n=== [${new Date().toISOString()}] Worker=${this.workerTag || this.profileDirName} profile=${this.profileDirName} job=${jobLabel} attempt=${attempt}/${MAX_ATTEMPTS} ===\n`,
+            'utf8',
+          )
+        } catch {
+          /* ignore log header error */
         }
+        let currentStage = 'setup/ensure_page'
+        await this.waitIfPausedOrThrowIfStopped(scope)
 
-        let urlBeforeReload = ''
-        let urlAfterReload = ''
+        const currentInternalErrorAction = pendingInternalErrorAction
+        pendingInternalErrorAction = 'none'
+        const isHardRefreshNewPage = currentInternalErrorAction === 'hard_refresh_new_page'
+        const isInternalErrorBrowserRestart = currentInternalErrorAction === 'browser_restart'
+        const isInternalErrorLastResortNewChat = currentInternalErrorAction === 'last_resort_new_chat'
 
-        // (a) On 403 PERMISSION_DENIED retry: alternate between:
-        //   - Odd retry (1, 3, 5...): Hard page reset (close old page, clear cache + site storage via CDP without touching cookies, open fresh page in same context, goto new_chat)
-        //   - Even retry (2, 4, 6...): Full browser restart (close context, relaunch persistent profile, open fresh page, goto new_chat)
-        // On internal error:
-        //   - 1st & 2nd time: REAL Chrome hard refresh on the SAME page via CDP (Page.reload ignoreCache=true, no page close, no new_chat, no clearDataForOrigin)
-        //   - 3rd time: Browser restart (persistent profile relaunch, cookies & origin storage preserved, no clearDataForOrigin)
-        //   - After 3rd time (last resort): New chat (retry same window)
-        if (resetOnPermissionDenied) {
-          resetOnPermissionDenied = false
-          const resetCounter = permissionDeniedRetries
-          const resetMax = MAX_PERMISSION_RETRIES
-          const resetPrefix = '403'
-          const isHardPageReset = resetCounter % 2 === 1
-          const storageTypesToClear = 'local_storage,indexeddb,cache_storage,service_workers,websql'
-
-          const clearCacheAndStorageViaCdp = async (targetPage: Page): Promise<string[]> => {
-            if (!this.context) return []
-            const clearedItems: string[] = []
-            let cdp: Awaited<ReturnType<BrowserContext['newCDPSession']>> | null = null
-            try {
-              cdp = await this.context.newCDPSession(targetPage)
-              try {
-                await cdp.send('Network.clearBrowserCache')
-                clearedItems.push('Network.clearBrowserCache')
-              } catch {
-                /* ignore cache clear warning */
-              }
-              try {
-                await cdp.send('Storage.clearDataForOrigin', {
-                  origin: 'https://aistudio.google.com',
-                  storageTypes: storageTypesToClear,
-                })
-                clearedItems.push(`Storage.clearDataForOrigin(${storageTypesToClear})`)
-              } catch {
-                /* ignore storage clear warning */
-              }
-            } catch {
-              /* ignore cdp session warning */
-            } finally {
-              if (cdp) {
-                await cdp.detach().catch(() => {})
-              }
-            }
-            return clearedItems
+        try {
+          let page = await this.ensurePage(username)
+          if (this.browserLaunchInfo && attempt === 1 && permissionDeniedRetries === 0 && internalErrorRefreshes === 0) {
+            const isFallbackWarn = /WARN|mode=headless/i.test(this.browserLaunchInfo)
+            this.logStep('browser info', this.browserLaunchInfo, isFallbackWarn ? 'warn' : 'info')
           }
 
-          if (isHardPageReset) {
-            currentStage = 'setup/hard_reset_page'
+          // (a) On 403 PERMISSION_DENIED retry: alternate between:
+          //   - Odd retry (1, 3, 5...): Hard page reset (close old page, clear cache + site storage via CDP without touching cookies, open fresh page in same context, goto new_chat)
+          //   - Even retry (2, 4, 6...): Full browser restart (close context, relaunch persistent profile, open fresh page, goto new_chat)
+          // On internal error:
+          //   - 1st & 2nd time: Hard refresh + open a fresh new_chat page (so broken chat state never causes fake running)
+          //   - 3rd time: Browser restart + open a fresh new_chat page
+          if (resetOnPermissionDenied) {
+            resetOnPermissionDenied = false
+            const resetCounter = permissionDeniedRetries
+            const resetMax = MAX_PERMISSION_RETRIES
+            const resetPrefix = '403'
+            const isHardPageReset = resetCounter % 2 === 1
+            const storageTypesToClear = 'local_storage,indexeddb,cache_storage,service_workers,websql'
+
+            const clearCacheAndStorageViaCdp = async (targetPage: Page): Promise<string[]> => {
+              if (!this.context) return []
+              const clearedItems: string[] = []
+              let cdp: Awaited<ReturnType<BrowserContext['newCDPSession']>> | null = null
+              try {
+                cdp = await this.context.newCDPSession(targetPage)
+                try {
+                  await cdp.send('Network.clearBrowserCache')
+                  clearedItems.push('Network.clearBrowserCache')
+                } catch {
+                  /* ignore cache clear warning */
+                }
+                try {
+                  await cdp.send('Storage.clearDataForOrigin', {
+                    origin: 'https://aistudio.google.com',
+                    storageTypes: storageTypesToClear,
+                  })
+                  clearedItems.push(`Storage.clearDataForOrigin(${storageTypesToClear})`)
+                } catch {
+                  /* ignore storage clear warning */
+                }
+              } catch {
+                /* ignore cdp session warning */
+              } finally {
+                if (cdp) {
+                  await cdp.detach().catch(() => {})
+                }
+              }
+              return clearedItems
+            }
+
+            if (isHardPageReset) {
+              currentStage = 'setup/hard_reset_page'
+              if (!this.context) {
+                page = await this.ensurePage(username)
+              }
+              const oldPages = this.context ? [...this.context.pages()] : [page]
+              const freshPage = await this.context!.newPage()
+              for (const oldP of oldPages) {
+                if (oldP !== freshPage && !oldP.isClosed()) {
+                  await oldP.close().catch(() => {})
+                }
+              }
+              const clearedList = await clearCacheAndStorageViaCdp(freshPage)
+              await freshPage.setViewportSize(VIEWPORT)
+              this.page = freshPage
+              page = freshPage
+
+              const clearedDesc =
+                clearedList.length > 0
+                  ? clearedList.join(' + ')
+                  : `cache + storage (${storageTypesToClear})`
+              const resetDetail = `${jobLabel} (${resetPrefix} refresh ${resetCounter}/${resetMax}, model=${activeModelName}) — old page closed, cleared [${clearedDesc}] for https://aistudio.google.com (cookies preserved), opened new page -> new_chat`
+              this.logStep(`${resetPrefix} -> hard reset (page+cache)`, resetDetail, 'info')
+              onLog?.('info', `${resetPrefix} -> hard reset (page+cache): ${resetDetail}`)
+
+              await page.goto(buildNewChatUrlForModel(activeModelName), {
+                waitUntil: 'domcontentloaded',
+                timeout: 45_000,
+              })
+            } else {
+              currentStage = 'setup/browser_restart'
+              let clearedList: string[] = []
+              if (this.context && page && !page.isClosed()) {
+                clearedList = await clearCacheAndStorageViaCdp(page)
+              }
+              if (this.context) {
+                try {
+                  await this.context.close()
+                } catch {
+                  /* ignore context close warning */
+                }
+                this.context = null
+                this.page = null
+              }
+              await new Promise((r) => setTimeout(r, 1000))
+
+              await this.ensurePage(username)
+              const activeCtx = this.context as BrowserContext | null
+              const existingPages = activeCtx ? [...activeCtx.pages()] : []
+              const freshPage = await activeCtx!.newPage()
+              for (const oldP of existingPages) {
+                if (oldP !== freshPage && !oldP.isClosed()) {
+                  await oldP.close().catch(() => {})
+                }
+              }
+              if (clearedList.length === 0) {
+                clearedList = await clearCacheAndStorageViaCdp(freshPage)
+              }
+              await freshPage.setViewportSize(VIEWPORT)
+              this.page = freshPage
+              page = freshPage
+
+              const clearedDesc =
+                clearedList.length > 0
+                  ? clearedList.join(' + ')
+                  : `cache + storage (${storageTypesToClear})`
+              const restartDetail = `${jobLabel} (${resetPrefix} refresh ${resetCounter}/${resetMax}, model=${activeModelName}) — context closed & relaunched persistent profile (${this.profileDirName}), cleared [${clearedDesc}] for https://aistudio.google.com (cookies preserved), opened new page -> new_chat`
+              this.logStep(`${resetPrefix} -> browser restart`, restartDetail, 'info')
+              onLog?.('info', `${resetPrefix} -> browser restart: ${restartDetail}`)
+
+              await page.goto(buildNewChatUrlForModel(activeModelName), {
+                waitUntil: 'domcontentloaded',
+                timeout: 45_000,
+              })
+            }
+          } else if (isHardRefreshNewPage) {
+            currentStage = 'setup/hard_refresh_new_page'
+            // Perform CDP hard cache clear + reload, then open a fresh new_chat page so broken chat never fake-runs
+            let client: Awaited<ReturnType<BrowserContext['newCDPSession']>> | null = null
+            try {
+              client = await page.context().newCDPSession(page)
+              await client.send('Network.clearBrowserCache').catch(() => {})
+              await client.send('Network.setCacheDisabled', { cacheDisabled: true }).catch(() => {})
+              await client.send('Page.reload', { ignoreCache: true }).catch(() => {})
+            } catch {
+              /* ignore cdp reload error */
+            } finally {
+              if (client) {
+                await client.send('Network.setCacheDisabled', { cacheDisabled: false }).catch(() => {})
+                await client.detach().catch(() => {})
+              }
+            }
             if (!this.context) {
               page = await this.ensurePage(username)
             }
@@ -5448,29 +5680,23 @@ export class StudioBrowserController {
                 await oldP.close().catch(() => {})
               }
             }
-            const clearedList = await clearCacheAndStorageViaCdp(freshPage)
             await freshPage.setViewportSize(VIEWPORT)
             this.page = freshPage
             page = freshPage
 
-            const clearedDesc =
-              clearedList.length > 0
-                ? clearedList.join(' + ')
-                : `cache + storage (${storageTypesToClear})`
-            const resetDetail = `${jobLabel} (${resetPrefix} refresh ${resetCounter}/${resetMax}, model=${activeModelName}) — old page closed, cleared [${clearedDesc}] for https://aistudio.google.com (cookies preserved), opened new page -> new_chat`
-            this.logStep(`${resetPrefix} -> hard reset (page+cache)`, resetDetail, 'info')
-            onLog?.('info', `${resetPrefix} -> hard reset (page+cache): ${resetDetail}`)
+            const targetNewChatUrl = buildNewChatUrlForModel(activeModelName)
+            const refreshLogStep = `internal error -> hard refresh + new page (refresh ${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
+            const refreshDetail = `${jobLabel} (refresh ${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH}, model=${activeModelName}, url=${targetNewChatUrl})`
+            this.logStep(refreshLogStep, refreshDetail, 'info')
+            onLog?.('info', `${refreshLogStep}: ${refreshDetail}`)
 
-            await page.goto(buildNewChatUrlForModel(activeModelName), {
+            await page.goto(targetNewChatUrl, {
               waitUntil: 'domcontentloaded',
               timeout: 45_000,
             })
-          } else {
+          } else if (isInternalErrorBrowserRestart) {
             currentStage = 'setup/browser_restart'
-            let clearedList: string[] = []
-            if (this.context && page && !page.isClosed()) {
-              clearedList = await clearCacheAndStorageViaCdp(page)
-            }
+            // 3rd internal error: restart browser (persistent profile relaunch) + open fresh new_chat page
             if (this.context) {
               try {
                 await this.context.close()
@@ -5481,381 +5707,99 @@ export class StudioBrowserController {
               this.page = null
             }
             await new Promise((r) => setTimeout(r, 1000))
-
-            await this.ensurePage(username)
+            page = await this.ensurePage(username)
             const activeCtx = this.context as BrowserContext | null
-            const existingPages = activeCtx ? [...activeCtx.pages()] : []
-            const freshPage = await activeCtx!.newPage()
-            for (const oldP of existingPages) {
-              if (oldP !== freshPage && !oldP.isClosed()) {
-                await oldP.close().catch(() => {})
+            if (activeCtx) {
+              const existingPages = [...activeCtx.pages()]
+              const freshPage = await activeCtx.newPage()
+              for (const oldP of existingPages) {
+                if (oldP !== freshPage && !oldP.isClosed()) {
+                  await oldP.close().catch(() => {})
+                }
               }
+              await freshPage.setViewportSize(VIEWPORT)
+              this.page = freshPage
+              page = freshPage
             }
-            if (clearedList.length === 0) {
-              clearedList = await clearCacheAndStorageViaCdp(freshPage)
-            }
-            await freshPage.setViewportSize(VIEWPORT)
-            this.page = freshPage
-            page = freshPage
-
-            const clearedDesc =
-              clearedList.length > 0
-                ? clearedList.join(' + ')
-                : `cache + storage (${storageTypesToClear})`
-            const restartDetail = `${jobLabel} (${resetPrefix} refresh ${resetCounter}/${resetMax}, model=${activeModelName}) — context closed & relaunched persistent profile (${this.profileDirName}), cleared [${clearedDesc}] for https://aistudio.google.com (cookies preserved), opened new page -> new_chat`
-            this.logStep(`${resetPrefix} -> browser restart`, restartDetail, 'info')
-            onLog?.('info', `${resetPrefix} -> browser restart: ${restartDetail}`)
-
+            const restartLogStep = `internal error -> browser restart + new page (refresh ${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
+            const restartDetail = `${jobLabel} (refresh ${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH}, model=${activeModelName}) — persistent profile (${this.profileDirName}) relaunched -> new_chat`
+            this.logStep(restartLogStep, restartDetail, 'info')
+            onLog?.('info', `${restartLogStep}: ${restartDetail}`)
             await page.goto(buildNewChatUrlForModel(activeModelName), {
               waitUntil: 'domcontentloaded',
               timeout: 45_000,
             })
+          } else {
+            currentStage = 'setup/new_chat'
+            if (isInternalErrorLastResortNewChat) {
+              const lastResortStep = 'internal error -> last resort: naya chat (retry same window)'
+              const lastResortDetail = `${jobLabel} (after ${MAX_INTERNAL_ERROR_REFRESH}/${MAX_INTERNAL_ERROR_REFRESH} refreshes, attempt ${attempt}/${MAX_ATTEMPTS}, model=${activeModelName})`
+              this.logStep(lastResortStep, lastResortDetail, 'warn')
+              onLog?.('warn', `${lastResortStep}: ${lastResortDetail}`)
+            }
+            // Open a clean page in the browser context for new_chat so stale page state never carries over
+            if (this.context) {
+              const existingPages = [...this.context.pages()]
+              const freshPage = await this.context.newPage()
+              for (const oldP of existingPages) {
+                if (oldP !== freshPage && !oldP.isClosed()) {
+                  await oldP.close().catch(() => {})
+                }
+              }
+              await freshPage.setViewportSize(VIEWPORT)
+              this.page = freshPage
+              page = freshPage
+            }
+            const targetNewChatUrl = buildNewChatUrlForModel(activeModelName)
+            this.logStep('opening new chat', `${jobLabel} (attempt ${attempt}/${MAX_ATTEMPTS}, model=${activeModelName}, url=${targetNewChatUrl})`)
+            await page.goto(targetNewChatUrl, {
+              waitUntil: 'domcontentloaded',
+              timeout: 45_000,
+            })
           }
-        } else if (isSamePageHardRefresh) {
-          currentStage = 'setup/hard_refresh_same_page'
-          urlBeforeReload = page.url()
-          let reloadMethod = 'CDP Page.reload(ignoreCache=true)'
-          let client: Awaited<ReturnType<BrowserContext['newCDPSession']>> | null = null
-          try {
-            client = await page.context().newCDPSession(page)
-            await client.send('Network.setCacheDisabled', { cacheDisabled: true })
-            const navPromise = page
-              .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45_000 })
-              .catch(() => null)
-            await client.send('Page.reload', { ignoreCache: true })
-            await navPromise
-            await page.waitForLoadState('domcontentloaded', { timeout: 30_000 }).catch(() => {})
-            await page.waitForLoadState('load', { timeout: 15_000 }).catch(() => {})
-          } catch (cdpErr) {
-            const cdpErrMsg = cdpErr instanceof Error ? cdpErr.message : String(cdpErr)
-            this.logStep(
-              'hard refresh CDP fallback',
-              `${jobLabel}: CDP reload failed (${cdpErrMsg.slice(0, 100)}) -> trying page.reload / Control+Shift+R`,
-              'warn',
+          await new Promise((r) => setTimeout(r, 2500))
+          await this.dismissAnyOnboardingModals(page)
+
+          const needsAttentionReason = await page
+            .evaluate(() => {
+              if (window.location.href.includes('accounts.google.com')) {
+                return 'Google session logged out or requires verification'
+              }
+              const body = document.body?.innerText || ''
+              if (/no\s+api\s+key\s+selected|select\s+an?\s+api\s+key\s+to\s+continue/i.test(body)) {
+                return 'No API key selected or project prompt blocking AI Studio'
+              }
+              return null
+            })
+            .catch(() => (page.url().includes('accounts.google.com') ? 'Google session logged out' : null))
+
+          if (needsAttentionReason) {
+            throw new Error(
+              `NEEDS_ATTENTION: ${needsAttentionReason}. Open "Gemini Studio Live" -> Login Assist or log in once in the persistent Chrome profile.`,
             )
-            try {
-              reloadMethod = 'page.reload(domcontentloaded)'
-              await page.reload({ waitUntil: 'domcontentloaded', timeout: 45_000 })
-            } catch {
-              reloadMethod = 'keyboard Control+Shift+R'
-              const kbNav = page
-                .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45_000 })
-                .catch(() => null)
-              await page.keyboard.press('Control+Shift+R').catch(() => {})
-              await kbNav
-            }
-          } finally {
-            if (client) {
-              await client.send('Network.setCacheDisabled', { cacheDisabled: false }).catch(() => {})
-              await client.detach().catch(() => {})
-            }
           }
 
-          // Wait for AI Studio UI ready (prompt box visible)
-          const uiReadyPrompt = await findFirstVisibleLocator(page, STUDIO_SELECTORS.promptInput, 25_000)
-          urlAfterReload = page.url()
-          const sameUrlFlag = urlBeforeReload === urlAfterReload
-          const refreshLogStep = `internal error -> REAL hard refresh (page.reload ignoreCache, same page) (refresh ${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
-          const refreshDetail = `${jobLabel} (refresh ${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH}, model=${activeModelName}, method=${reloadMethod}, sameUrl=${sameUrlFlag}, uiReady=${Boolean(uiReadyPrompt)})`
-          this.logStep(refreshLogStep, refreshDetail, 'info')
-          onLog?.('info', `${refreshLogStep}: ${refreshDetail}`)
-        } else if (isInternalErrorBrowserRestart) {
-          currentStage = 'setup/browser_restart'
-          // 3rd internal error: restart browser (persistent profile relaunch) WITHOUT clearDataForOrigin
-          if (this.context) {
-            try {
-              await this.context.close()
-            } catch {
-              /* ignore context close warning */
-            }
-            this.context = null
-            this.page = null
+          // Requirement: Immediately after opening a new page (new_chat), automatically run "Save Cookies"
+          // so fresh live Google session cookies are saved to Settings before starting work (preventing 403 permission errors).
+          const savedLiveCookies = await this.saveLiveSessionToSettingsIfAuthenticated(username)
+          if (!savedLiveCookies.saved) {
+            await this.saveRotatedSessionFromContext(username)
           }
-          await new Promise((r) => setTimeout(r, 1000))
-          page = await this.ensurePage(username)
-          const restartLogStep = `internal error -> browser restart (persistent profile relaunch) (refresh ${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
-          const restartDetail = `${jobLabel} (refresh ${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH}, model=${activeModelName}) — persistent profile (${this.profileDirName}) relaunched (cookies & origin storage preserved)`
-          this.logStep(restartLogStep, restartDetail, 'info')
-          onLog?.('info', `${restartLogStep}: ${restartDetail}`)
-          await page.goto(buildNewChatUrlForModel(activeModelName), {
-            waitUntil: 'domcontentloaded',
-            timeout: 45_000,
+
+          const promptText = buildStudioChunkPrompt({
+            movieWindowSec: movieEndSec - movieStartSec,
+            shortPartSec: shortEndSec - shortStartSec,
+            sanitized,
           })
-        } else {
-          currentStage = 'setup/new_chat'
-          if (isInternalErrorLastResortNewChat) {
-            const lastResortStep = 'internal error -> last resort: naya chat (retry same window)'
-            const lastResortDetail = `${jobLabel} (after ${MAX_INTERNAL_ERROR_REFRESH}/${MAX_INTERNAL_ERROR_REFRESH} refreshes, attempt ${attempt}/${MAX_ATTEMPTS}, model=${activeModelName})`
-            this.logStep(lastResortStep, lastResortDetail, 'warn')
-            onLog?.('warn', `${lastResortStep}: ${lastResortDetail}`)
-          }
-          const targetNewChatUrl = buildNewChatUrlForModel(activeModelName)
-          this.logStep('opening new chat', `${jobLabel} (attempt ${attempt}/${MAX_ATTEMPTS}, model=${activeModelName}, url=${targetNewChatUrl})`)
-          await page.goto(targetNewChatUrl, {
-            waitUntil: 'domcontentloaded',
-            timeout: 45_000,
-          })
-        }
-        await new Promise((r) => setTimeout(r, 2500))
-        await this.dismissAnyOnboardingModals(page)
 
-        const needsAttentionReason = await page
-          .evaluate(() => {
-            if (window.location.href.includes('accounts.google.com')) {
-              return 'Google session logged out or requires verification'
-            }
-            const body = document.body?.innerText || ''
-            if (/no\s+api\s+key\s+selected|select\s+an?\s+api\s+key\s+to\s+continue/i.test(body)) {
-              return 'No API key selected or project prompt blocking AI Studio'
-            }
-            return null
-          })
-          .catch(() => (page.url().includes('accounts.google.com') ? 'Google session logged out' : null))
+          const needConfigureRunSettings = true
+          const needAttachShort = true
+          const needAttachMovie = true
+          const needPastePrompt = true
 
-        if (needsAttentionReason) {
-          throw new Error(
-            `NEEDS_ATTENTION: ${needsAttentionReason}. Open "Gemini Studio Live" -> Login Assist or log in once in the persistent Chrome profile.`,
-          )
-        }
-
-        const promptText = buildStudioChunkPrompt({
-          movieWindowSec: movieEndSec - movieStartSec,
-          shortPartSec: shortEndSec - shortStartSec,
-          sanitized,
-        })
-
-        let needConfigureRunSettings = true
-        let needAttachShort = true
-        let needAttachMovie = true
-        let needPastePrompt = true
-
-        if (isSamePageHardRefresh) {
-          currentStage = 'setup/verify_after_hard_refresh'
-          urlAfterReload = page.url()
-          const sameChatUrl = urlBeforeReload === urlAfterReload
-
-          const shortBaseName = (
-            shortDriveFileName ||
-            (shortLocalPath ? path.basename(shortLocalPath) : '')
-          ).toLowerCase()
-          const movieBaseName = (
-            (windowClip?.clipPath ? path.basename(windowClip.clipPath) : '') ||
-            movieDriveFileName ||
-            (movieLocalPath ? path.basename(movieLocalPath) : '')
-          ).toLowerCase()
-
-          const syncedComposerChips = await this.syncFallbackMediaChips(page)
-          const currentTokensAfterReload = await this.readStudioTokenCount(page)
-
-          const pageState = await page
-            .evaluate(
-              ({
-                expectedModel,
-                expectedThinking,
-                shortName,
-                movieName,
-                modelTriggerSels,
-                promptInputSels,
-              }) => {
-                const isVis = (el: Element | null): el is HTMLElement => {
-                  if (!el) return false
-                  const h = el as HTMLElement
-                  const r = h.getBoundingClientRect()
-                  return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
-                }
-
-                // 1. Check currently displayed model & thinking level in Run Settings
-                let displayedModel = ''
-                for (const sel of modelTriggerSels) {
-                  try {
-                    const el = document.querySelector(sel)
-                    if (isVis(el)) {
-                      displayedModel = (el.innerText || el.textContent || '').trim()
-                      if (displayedModel) break
-                    }
-                  } catch {
-                    /* ignore */
-                  }
-                }
-                const modelMatches =
-                  displayedModel.length > 0 &&
-                  displayedModel.toLowerCase().includes(expectedModel.toLowerCase())
-
-                let displayedThinking = ''
-                const thinkEl = document.querySelector(
-                  'ms-thinking-level-select mat-select, ms-thinking-level-select [role="combobox"], ms-thinking-level-select',
-                )
-                if (isVis(thinkEl)) {
-                  displayedThinking = (thinkEl.innerText || thinkEl.textContent || '').trim()
-                }
-                const thinkingMatches =
-                  !thinkEl ||
-                  displayedThinking.toLowerCase().includes(expectedThinking.toLowerCase())
-
-                // 2. Check attached video chips in composer and in chat turns
-                const chipLabels: string[] = []
-                const chipSelectors = [
-                  'button[aria-label*="Edit video options" i]',
-                  'button[aria-label*="Video options" i]',
-                  'button[aria-label*="Edit media options" i]',
-                  '[data-cmt-chip-idx]',
-                  'ms-prompt-chip',
-                  'ms-media-chip',
-                  'ms-video-chunk',
-                  'ms-chat-turn video',
-                ]
-                const seenChipEls = new Set<Element>()
-                for (const sel of chipSelectors) {
-                  try {
-                    const nodes = Array.from(document.querySelectorAll(sel))
-                    for (const node of nodes) {
-                      if (!isVis(node)) continue
-                      const container =
-                        node.closest(
-                          'ms-prompt-chip, ms-media-chip, ms-video-chunk, .chip, .media-chip, [data-cmt-chip-idx]',
-                        ) ||
-                        node.parentElement ||
-                        node
-                      if (seenChipEls.has(container)) continue
-                      seenChipEls.add(container)
-                      const label = (
-                        (container as HTMLElement).innerText ||
-                        container.textContent ||
-                        container.getAttribute('aria-label') ||
-                        node.getAttribute('aria-label') ||
-                        ''
-                      )
-                        .trim()
-                        .toLowerCase()
-                      chipLabels.push(label)
-                    }
-                  } catch {
-                    /* ignore */
-                  }
-                }
-
-                const hasShortByName =
-                  shortName.length > 0 && chipLabels.some((l) => l.includes(shortName))
-                const hasMovieByName =
-                  movieName.length > 0 && chipLabels.some((l) => l.includes(movieName))
-
-                // 3. Check prompt text in prompt input or committed user turn
-                let promptBoxText = ''
-                for (const sel of promptInputSels) {
-                  try {
-                    const el = document.querySelector(sel)
-                    if (isVis(el)) {
-                      const val =
-                        (el as HTMLTextAreaElement).value ??
-                        el.innerText ??
-                        el.textContent ??
-                        ''
-                      promptBoxText = String(val).trim()
-                      if (promptBoxText) break
-                    }
-                  } catch {
-                    /* ignore */
-                  }
-                }
-
-                let turnHasPromptText = false
-                const turns = Array.from(
-                  document.querySelectorAll('ms-chat-turn, [data-turn-role="user"], .user-turn'),
-                )
-                for (const t of turns) {
-                  const txt = ((t as HTMLElement).innerText || t.textContent || '').trim()
-                  if (/HISSA\s*1/i.test(txt) && /HISSA\s*2/i.test(txt)) {
-                    turnHasPromptText = true
-                    break
-                  }
-                }
-
-                const runBtns = Array.from(
-                  document.querySelectorAll(
-                    'ms-run-button button, button.run-button, button[aria-label*="Run" i], button[aria-label*="Rerun" i], button[mattooltip*="Rerun" i]',
-                  ),
-                )
-                let runOrRerunEnabled = false
-                for (const b of runBtns) {
-                  if (!isVis(b)) continue
-                  const btn = b as HTMLButtonElement
-                  if (!btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
-                    runOrRerunEnabled = true
-                    break
-                  }
-                }
-
-                return {
-                  displayedModel,
-                  modelMatches,
-                  displayedThinking,
-                  thinkingMatches,
-                  chipCount: chipLabels.length,
-                  hasShortByName,
-                  hasMovieByName,
-                  promptBoxLen: promptBoxText.length,
-                  promptBoxHasHissa: /HISSA\s*1/i.test(promptBoxText),
-                  turnHasPromptText,
-                  runOrRerunEnabled,
-                }
-              },
-              {
-                expectedModel: activeModelName,
-                expectedThinking: effectiveThinkingLevel,
-                shortName: shortBaseName,
-                movieName: movieBaseName,
-                modelTriggerSels: [...STUDIO_SELECTORS.modelSelectorTrigger],
-                promptInputSels: [...STUDIO_SELECTORS.promptInput],
-              },
-            )
-            .catch(() => ({
-              displayedModel: '',
-              modelMatches: false,
-              displayedThinking: '',
-              thinkingMatches: false,
-              chipCount: 0,
-              hasShortByName: false,
-              hasMovieByName: false,
-              promptBoxLen: 0,
-              promptBoxHasHissa: false,
-              turnHasPromptText: false,
-              runOrRerunEnabled: false,
-            }))
-
-          const syncedCount =
-            typeof syncedComposerChips === 'number'
-              ? syncedComposerChips
-              : Array.isArray(syncedComposerChips)
-                ? (syncedComposerChips as unknown[]).length
-                : 0
-          const effectiveChipCount = Math.max(syncedCount, pageState.chipCount)
-          const tokensShowBothAttached =
-            currentTokensAfterReload !== null &&
-            currentTokensAfterReload >= minPlausible24FpsTokens
-
-          const shortAttached =
-            pageState.hasShortByName || effectiveChipCount >= 2 || tokensShowBothAttached
-          const movieAttached =
-            pageState.hasMovieByName || effectiveChipCount >= 2 || tokensShowBothAttached
-
-          needConfigureRunSettings = !(pageState.modelMatches && pageState.thinkingMatches)
-          needAttachShort = !shortAttached
-          needAttachMovie = !movieAttached
-          // Prompt is present if it is in the prompt box OR already committed in the chat turn with an enabled Run/Rerun button
-          const promptAlreadyPresent =
-            pageState.promptBoxHasHissa ||
-            pageState.promptBoxLen >= Math.min(80, Math.floor(promptText.length * 0.5)) ||
-            (pageState.turnHasPromptText && pageState.runOrRerunEnabled && !needAttachShort && !needAttachMovie)
-          needPastePrompt = !promptAlreadyPresent
-
-          const verifySummary = `${jobLabel}: sameUrl=${sameChatUrl} (${urlAfterReload}), modelOk=${!needConfigureRunSettings} (displayed="${pageState.displayedModel || 'unknown'}"), shortChip=${shortAttached}, movieChip=${movieAttached} (chips=${effectiveChipCount}, tokens=${currentTokensAfterReload ?? 'null'}), promptPresent=${promptAlreadyPresent} -> redo=[model:${needConfigureRunSettings}, short:${needAttachShort}, movie:${needAttachMovie}, prompt:${needPastePrompt}]`
-          this.logStep('verify state after hard refresh', verifySummary, 'info')
-          onLog?.('info', `verify state after hard refresh: ${verifySummary}`)
-        }
-
-        // (b) Configure Run Settings (if normal start or if model/thinking needed re-setting after hard refresh)
-        if (needConfigureRunSettings) {
-          currentStage = 'setup/run_settings'
+          // (b) Configure Run Settings
+          if (needConfigureRunSettings) {
+            currentStage = 'setup/run_settings'
           const runSettingsRes = await this.configureRunSettings(
             page,
             {
@@ -6251,133 +6195,6 @@ export class StudioBrowserController {
           }, [...STUDIO_SELECTORS.modelTurnContainers])
           .catch(() => ({ count: 0, lastHadInternalError: false }))
 
-        const trySameChatInternalErrorRerun = async (reasonDetail: string): Promise<boolean> => {
-          if (internalErrorSameChatRetries >= 2) return false
-          const partialCheck = await this.extractFinalAnswerWithoutThoughts(page)
-          const hasValidPartial =
-            Boolean(
-              partialCheck &&
-                /\bHISSA\s*1\b/i.test(partialCheck) &&
-                !isThinkingOnlyText(partialCheck) &&
-                !/^(?:an\s+internal\s+error|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i.test(
-                  partialCheck.trim(),
-                ),
-            )
-          if (hasValidPartial) {
-            // Let post-loop Continue in same chat stitch the partial HISSA 1 output
-            return false
-          }
-
-          internalErrorSameChatRetries += 1
-          await cancelStuckStopButtonIfVisible()
-          await this.markPageErrorBannersHandled(page)
-
-          // On 2nd same-chat internal error retry, switch to the next non-exhausted model in MODEL_FALLBACK_CHAIN
-          if (internalErrorSameChatRetries === 2) {
-            const prevMod = activeModelName
-            const quotaSnap = await loadStudioModelQuotaState()
-            const nonExhausted = MODEL_FALLBACK_CHAIN.filter(
-              (m) => !quotaSnap.exhausted[canonicalizeStudioModelName(m)],
-            )
-            const pool = nonExhausted.length > 0 ? nonExhausted : MODEL_FALLBACK_CHAIN
-            const curIdx = pool.findIndex((m) => m.toLowerCase() === prevMod.toLowerCase())
-            const nextMod = pool[(curIdx + 1) % pool.length] || prevMod
-            if (nextMod.toLowerCase() !== prevMod.toLowerCase()) {
-              this.logStep(
-                'internal error -> switch model (same chat)',
-                `${jobLabel}: switching ${prevMod} -> ${nextMod} after repeated HTTP 500 internal error`,
-                'warn',
-              )
-              onLog?.(
-                'warn',
-                `${jobLabel}: switching model ${prevMod} -> ${nextMod} in same chat after HTTP 500 internal error`,
-              )
-              const swRes = await this.selectModelInRunSettings(page, nextMod, MODEL_FALLBACK_CHAIN)
-              if (swRes.selectedModelName) {
-                activeModelName = swRes.selectedModelName
-                this.activeModelName = activeModelName
-              }
-            }
-          }
-
-          const waitSec = internalErrorSameChatRetries * 5
-          this.logStep(
-            `internal error -> same-chat Rerun (${internalErrorSameChatRetries}/2)`,
-            `${jobLabel} [${activeModelName}] (${reasonDetail.slice(0, 100)}) — waiting ${waitSec}s without reloading so attached videos stay intact`,
-            'warn',
-          )
-          onLog?.(
-            'warn',
-            `${jobLabel}: HTTP 500 internal error — retrying Rerun/Run in same chat (${internalErrorSameChatRetries}/2) after ${waitSec}s [${activeModelName}]`,
-          )
-          await new Promise((r) => setTimeout(r, waitSec * 1000))
-          await this.closeModelSelectionPanelIfOpen(page)
-          await this.markPageErrorBannersHandled(page)
-
-          // Respect Run stagger gate so parallel workers never collide on retry
-          const retryStaggerSec = parallelMode
-            ? Math.max(20, userCfg.studioRunStaggerSec || DEFAULT_STUDIO_RUN_STAGGER_SEC)
-            : userCfg.studioRunStaggerSec ?? DEFAULT_STUDIO_RUN_STAGGER_SEC
-          globalStudioRunStaggerGate.setStaggerMs(retryStaggerSec * 1000)
-          await globalStudioRunStaggerGate.acquireRunSlot(jobLabel, {
-            isAborted: () => this.isStopping(scope),
-          })
-
-          // Refresh preRunTurnSnap so the failed turn on page doesn't re-trigger immediately
-          const updatedTurnSnap = await page
-            .evaluate((turnSels) => {
-              for (const sel of turnSels) {
-                if (sel.includes(':has-text(')) continue
-                try {
-                  const found = Array.from(document.querySelectorAll(sel))
-                  if (found.length > 0) return found.length
-                } catch {
-                  /* ignore */
-                }
-              }
-              return 0
-            }, [...STUDIO_SELECTORS.modelTurnContainers])
-            .catch(() => preRunTurnSnap.count)
-          preRunTurnSnap.count = updatedTurnSnap
-          preRunTurnSnap.lastHadInternalError = true
-
-          capturedRunError = null
-          capturedFinishReason = null
-          internalErrorDetected = false
-          transientBannerReason = null
-          runStarted = Date.now()
-          stopEverSeen = false
-          stopGoneConsecutivePolls = 0
-          stableSeconds = 0
-          lastCandidateText = ''
-
-          const rerunBtnNow = await findFirstVisibleLocator(
-            page,
-            [
-              'button[aria-label*="Rerun" i]',
-              'button[mattooltip*="Rerun" i]',
-              'ms-chat-turn button:has-text("Rerun")',
-            ],
-            2000,
-          )
-          if (rerunBtnNow && (await rerunBtnNow.isEnabled().catch(() => false))) {
-            await rerunBtnNow.click().catch(() => {})
-            globalStudioRunStaggerGate.recordRunPressed()
-            this.logStep('re-press Rerun (same chat)', `${jobLabel} [${activeModelName}]`, 'info')
-            return true
-          }
-
-          const runBtnNow = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 2000)
-          if (runBtnNow && (await runBtnNow.isEnabled().catch(() => false))) {
-            await runBtnNow.click().catch(() => {})
-            globalStudioRunStaggerGate.recordRunPressed()
-            this.logStep('re-press Run (same chat)', `${jobLabel} [${activeModelName}]`, 'info')
-            return true
-          }
-
-          return false
-        }
-
         try {
           // Ensure Model selection panel is closed before clicking Run
           await this.closeModelSelectionPanelIfOpen(page)
@@ -6402,7 +6219,7 @@ export class StudioBrowserController {
 
           await this.closeModelSelectionPanelIfOpen(page)
 
-          // (e) Press Run (or Rerun if on same page after hard refresh and Run button is disabled while Rerun is visible)
+          // (e) Press Run
           const runBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 4000)
           const runBtnEnabled = runBtn ? await runBtn.isEnabled().catch(() => false) : false
           if (runBtn && runBtnEnabled) {
@@ -6478,21 +6295,16 @@ export class StudioBrowserController {
 
               permissionDeniedRetries += 1
 
-              // Model fallback: advance to next non-exhausted model in MODEL_FALLBACK_CHAIN without marking quota state
+              // Model fallback: advance to next unleased non-exhausted model in MODEL_FALLBACK_CHAIN
               const prevModel = activeModelName
-              const quotaSnap = await loadStudioModelQuotaState()
-              const nonExhaustedChain = MODEL_FALLBACK_CHAIN.filter(
-                (m) => !quotaSnap.exhausted[canonicalizeStudioModelName(m)],
-              )
-              const chainToCycle =
-                nonExhaustedChain.length > 0 ? nonExhaustedChain : MODEL_FALLBACK_CHAIN
-              const curIdxInCycle = chainToCycle.findIndex(
-                (m) => m.toLowerCase() === prevModel.toLowerCase(),
-              )
               const nextModelInCycle =
-                curIdxInCycle >= 0 && curIdxInCycle + 1 < chainToCycle.length
-                  ? chainToCycle[curIdxInCycle + 1]
-                  : chainToCycle[(curIdxInCycle + 1) % chainToCycle.length]
+                (await getEffectiveModel(
+                  chosenModel,
+                  MODEL_FALLBACK_CHAIN,
+                  Date.now(),
+                  this.profileDirName,
+                  [prevModel],
+                )) || prevModel
               activeModelName = nextModelInCycle
               activeModelIndex = Math.max(
                 0,
@@ -6524,9 +6336,8 @@ export class StudioBrowserController {
             const elapsed = Math.floor((Date.now() - runStarted) / 1000)
             const mm = String(Math.floor(elapsed / 60)).padStart(2, '0')
             const ss = String(elapsed % 60).padStart(2, '0')
-            this.logStep(`running ${mm}:${ss}`, `${jobLabel} [${activeModelName}]`)
 
-            // Error/quota/daily-limit alert banner detection + last model turn error detection
+            // Error/quota/daily-limit alert banner detection + last model turn error detection BEFORE logging "running"
             const errBannerText = await page.evaluate(
               ({ sels, turnSels }) => {
                 const strictRegex =
@@ -6593,7 +6404,7 @@ export class StudioBrowserController {
             const domQuotaExceeded =
               errBannerText !== null && this.isQuotaOrDailyLimitErrorText(errBannerText)
 
-            // Requirement 4 & 5: Quota / Daily Limit Exceeded -> mark the ACTUAL running UI model exhausted, switch model in Run Settings, continue/rerun
+            // Requirement 4 & 5: Quota / Daily Limit Exceeded -> mark the ACTUAL running UI model exhausted, switch to an unleased model in Run Settings, continue/rerun
             if (domQuotaExceeded || netQuotaExceeded) {
               const quotaDetail = errBannerText || capturedRunError?.body || 'HTTP 429 RESOURCE_EXHAUSTED'
               await cancelStuckStopButtonIfVisible()
@@ -6614,7 +6425,13 @@ export class StudioBrowserController {
                 await markModelExhausted(activeModelName)
               }
 
-              let nextAvailableModel = await getEffectiveModel(chosenModel, MODEL_FALLBACK_CHAIN)
+              let nextAvailableModel = await getEffectiveModel(
+                chosenModel,
+                MODEL_FALLBACK_CHAIN,
+                Date.now(),
+                this.profileDirName,
+                [exhaustedModel],
+              )
               if (!nextAvailableModel) {
                 const resetTimeStr = await formatQuotaResetTime()
                 const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`
@@ -6644,7 +6461,13 @@ export class StudioBrowserController {
               // mark the attempted fallback exhausted too and pick the next available model
               if (activeModelName.toLowerCase() === exhaustedModel.toLowerCase()) {
                 await markModelExhausted(nextAvailableModel)
-                nextAvailableModel = await getEffectiveModel(chosenModel, MODEL_FALLBACK_CHAIN)
+                nextAvailableModel = await getEffectiveModel(
+                  chosenModel,
+                  MODEL_FALLBACK_CHAIN,
+                  Date.now(),
+                  this.profileDirName,
+                  [exhaustedModel, nextAvailableModel],
+                )
                 if (!nextAvailableModel) {
                   const resetTimeStr = await formatQuotaResetTime()
                   const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`
@@ -6677,45 +6500,7 @@ export class StudioBrowserController {
                 break
               }
 
-              // No partial HISSA 1 output yet -> try re-pressing Run or Rerun in the SAME chat
-              capturedRunError = null
-              capturedFinishReason = null
-              runStarted = Date.now()
-              stopEverSeen = false
-              stopGoneConsecutivePolls = 0
-              stableSeconds = 0
-              lastCandidateText = ''
-
-              const retryRunBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 2000)
-              const retryRunBtnEnabled = retryRunBtn
-                ? await retryRunBtn.isEnabled().catch(() => false)
-                : false
-              if (retryRunBtn && retryRunBtnEnabled) {
-                await retryRunBtn.click().catch(() => {})
-                this.logStep('re-press Run (same chat)', `${jobLabel} [${activeModelName}]`, 'info')
-                continue
-              }
-
-              const retryRerunBtn = await findFirstVisibleLocator(
-                page,
-                [
-                  'button[aria-label*="Rerun" i]',
-                  'button[mattooltip*="Rerun" i]',
-                  'ms-chat-turn button:has-text("Rerun")',
-                ],
-                2000,
-              )
-              const retryRerunEnabled = retryRerunBtn
-                ? await retryRerunBtn.isEnabled().catch(() => false)
-                : false
-              if (retryRerunBtn && retryRerunEnabled) {
-                await retryRerunBtn.click().catch(() => {})
-                this.logStep('re-press Rerun (same chat)', `${jobLabel} [${activeModelName}]`, 'info')
-                continue
-              }
-
-              // Neither Run nor Rerun is enabled and there is no partial HISSA 1 output:
-              // retry the window cleanly with the newly switched model in a fresh chat
+              // Retry the window cleanly with the newly switched model in a fresh chat
               quotaSwitchRetryNewChat = true
               break
             }
@@ -6751,9 +6536,6 @@ export class StudioBrowserController {
                   errBannerText,
                 )
               ) {
-                if (await trySameChatInternalErrorRerun(`${errBannerText}${netDetail}`)) {
-                  continue
-                }
                 internalErrorDetected = true
                 transientBannerReason = `internal_error:${errBannerText.slice(0, 80)}`
                 break
@@ -6773,7 +6555,7 @@ export class StudioBrowserController {
                 throw new Error('POLICY_BLOCKED: Gemini prohibited content')
               }
 
-              // Requirement 6: Also check the last model turn text + network 500/INTERNAL for "An internal error has occurred" / "Internal error encountered"
+              // Check the last model turn text + network 500/INTERNAL for "An internal error has occurred" / "Internal error encountered"
               const turnInternalError = await page
                 .evaluate(
                   ({ turnSels, preCount, preHadErr, stopSeen, elapsedSec }) => {
@@ -6790,8 +6572,6 @@ export class StudioBrowserController {
                         // ignore
                       }
                     }
-                    // If a previous turn on the same page already had an internal error before we pressed Run,
-                    // wait until a new turn is added or generation has started & finished (or >= 8s elapsed)
                     if (preHadErr && turns.length <= preCount && !stopSeen && elapsedSec < 8) {
                       return null
                     }
@@ -6838,15 +6618,42 @@ export class StudioBrowserController {
                   capturedRunError?.body ||
                   'HTTP 500 INTERNAL'
                 ).slice(0, 120)
-                if (await trySameChatInternalErrorRerun(ieReason)) {
-                  continue
-                }
+                this.logStep(
+                  'internal error detected',
+                  `${jobLabel} [${activeModelName}] (${ieReason}) -> hard refresh + new page`,
+                  'warn',
+                )
+                onLog?.(
+                  'warn',
+                  `${jobLabel}: internal error detected (${ieReason}) -> hard refresh + new page`,
+                )
                 internalErrorDetected = true
                 transientBannerReason = `internal_error:${ieReason.slice(0, 80)}`
                 break
               }
 
               const candidateText = await this.extractFinalAnswerWithoutThoughts(page)
+
+              // Fake-Running Detector: if >= 20s have elapsed since pressing Run and AI Studio has shown
+              // no Stop button, no thinking/running spinner, no in-flight GenerateContent request, and no output text,
+              // then nothing is actually running -> break immediately to Hard Refresh + New Page!
+              if (
+                elapsed >= 20 &&
+                !stopEverSeen &&
+                !stopVisible &&
+                !spinnerVisible &&
+                genContentInFlight === 0 &&
+                !candidateText.trim()
+              ) {
+                const fakeMsg = `No generation activity after ${elapsed}s (stopEverSeen=false, spinner=false, inFlight=0) -> hard refresh + new page`
+                this.logStep('fake running detected', `${jobLabel} [${activeModelName}]: ${fakeMsg}`, 'warn')
+                onLog?.('warn', `${jobLabel}: fake running detected (${fakeMsg})`)
+                internalErrorDetected = true
+                transientBannerReason = 'internal_error:fake_running_no_generation'
+                break
+              }
+
+              this.logStep(`running ${mm}:${ss}`, `${jobLabel} [${activeModelName}]`)
 
               if (!hissa2FirstSeenLogged && /HISSA\s*2\b/i.test(candidateText)) {
                 hissa2FirstSeenLogged = true
@@ -6934,6 +6741,8 @@ export class StudioBrowserController {
                 incompleteAfterAbStartedAt = null
                 lastIncompleteLogAt = 0
               }
+            } else {
+              this.logStep(`running ${mm}:${ss}`, `${jobLabel} [${activeModelName}]`)
             }
 
             await new Promise((r) => setTimeout(r, 1000))
@@ -7221,7 +7030,13 @@ export class StudioBrowserController {
                     const uiCardNow = await this.readVisibleModelCardText(page)
                     const exhaustedMod = uiCardNow ? canonicalizeStudioModelName(uiCardNow) : activeModelName
                     await markModelExhausted(exhaustedMod)
-                    const nextMod = await getEffectiveModel(chosenModel, MODEL_FALLBACK_CHAIN)
+                    const nextMod = await getEffectiveModel(
+                      chosenModel,
+                      MODEL_FALLBACK_CHAIN,
+                      Date.now(),
+                      this.profileDirName,
+                      [exhaustedMod],
+                    )
                     if (!nextMod) {
                       const resetTimeStr = await formatQuotaResetTime()
                       const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`
@@ -7255,89 +7070,59 @@ export class StudioBrowserController {
           }
         }
 
-        // Requirement 6: "An internal error has occurred" / "Internal error encountered" / CONTINUE_TURN_ERROR handling:
-        // Escalation order:
-        // - 1st and 2nd time (refresh 1/3, 2/3): REAL Chrome hard refresh on the SAME page via CDP (Page.reload ignoreCache=true), verify state, re-press Run
-        // - 3rd time (refresh 3/3): Browser restart (persistent profile relaunch, cookies & origin storage preserved)
-        // - After 3rd time (last resort): New chat (retry same window)
+        // Requirement: When an internal error occurs (or fake running is detected), do NOT stay on the broken chat page.
+        // Switch to an unleased available model, perform Hard Refresh + New Page (prompts/new_chat), Save Cookies, and retry cleanly!
         if (internalErrorDetected && !rawAnswer) {
           await cancelStuckStopButtonIfVisible()
+          const prevMod = activeModelName
+          const nextMod =
+            (await getEffectiveModel(
+              chosenModel,
+              MODEL_FALLBACK_CHAIN,
+              Date.now(),
+              this.profileDirName,
+              [prevMod],
+            )) || prevMod
+          if (nextMod.toLowerCase() !== prevMod.toLowerCase()) {
+            this.logStep(
+              'internal error -> switch model',
+              `${jobLabel}: switching ${prevMod} -> ${nextMod} before hard refresh + new page`,
+              'warn',
+            )
+            onLog?.(
+              'warn',
+              `${jobLabel}: switching model ${prevMod} -> ${nextMod} after internal error`,
+            )
+            activeModelName = nextMod
+            this.activeModelName = activeModelName
+          }
 
-          if (!internalErrorContinueTriedInChat) {
-            internalErrorContinueTriedInChat = true
-            const partialBeforeErr = await this.extractFinalAnswerWithoutThoughts(page)
-            const hasValidPartialBeforeErr =
-              Boolean(
-                partialBeforeErr &&
-                  /\bHISSA\s*1\b/i.test(partialBeforeErr) &&
-                  !/^(?:an\s+internal\s+error|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i.test(
-                    partialBeforeErr.trim(),
-                  ),
-              )
-
-            if (hasValidPartialBeforeErr) {
+          if (internalErrorRefreshes < MAX_INTERNAL_ERROR_REFRESH) {
+            internalErrorRefreshes += 1
+            await this.saveRotatedSessionFromContext(username)
+            if (internalErrorRefreshes <= 2) {
+              const refreshLog = `internal error -> hard refresh + new page (${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
               this.logStep(
-                'internal error -> Continue (1/1)',
+                refreshLog,
                 `${jobLabel} [${activeModelName}] (${transientBannerReason || 'internal error'})`,
                 'warn',
               )
-              onLog?.('warn', `${jobLabel}: internal error -> Continue (1/1) in same chat`)
-
-              try {
-                const contAfterErr = await this.sendContinueFollowUpAndFetch(page, {
-                  jobLabel,
-                  activeModelName,
-                  continueAttempt: 1,
-                  scope,
-                  onLog,
-                })
-                if (contAfterErr && contAfterErr.trim()) {
-                  accumulatedUnshiftedText = stitchContinuedStudioAnswer(partialBeforeErr, contAfterErr)
-                  shiftValidateAndCheckCoverage(accumulatedUnshiftedText)
-                }
-              } catch (ieContErr) {
-                const ieMsg = ieContErr instanceof Error ? ieContErr.message : String(ieContErr)
-                if (ieMsg.startsWith('POLICY_BLOCKED:') || ieMsg.startsWith('STOPPED')) {
-                  throw ieContErr
-                }
-                this.logStep(
-                  'internal error Continue failed',
-                  `${jobLabel}: ${ieMsg.slice(0, 140)}`,
-                  'warn',
-                )
-              }
-            }
-          }
-
-          if (!rawAnswer) {
-            await cancelStuckStopButtonIfVisible()
-            if (internalErrorRefreshes < MAX_INTERNAL_ERROR_REFRESH) {
-              internalErrorRefreshes += 1
-              await this.saveRotatedSessionFromContext(username)
-              if (internalErrorRefreshes <= 2) {
-                const refreshLog = `internal error -> REAL hard refresh (${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
-                this.logStep(
-                  refreshLog,
-                  `${jobLabel} [${activeModelName}] (same page CDP Page.reload ignoreCache)`,
-                  'warn',
-                )
-                onLog?.('warn', `${jobLabel}: ${refreshLog} (same page CDP Page.reload ignoreCache)`)
-                pendingInternalErrorAction = 'same_page_hard_refresh'
-              } else {
-                const restartLog = `internal error -> browser restart (${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
-                this.logStep(
-                  restartLog,
-                  `${jobLabel} [${activeModelName}] (persistent profile relaunch)`,
-                  'warn',
-                )
-                onLog?.('warn', `${jobLabel}: ${restartLog} (persistent profile relaunch)`)
-                pendingInternalErrorAction = 'browser_restart'
-              }
-              attempt -= 1
-              continue
+              onLog?.('warn', `${jobLabel}: ${refreshLog} [${activeModelName}]`)
+              pendingInternalErrorAction = 'hard_refresh_new_page'
             } else {
-              pendingInternalErrorAction = 'last_resort_new_chat'
+              const restartLog = `internal error -> browser restart + new page (${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
+              this.logStep(
+                restartLog,
+                `${jobLabel} [${activeModelName}] (persistent profile relaunch)`,
+                'warn',
+              )
+              onLog?.('warn', `${jobLabel}: ${restartLog} (persistent profile relaunch)`)
+              pendingInternalErrorAction = 'browser_restart'
             }
+            attempt -= 1
+            continue
+          } else {
+            pendingInternalErrorAction = 'last_resort_new_chat'
           }
         }
 
@@ -7627,6 +7412,9 @@ export class StudioBrowserController {
     }
 
     throw new Error(`Studio job ${jobLabel} failed after ${MAX_ATTEMPTS} attempts`)
+    } finally {
+      releaseExclusiveStudioModel(this.profileDirName)
+    }
   }
 
   /**

@@ -18,7 +18,6 @@ import type { StudioThinkingLevel } from '@/lib/studio-model-state'
 const STUDIO_MODEL_DROPDOWN_OPTIONS = [
   'Argon',
   'Gemini 3.8 Flash',
-  'Gemini 3.7 Flash',
   'Gemini 3.6 Flash',
 ] as const
 
@@ -32,7 +31,9 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
   const [thinkingLevel, setThinkingLevel] = useState<StudioThinkingLevel>(
     studio?.studioThinkingLevel ?? 'high',
   )
-  const [maxOutputTokens, setMaxOutputTokens] = useState(studio?.studioMaxOutputTokens ?? 65536)
+  const [maxOutputTokens, setMaxOutputTokens] = useState(
+    studio?.studioMaxOutputTokens ?? (/argon/i.test(studio?.studioModelName ?? 'Argon') ? 1_000_000 : 65536),
+  )
   const [maxInputTokensStr, setMaxInputTokensStr] = useState<string>(
     studio?.studioMaxInputTokens ? String(studio.studioMaxInputTokens) : '',
   )
@@ -75,9 +76,12 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
 
   useEffect(() => {
     if (!studio) return
-    setModelName(studio.studioModelName || 'Argon')
+    const nextModel = studio.studioModelName || 'Argon'
+    setModelName(nextModel)
     setThinkingLevel(studio.studioThinkingLevel || 'high')
-    setMaxOutputTokens(studio.studioMaxOutputTokens)
+    setMaxOutputTokens(
+      /argon/i.test(nextModel) ? 1_000_000 : studio.studioMaxOutputTokens || 65536,
+    )
     setMaxInputTokensStr(studio.studioMaxInputTokens ? String(studio.studioMaxInputTokens) : '')
     setPageRecycleInterval(studio.studioPageRecycleInterval ?? 5)
     setWindowMinutes(studio.studioWindowMinutes)
@@ -124,6 +128,7 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
       trimmedMaxInput === '' || trimmedMaxInput.toLowerCase() === 'auto'
         ? null
         : Number(trimmedMaxInput)
+    const effectiveOut = /argon/i.test(modelName) ? 1_000_000 : Number(maxOutputTokens) || 65536
     const res = await fetch('/api/settings', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -131,7 +136,7 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
         studio: {
           studioModelName: modelName,
           studioThinkingLevel: thinkingLevel,
-          studioMaxOutputTokens: Number(maxOutputTokens),
+          studioMaxOutputTokens: effectiveOut,
           studioMaxInputTokens:
             parsedMaxInput !== null && Number.isFinite(parsedMaxInput) && parsedMaxInput > 0
               ? Math.floor(parsedMaxInput)
@@ -490,7 +495,7 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
             <label className="space-y-1 text-xs">
-              <span className="text-muted-foreground">Model (AI Studio picker)</span>
+              <span className="text-muted-foreground">Model (1 window = 1 model)</span>
               <select
                 value={
                   STUDIO_MODEL_DROPDOWN_OPTIONS.includes(
@@ -499,7 +504,15 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
                     ? modelName
                     : 'Argon'
                 }
-                onChange={(e) => setModelName(e.target.value)}
+                onChange={(e) => {
+                  const next = e.target.value
+                  setModelName(next)
+                  if (/argon/i.test(next)) {
+                    setMaxOutputTokens(1_000_000)
+                  } else if (maxOutputTokens > 65536) {
+                    setMaxOutputTokens(65536)
+                  }
+                }}
                 className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring"
               >
                 {STUDIO_MODEL_DROPDOWN_OPTIONS.map((opt) => (
@@ -557,13 +570,15 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
               )}
 
             <label className="space-y-1 text-xs">
-              <span className="text-muted-foreground">Max output tokens</span>
+              <span className="text-muted-foreground">
+                Max output tokens ({/argon/i.test(modelName) ? 'Argon = 1000000' : 'Flash = 65536'})
+              </span>
               <input
                 type="number"
                 min={1024}
-                max={65536}
+                max={1000000}
                 step={1024}
-                value={maxOutputTokens}
+                value={/argon/i.test(modelName) ? 1000000 : maxOutputTokens}
                 onChange={(e) => setMaxOutputTokens(Number(e.target.value))}
                 className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring"
               />
@@ -571,13 +586,13 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
 
             <label className="space-y-1 text-xs">
               <span className="text-muted-foreground">
-                Max input tokens (auto = {(1_048_576 - (Number(maxOutputTokens) || 65536) - 5_000).toLocaleString()})
+                Max input tokens (auto = {(1_048_576 - Math.min(65536, Number(maxOutputTokens) || 65536) - 5_000).toLocaleString()})
               </span>
               <input
                 type="text"
                 value={maxInputTokensStr}
                 onChange={(e) => setMaxInputTokensStr(e.target.value)}
-                placeholder={`auto (${1_048_576 - (Number(maxOutputTokens) || 65536) - 5_000})`}
+                placeholder={`auto (${1_048_576 - Math.min(65536, Number(maxOutputTokens) || 65536) - 5_000})`}
                 className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring"
               />
             </label>

@@ -1481,7 +1481,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
           <RotateCcw className="size-3.5" aria-hidden /> Restart
         </button>
 
-        {/* Retry / Rescan Button with Model Selection (3.6, 3.7, 3.8) */}
+        {/* Retry / Rescan Button with Model Selection (3.6, 3.8) */}
         <div className="relative">
           <button
             type="button"
@@ -1491,7 +1491,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
             }}
             disabled={isCurrentRescanning}
             className="flex items-center gap-1.5 rounded-md border border-indigo-500/50 bg-indigo-500/10 px-3.5 py-2 text-xs font-semibold text-indigo-300 hover:bg-indigo-500/20 active:scale-95 transition-all disabled:opacity-50 cursor-pointer"
-            title="Rescan this scene with Gemini Models (3.6, 3.7, 3.8) & 4x auto-retry. Runs in background so you can continue reviewing!"
+            title="Rescan this scene with Gemini Models (3.6, 3.8) & 4x auto-retry. Runs in background so you can continue reviewing!"
           >
             {isCurrentRescanning ? (
               <Loader2 className="size-3.5 animate-spin text-indigo-400" aria-hidden />
@@ -1521,17 +1521,6 @@ export function ComparePanel({ scan }: { scan: Scan }) {
                   ✕
                 </button>
               </div>
-              <button
-                type="button"
-                onClick={() => void handleRescanScene('gemini-3.7-flash')}
-                className="w-full flex items-center justify-between rounded px-2 py-1.5 text-xs text-foreground hover:bg-indigo-500/20 hover:text-indigo-300 transition-colors text-left cursor-pointer"
-              >
-                <div className="flex items-center gap-1.5">
-                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>
-                  <span className="font-medium">Gemini 3.7 Flash</span>
-                </div>
-                <span className="text-[10px] text-muted-foreground">High Precision</span>
-              </button>
               <button
                 type="button"
                 onClick={() => void handleRescanScene('gemini-3.8-flash')}
@@ -1564,7 +1553,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
                   <span className="h-1.5 w-1.5 rounded-full bg-primary"></span>
                   <span className="font-medium">Auto (First Free)</span>
                 </div>
-                <span className="text-[10px] text-muted-foreground">3.6 / 3.7 / 3.8</span>
+                <span className="text-[10px] text-muted-foreground">3.6 / 3.8</span>
               </button>
             </div>
           )}

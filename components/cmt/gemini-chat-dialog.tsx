@@ -127,8 +127,8 @@ export function GeminiChatDialog({ open, onClose }: GeminiChatDialogProps) {
   const [panes, setPanes] = useState<ChatPaneState[]>([
     {
       id: 'pane-1',
-      title: 'Chat 1 (3.7-Flash)',
-      selectedModel: 'gemini-3.7-flash',
+      title: 'Chat 1 (3.6-Flash)',
+      selectedModel: 'gemini-3.6-flash',
       keySelection: 'auto',
       messages: [],
       inputPrompt: '',
@@ -221,7 +221,7 @@ export function GeminiChatDialog({ open, onClose }: GeminiChatDialogProps) {
 
   function addParallelPane() {
     const nextIdx = panes.length + 1
-    const modelOptions = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.7-flash', 'gemini-3.8-flash']
+    const modelOptions = ['gemini-3.6-flash', 'gemini-3.8-flash', 'gemini-3.5-flash']
     const nextModel = modelOptions[(nextIdx - 1) % modelOptions.length]
     const slotString = String(Math.min(nextIdx, (keysData?.slots?.length || 1)))
     const newPane: ChatPaneState = {

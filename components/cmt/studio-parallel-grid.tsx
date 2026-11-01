@@ -183,8 +183,8 @@ function logLevelBadgeStyle(level: ParallelLogLevel): string {
 }
 
 function shortModelBadge(modelName: string): string {
+  if (/argon/i.test(modelName)) return 'Argon'
   if (/3\.8/i.test(modelName)) return '3.8 Flash'
-  if (/3\.7/i.test(modelName)) return '3.7 Flash'
   if (/3\.6/i.test(modelName)) return '3.6 Flash'
   return modelName || '3.8 Flash'
 }

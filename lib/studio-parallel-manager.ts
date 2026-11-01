@@ -44,6 +44,8 @@ import {
 import {
   DEFAULT_STUDIO_MODEL_NAME,
   getEffectiveModel,
+  releaseExclusiveStudioModel,
+  resolveEffectiveMaxOutputTokensForModel,
 } from './studio-model-state'
 import {
   ensureScanChunkTicket,
@@ -3149,7 +3151,12 @@ export class StudioParallelManager {
 
     try {
       const effectiveWinModel =
-        (await getEffectiveModel(cfg.studioModelName)) ||
+        (await getEffectiveModel(
+          cfg.studioModelName,
+          undefined,
+          Date.now(),
+          slot.profileDirName,
+        )) ||
         cfg.studioModelName ||
         DEFAULT_STUDIO_MODEL_NAME
       win.modelName = effectiveWinModel
@@ -3158,9 +3165,12 @@ export class StudioParallelManager {
         username: this.username || 'admin',
         scanId: jobScanScope,
         jobLabel,
-        modelName: cfg.studioModelName || DEFAULT_STUDIO_MODEL_NAME,
+        modelName: effectiveWinModel,
         thinkingLevel: cfg.studioThinkingLevel,
-        maxOutputTokens: cfg.studioMaxOutputTokens || 65536,
+        maxOutputTokens: resolveEffectiveMaxOutputTokensForModel(
+          effectiveWinModel,
+          cfg.studioMaxOutputTokens,
+        ),
         maxInputTokens: cfg.studioMaxInputTokens,
         pageRecycleInterval: cfg.studioPageRecycleInterval || 5,
         shortDriveFileName: null,
@@ -3366,6 +3376,7 @@ export class StudioParallelManager {
         }
         this.windowClipPromises.delete(win.id)
       }
+      releaseExclusiveStudioModel(slot.profileDirName)
       ctrl.setStepLogListener(undefined)
       ctrl.setScanContextTag('')
       // Ensure this worker's Chrome is closed on DONE/PROHIBITED/FAILED/STOPPED unless user enabled Login Assist on it

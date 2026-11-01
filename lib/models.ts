@@ -9,13 +9,10 @@ export interface ModelSpec {
   rpd: number
 }
 
-/** CHUNK-MAP models (locked): gemini-3.6-flash, gemini-3.7-flash, and
- * gemini-3.8-flash are allowed to run chunk-time mapping requests. Every other
- * model is BANNED from this phase. All API keys run all three models in
- * parallel on the shared chunk queue. */
+/** CHUNK-MAP models (locked): gemini-3.6-flash and
+ * gemini-3.8-flash are allowed to run chunk-time mapping requests. */
 export const CHUNK_MODEL_POOL: ModelSpec[] = [
   { id: 'gemini-3.6-flash', rpm: 5, rpd: 20 },
-  { id: 'gemini-3.7-flash', rpm: 5, rpd: 20 },
   { id: 'gemini-3.8-flash', rpm: 5, rpd: 20 },
 ]
 
@@ -23,7 +20,7 @@ export const CHUNK_MODEL_POOL: ModelSpec[] = [
  * MatchTool Chunk Scan Orchestrator Model Specs
  */
 export const ORCHESTRATOR_PRIMARY_MODEL = 'gemini-3.6-flash'
-export const ORCHESTRATOR_SECONDARY_MODEL = 'gemini-3.7-flash'
+export const ORCHESTRATOR_SECONDARY_MODEL = 'gemini-3.8-flash'
 export const ORCHESTRATOR_TERTIARY_MODEL = 'gemini-3.8-flash'
 export const ORCHESTRATOR_CANARY_MODEL = 'gemini-3.5-flash'
 
@@ -75,7 +72,6 @@ export interface GapFinderModelOption {
 }
 
 export const GAP_FINDER_AVAILABLE_MODELS: GapFinderModelOption[] = [
-  { id: 'gemini-3.7-flash', name: '3.7-shiva', rpd: 20, rpm: 5, description: 'Fast, balanced high-accuracy forensic', recommended: true },
   { id: 'gemini-3.8-flash', name: '3.8-shiva', rpd: 20, rpm: 5, description: 'Deep forensic multi-frame analysis', recommended: true },
   { id: 'gemini-3.6-flash', name: '3.6-shiva', rpd: 20, rpm: 5, description: 'Robust baseline scene comparison', recommended: true },
   { id: 'gemini-3.5-flash', name: '3.5-shiva', rpd: 20, rpm: 5, description: 'Precision chunk matcher', recommended: false },

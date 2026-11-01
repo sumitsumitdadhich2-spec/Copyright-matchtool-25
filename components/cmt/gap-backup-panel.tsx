@@ -212,7 +212,6 @@ export function GapBackupPanel({ scan }: { scan: Scan }) {
   const [error, setError] = useState<string | null>(null)
   const [showModelPicker, setShowModelPicker] = useState(false)
   const [selectedModels, setSelectedModels] = useState<string[]>(() => [
-    'gemini-3.7-flash',
     'gemini-3.8-flash',
     'gemini-3.6-flash',
   ])
@@ -331,7 +330,7 @@ export function GapBackupPanel({ scan }: { scan: Scan }) {
   }
 
   const resetDefaultModels = () => {
-    setSelectedModels(['gemini-3.7-flash', 'gemini-3.8-flash', 'gemini-3.6-flash'])
+    setSelectedModels(['gemini-3.8-flash', 'gemini-3.6-flash'])
   }
 
   const chosenGaps = allAvailableGaps.filter((g) => selectedGapKeys.includes(g.key))
@@ -551,7 +550,7 @@ export function GapBackupPanel({ scan }: { scan: Scan }) {
                 onClick={resetDefaultModels}
                 className="text-muted-foreground hover:underline"
               >
-                Reset Default (3.7, 3.8, 3.6)
+                Reset Default (3.8, 3.6)
               </button>
             </div>
           </div>

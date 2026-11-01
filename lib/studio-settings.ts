@@ -1,11 +1,14 @@
 import crypto from 'crypto'
 import { readJSONRecord, writeJSONRecord } from './json-record'
 import {
+  ARGON_MAX_OUTPUT_TOKENS,
+  canonicalizeStudioModelName,
   DEFAULT_STUDIO_MODEL_NAME,
   DEFAULT_STUDIO_THINKING_LEVEL,
   getEffectiveModel,
   loadStudioModelQuotaState,
   normalizeStudioThinkingLevel,
+  resolveEffectiveMaxOutputTokensForModel,
   type StudioThinkingLevel,
 } from './studio-model-state'
 import type { ChunkScanEngine } from './types'
@@ -113,7 +116,7 @@ export const STUDIO_SAFETY_MARGIN_TOKENS = 5_000
 
 /**
  * Compute the input token shrink threshold:
- * Default (auto): 1_048_576 - maxOutputTokens - 5_000 (with maxOutputTokens = 65_536 this is 978_040).
+ * Default (auto): 1_048_576 - 65_536 - 5_000 = 978_040 (even when Argon output length is set to 1_000_000).
  * If user sets a custom studioMaxInputTokens > 0, use that override.
  */
 export function computeEffectiveMaxInputTokens(
@@ -141,7 +144,7 @@ export const DEFAULT_STUDIO_CONFIG: StudioUserConfig = {
   chunkScanEngine: 'studio',
   studioModelName: DEFAULT_STUDIO_MODEL_NAME,
   studioThinkingLevel: DEFAULT_STUDIO_THINKING_LEVEL,
-  studioMaxOutputTokens: 65536,
+  studioMaxOutputTokens: ARGON_MAX_OUTPUT_TOKENS,
   studioMaxInputTokens: null,
   studioPageRecycleInterval: 5,
   studioWindowMinutes: 5,
@@ -195,9 +198,14 @@ function recordKey(username: string): string {
 
 export async function loadStudioUserConfig(username: string): Promise<StudioUserConfig> {
   const raw = await readJSONRecord<Partial<StudioUserConfig>>(recordKey(username))
-  const studioMaxOutputTokens = Math.max(
-    1024,
-    Math.min(65536, Number(raw?.studioMaxOutputTokens) || DEFAULT_STUDIO_CONFIG.studioMaxOutputTokens),
+  const rawModel = (raw?.studioModelName || '').trim()
+  const resolvedModelName =
+    !rawModel || rawModel === 'Gemini 2.5 Pro' || rawModel === 'Gemini 3.8 Pro'
+      ? DEFAULT_STUDIO_CONFIG.studioModelName
+      : canonicalizeStudioModelName(rawModel)
+  const studioMaxOutputTokens = resolveEffectiveMaxOutputTokensForModel(
+    resolvedModelName,
+    raw?.studioMaxOutputTokens,
   )
   const rawMaxInput = raw?.studioMaxInputTokens
   const studioMaxInputTokens =
@@ -209,11 +217,6 @@ export async function loadStudioUserConfig(username: string): Promise<StudioUser
     Math.min(100, Math.floor(Number(raw?.studioPageRecycleInterval) || DEFAULT_STUDIO_CONFIG.studioPageRecycleInterval)),
   )
 
-  const rawModel = (raw?.studioModelName || '').trim()
-  const resolvedModelName =
-    !rawModel || rawModel === 'Gemini 2.5 Pro' || rawModel === 'Gemini 3.8 Pro'
-      ? DEFAULT_STUDIO_CONFIG.studioModelName
-      : rawModel
   const studioThinkingLevel = normalizeStudioThinkingLevel(raw?.studioThinkingLevel)
 
   return {
@@ -267,9 +270,20 @@ export async function saveStudioUserConfig(
   patch: Partial<StudioUserConfig>,
 ): Promise<StudioUserConfig> {
   const current = await loadStudioUserConfig(username)
+  const nextModelName = patch.studioModelName
+    ? canonicalizeStudioModelName(patch.studioModelName)
+    : current.studioModelName
+  const nextMaxOut = resolveEffectiveMaxOutputTokensForModel(
+    nextModelName,
+    patch.studioMaxOutputTokens !== undefined
+      ? patch.studioMaxOutputTokens
+      : current.studioMaxOutputTokens,
+  )
   const next: StudioUserConfig = {
     ...current,
     ...patch,
+    studioModelName: nextModelName,
+    studioMaxOutputTokens: nextMaxOut,
     chunkScanEngine: 'studio',
     updatedAt: Date.now(),
   }

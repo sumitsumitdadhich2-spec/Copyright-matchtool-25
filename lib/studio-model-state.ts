@@ -3,13 +3,15 @@ import { readJSONRecord, writeJSONRecord } from './json-record'
 export const STUDIO_MODEL_OPTIONS = [
   'Argon',
   'Gemini 3.8 Flash',
-  'Gemini 3.7 Flash',
   'Gemini 3.6 Flash',
 ] as const
 
 export type StudioModelOption = (typeof STUDIO_MODEL_OPTIONS)[number]
 
 export const DEFAULT_STUDIO_MODEL_NAME: StudioModelOption = 'Argon'
+
+export const ARGON_MAX_OUTPUT_TOKENS = 1_000_000
+export const FLASH_DEFAULT_MAX_OUTPUT_TOKENS = 65_536
 
 export type StudioThinkingLevel = 'high' | 'medium' | 'low'
 
@@ -42,44 +44,66 @@ export function thinkingLevelToDisplayLabel(level?: StudioThinkingLevel | string
   return 'High'
 }
 
-export function canonicalizeStudioModelName(raw?: string | null): string {
+/**
+ * Strictly canonicalize to the 3 allowed models ONLY:
+ * - 'Argon'
+ * - 'Gemini 3.8 Flash'
+ * - 'Gemini 3.6 Flash'
+ * (3.7 is removed everywhere; any 3.7 or unknown model maps to 'Gemini 3.8 Flash' or 'Argon').
+ */
+export function canonicalizeStudioModelName(raw?: string | null): StudioModelOption {
   const trimmed = (raw || '').trim()
   if (!trimmed) return DEFAULT_STUDIO_MODEL_NAME
   if (/^argon$/i.test(trimmed) || /\bargon\b/i.test(trimmed)) return 'Argon'
-  if (/3\.8/.test(trimmed) && /flash/i.test(trimmed)) return 'Gemini 3.8 Flash'
-  if (/3\.7/.test(trimmed) && /flash/i.test(trimmed)) return 'Gemini 3.7 Flash'
-  if (/3\.6/.test(trimmed) && /flash/i.test(trimmed)) return 'Gemini 3.6 Flash'
-  return trimmed
+  if (/3\.8/.test(trimmed)) return 'Gemini 3.8 Flash'
+  if (/3\.6/.test(trimmed)) return 'Gemini 3.6 Flash'
+  if (/3\.7/.test(trimmed)) return 'Gemini 3.8 Flash'
+  return 'Gemini 3.8 Flash'
 }
 
 /**
- * Build the ordered fallback chain starting from the user's chosen model:
- * Argon -> Gemini 3.8 Flash -> Gemini 3.7 Flash -> Gemini 3.6 Flash
- * (e.g., if user chose "Gemini 3.8 Flash", returns ["Gemini 3.8 Flash", "Gemini 3.7 Flash", "Gemini 3.6 Flash"]).
+ * Whenever Argon is used, Output length (maxOutputTokens) MUST be 1,000,000 (1000000).
+ * For Gemini 3.8 Flash / Gemini 3.6 Flash, use 65,536 (or user setting <= 65,536).
  */
-export function buildStudioModelChain(chosenModel?: string | null): string[] {
+export function resolveEffectiveMaxOutputTokensForModel(
+  modelName?: string | null,
+  configuredMaxOutputTokens?: number | null,
+): number {
+  const canon = canonicalizeStudioModelName(modelName)
+  if (canon === 'Argon') {
+    return ARGON_MAX_OUTPUT_TOKENS
+  }
+  const num = Number(configuredMaxOutputTokens)
+  if (Number.isFinite(num) && num >= 1024 && num <= FLASH_DEFAULT_MAX_OUTPUT_TOKENS) {
+    return Math.floor(num)
+  }
+  return FLASH_DEFAULT_MAX_OUTPUT_TOKENS
+}
+
+/**
+ * Build the ordered fallback chain starting from the user's chosen model
+ * across the 3 allowed models: Argon, Gemini 3.8 Flash, Gemini 3.6 Flash.
+ */
+export function buildStudioModelChain(chosenModel?: string | null): StudioModelOption[] {
   const canonical = canonicalizeStudioModelName(chosenModel)
   const idx = STUDIO_MODEL_OPTIONS.findIndex(
     (opt) => opt.toLowerCase() === canonical.toLowerCase(),
   )
   if (idx >= 0) {
-    return STUDIO_MODEL_OPTIONS.slice(idx)
+    return [...STUDIO_MODEL_OPTIONS.slice(idx), ...STUDIO_MODEL_OPTIONS.slice(0, idx)]
   }
-  return [canonical, ...STUDIO_MODEL_OPTIONS]
+  return [...STUDIO_MODEL_OPTIONS]
 }
 
 /**
- * Build a complete fallback list starting with `buildStudioModelChain(chosenModel)`
- * and appending any remaining Flash models in `STUDIO_MODEL_OPTIONS` not yet in the chain,
- * so if the user chose "Gemini 3.6 Flash" or "Gemini 3.7 Flash" and it hits a daily limit
- * or is unavailable, the worker can still fall back to another non-exhausted Flash model.
+ * Build a complete fallback cycle across all 3 allowed models
+ * ('Argon', 'Gemini 3.8 Flash', 'Gemini 3.6 Flash') starting from `chosenModel`.
  */
-export function buildStudioFallbackCycle(chosenModel?: string | null): string[] {
+export function buildStudioFallbackCycle(chosenModel?: string | null): StudioModelOption[] {
   const primary = buildStudioModelChain(chosenModel)
   const seen = new Set(primary.map((m) => canonicalizeStudioModelName(m).toLowerCase()))
-  const full = [...primary]
+  const full: StudioModelOption[] = [...primary]
   for (const opt of STUDIO_MODEL_OPTIONS) {
-    if (opt === 'Argon') continue
     const key = opt.toLowerCase()
     if (!seen.has(key)) {
       seen.add(key)
@@ -87,6 +111,71 @@ export function buildStudioFallbackCycle(chosenModel?: string | null): string[] 
     }
   }
   return full
+}
+
+/**
+ * Global in-memory active window model lease registry to enforce:
+ * 1 Window = 1 Model across concurrent parallel windows.
+ * If Window A is running on 'Gemini 3.6 Flash', Window B will pick 'Gemini 3.8 Flash' or 'Argon'.
+ */
+const globalForActiveModelLeases = globalThis as unknown as {
+  __cmtActiveWindowModelLeases?: Map<string, StudioModelOption>
+}
+
+function getActiveModelLeaseMap(): Map<string, StudioModelOption> {
+  if (!globalForActiveModelLeases.__cmtActiveWindowModelLeases) {
+    globalForActiveModelLeases.__cmtActiveWindowModelLeases = new Map<string, StudioModelOption>()
+  }
+  return globalForActiveModelLeases.__cmtActiveWindowModelLeases
+}
+
+export function getActiveLeasedModelsByOtherHolders(excludeHolderKey?: string): Map<StudioModelOption, number> {
+  const map = getActiveModelLeaseMap()
+  const counts = new Map<StudioModelOption, number>()
+  for (const [holder, mod] of map.entries()) {
+    if (excludeHolderKey && holder === excludeHolderKey) continue
+    const canon = canonicalizeStudioModelName(mod)
+    counts.set(canon, (counts.get(canon) || 0) + 1)
+  }
+  return counts
+}
+
+export function updateExclusiveStudioModelLease(
+  holderKey: string,
+  modelName: string,
+): StudioModelOption {
+  const canon = canonicalizeStudioModelName(modelName)
+  if (holderKey) {
+    getActiveModelLeaseMap().set(holderKey, canon)
+  }
+  return canon
+}
+
+export function releaseExclusiveStudioModel(holderKey: string): void {
+  if (!holderKey) return
+  getActiveModelLeaseMap().delete(holderKey)
+}
+
+export function orderChainByUnleasedFirst(
+  holderKey: string | undefined,
+  chain: readonly string[],
+): StudioModelOption[] {
+  const normalizedChain: StudioModelOption[] = []
+  const seen = new Set<string>()
+  for (const raw of [...chain, ...STUDIO_MODEL_OPTIONS]) {
+    const canon = canonicalizeStudioModelName(raw)
+    if (!seen.has(canon.toLowerCase())) {
+      seen.add(canon.toLowerCase())
+      normalizedChain.push(canon)
+    }
+  }
+  const otherCounts = getActiveLeasedModelsByOtherHolders(holderKey)
+  return [...normalizedChain].sort((a, b) => {
+    const countA = otherCounts.get(a) || 0
+    const countB = otherCounts.get(b) || 0
+    if (countA !== countB) return countA - countB
+    return normalizedChain.indexOf(a) - normalizedChain.indexOf(b)
+  })
 }
 
 function getTzWallParts(
@@ -175,6 +264,10 @@ export async function loadStudioModelQuotaState(
   let changed = false
 
   for (const [modelKey, untilTs] of Object.entries(rawExhausted)) {
+    if (/3\.7/.test(modelKey)) {
+      changed = true
+      continue
+    }
     const numTs = Number(untilTs)
     if (Number.isFinite(numTs) && numTs > nowMs) {
       cleaned[canonicalizeStudioModelName(modelKey)] = numTs
@@ -238,27 +331,60 @@ export async function resetModelQuotaState(
 
 /**
  * Starting from `chosenModel`, return the first model in `chain` that is not exhausted
- * (or whose `untilTimestamp <= nowMs`). Automatically clears expired entries.
+ * (or whose `untilTimestamp <= nowMs`), prioritizing models NOT currently leased by
+ * another active window when `holderKey` is provided.
  * If all models in the chain are exhausted, returns `''` (empty string).
  */
 export async function getEffectiveModel(
   chosenModel?: string | null,
   chain?: string[],
   nowMs: number = Date.now(),
+  holderKey?: string,
+  excludeModels?: string[],
 ): Promise<string> {
   const state = await loadStudioModelQuotaState(nowMs)
-  const fullChain = chain && chain.length > 0 ? chain : buildStudioModelChain(chosenModel)
-  const startCanonical = canonicalizeStudioModelName(chosenModel || fullChain[0])
-  const startIdx = fullChain.findIndex(
+  const baseChain = chain && chain.length > 0 ? chain : buildStudioFallbackCycle(chosenModel)
+  const startCanonical = canonicalizeStudioModelName(chosenModel || baseChain[0])
+  const startIdx = baseChain.findIndex(
     (m) => canonicalizeStudioModelName(m).toLowerCase() === startCanonical.toLowerCase(),
   )
-  const candidateList = startIdx >= 0 ? fullChain.slice(startIdx) : fullChain
+  const rotatedChain =
+    startIdx >= 0
+      ? [...baseChain.slice(startIdx), ...baseChain.slice(0, startIdx)]
+      : [...baseChain]
 
-  for (const candidate of candidateList) {
+  const orderedCandidates = holderKey
+    ? orderChainByUnleasedFirst(holderKey, rotatedChain)
+    : rotatedChain.map((c) => canonicalizeStudioModelName(c))
+
+  const excludedSet = new Set(
+    (excludeModels || []).map((m) => canonicalizeStudioModelName(m).toLowerCase()),
+  )
+
+  // Pass 1: non-exhausted and not in excludedSet
+  for (const candidate of orderedCandidates) {
     const canon = canonicalizeStudioModelName(candidate)
+    if (excludedSet.has(canon.toLowerCase())) continue
     const untilTs = state.exhausted[canon]
     if (!untilTs || untilTs <= nowMs) {
+      if (holderKey) {
+        updateExclusiveStudioModelLease(holderKey, canon)
+      }
       return canon
+    }
+  }
+
+  // Pass 2: if excludedSet filtered out the only non-exhausted model(s), allow any non-exhausted model
+  if (excludedSet.size > 0) {
+    for (const candidate of orderedCandidates) {
+      const canon = canonicalizeStudioModelName(candidate)
+      const untilTs = state.exhausted[canon]
+      if (!untilTs || untilTs <= nowMs) {
+        if (holderKey) {
+          updateExclusiveStudioModelLease(holderKey, canon)
+        }
+        return canon
+      }
     }
   }
 
