@@ -981,6 +981,10 @@ export class StudioParallelManager {
   private usingOriginalMovieClips = false
   private clipCancelToken: CancelToken | null = null
   private windowClipPromises = new Map<string, Promise<WindowClipResult>>()
+  private windowYtUploadPromises = new Map<
+    string,
+    Promise<{ ytUrl: string; ytVideoId: string; reused: boolean } | null>
+  >()
   private startWindowClipTask?: (w: ParallelWindowState) => Promise<WindowClipResult>
   private clipsReady = 0
   private clipsTotal = 0
@@ -2116,21 +2120,32 @@ export class StudioParallelManager {
             })
             this.persistStateToDisk()
 
-            // Trigger background upload to YouTube Studio via globalYtStudioUploadGate
-            void (async () => {
-              if (this.stoppingAll || this.stoppedWindowIds.has(w.id)) return
+            // Trigger parallel upload to YouTube Studio via globalYtStudioUploadGate (no wait on processing modal)
+            if (!this.windowYtUploadPromises) {
+              this.windowYtUploadPromises = new Map()
+            }
+            const ytTaskPromise = (async (): Promise<{
+              ytUrl: string
+              ytVideoId: string
+              reused: boolean
+            } | null> => {
+              if (this.stoppingAll || this.stoppedWindowIds.has(w.id)) return null
               const existingYt = readClipYtSidecar(clipRes.clipPath)
-              if (existingYt?.ytUrl && !existingYt.ytDeleted) {
+              if (existingYt?.ytUrl && existingYt.ytVideoId && !existingYt.ytDeleted) {
                 if (w.status === 'QUEUED') {
                   w.stage = 'link ready'
                   w.summaryText = `YT link ready (${existingYt.ytUrl})`
                   this.persistStateToDisk()
                 }
-                return
+                return {
+                  ytUrl: existingYt.ytUrl,
+                  ytVideoId: existingYt.ytVideoId,
+                  reused: true,
+                }
               }
               const releaseYt = await globalYtStudioUploadGate.acquire()
               try {
-                if (this.stoppingAll || this.stoppedWindowIds.has(w.id)) return
+                if (this.stoppingAll || this.stoppedWindowIds.has(w.id)) return null
                 if (w.status === 'QUEUED') {
                   w.stage = 'uploading to YT'
                   w.summaryText = 'Uploading window clip to YouTube Studio...'
@@ -2159,10 +2174,11 @@ export class StudioParallelManager {
                   windowNumber: w.windowNumber,
                   windowRange: winRange,
                   level: 'INFO',
-                  step: ytRes.reused ? 'YT link reused' : 'YT link ready',
-                  message: `Window #${w.windowNumber} (${winRange}) YouTube link ready: ${ytRes.ytUrl}`,
+                  step: ytRes.reused ? 'YT link reused' : 'YT uploaded (popup closed)',
+                  message: `Window #${w.windowNumber} (${winRange}) uploaded to YouTube -> ${ytRes.ytUrl}`,
                 })
                 this.persistStateToDisk()
+                return ytRes
               } catch (ytErr: unknown) {
                 const ytMsg = ytErr instanceof Error ? ytErr.message : String(ytErr)
                 this.appendCombinedLog({
@@ -2174,10 +2190,13 @@ export class StudioParallelManager {
                   step: 'YT pre-upload warning',
                   message: `Window #${w.windowNumber} (${winRange}) background YT upload deferred to worker: ${ytMsg}`,
                 })
+                return null
               } finally {
                 releaseYt()
               }
             })()
+            ytTaskPromise.catch(() => null)
+            this.windowYtUploadPromises.set(w.id, ytTaskPromise)
 
             return clipRes
           } finally {
@@ -2215,6 +2234,7 @@ export class StudioParallelManager {
           this.clipCancelToken?.cancel()
           this.clipCancelToken = new CancelToken()
           this.windowClipPromises.clear()
+          if (this.windowYtUploadPromises) this.windowYtUploadPromises.clear()
           this.clipExtractWaitQueue = []
           this.clipExtractActiveCount = 0
           cleanStaleWindowClipPartials(this.scanId)
@@ -2783,6 +2803,104 @@ export class StudioParallelManager {
         }
       }
 
+      // 3. When using YouTube Studio window clips: wait for all window clips to finish parallel YT uploads
+      // (without waiting on individual "Video processing" popups) and then check the YouTube Studio Content
+      // page at the end to track progress, wait for SD processing ("Unlisted"), and confirm all links!
+      if (this.usingOriginalMovieClips && !this.stoppingAll) {
+        const pendingWins = this.windows.filter(
+          (w) =>
+            w.status === 'QUEUED' &&
+            !this.stoppedWindowIds.has(w.id),
+        )
+        if (pendingWins.length > 0) {
+          this.appendCombinedLog({
+            workerId: 'SYS',
+            level: 'INFO',
+            step: 'YT batch upload phase',
+            message: `Uploading ${pendingWins.length} window clip(s) to YouTube Studio in parallel (no wait on "Video processing" popup, Content check at the end)...`,
+          })
+
+          const expectedForContent: Array<{
+            windowNumber: number
+            clipPath?: string
+            title: string
+          }> = []
+
+          await Promise.allSettled(
+            pendingWins.map(async (w) => {
+              if (this.stoppingAll || this.stoppedWindowIds.has(w.id)) return
+              const clipTask =
+                this.windowClipPromises.get(w.id) ||
+                (this.startWindowClipTask ? this.startWindowClipTask(w) : null)
+              const clipRes = clipTask ? await clipTask.catch(() => null) : null
+              const ytTask = this.windowYtUploadPromises?.get(w.id)
+              if (ytTask) {
+                await ytTask.catch(() => null)
+              }
+              expectedForContent.push({
+                windowNumber: w.windowNumber,
+                clipPath: clipRes?.clipPath,
+                title: `cmt-${this.scanId.slice(0, 8)}-w${w.windowNumber}`,
+              })
+            }),
+          )
+
+          if (!this.stoppingAll && expectedForContent.length > 0) {
+            this.appendCombinedLog({
+              workerId: 'SYS',
+              level: 'INFO',
+              step: 'YT content check start',
+              message: `All ${expectedForContent.length} clip(s) submitted -> opening YouTube Studio Content page to check upload & SD processing progress...`,
+            })
+
+            try {
+              const contentSummary = await globalYtStudioController.checkAndVerifyContentPage({
+                scanId: this.scanId,
+                expectedWindows: expectedForContent,
+                waitForSdReady: true,
+                maxWaitMs: 90_000,
+                username: this.username || 'admin',
+                onProgress: (prog) => {
+                  this.appendCombinedLog({
+                    workerId: 'SYS',
+                    level: prog.allReady ? 'SUCCESS' : 'INFO',
+                    step: 'YT content progress',
+                    message: `YT Content: ${prog.uploadedCount}/${prog.expectedCount} uploaded · ${prog.readyCount}/${prog.expectedCount} SD ready (Unlisted)${prog.processingCount > 0 ? ` · ${prog.processingCount} processing SD` : ''}${prog.claimedCount > 0 ? ` · ${prog.claimedCount} claimed (link OK)` : ''}`,
+                  })
+                  for (const item of prog.items) {
+                    const matchWin = this.windows.find(
+                      (winItem) => winItem.windowNumber === item.windowNumber,
+                    )
+                    if (matchWin && matchWin.status === 'QUEUED' && item.ytUrl) {
+                      matchWin.stage = item.isReady ? 'link ready' : 'YT SD processing...'
+                      matchWin.summaryText = `YT ${item.visibility}: ${item.ytUrl}`
+                    }
+                  }
+                  this.persistStateToDisk()
+                },
+              })
+
+              this.appendCombinedLog({
+                workerId: 'SYS',
+                level: 'SUCCESS',
+                step: 'YT content verified',
+                message: `YouTube Studio Content check complete: ${contentSummary.uploadedCount}/${contentSummary.expectedCount} uploaded, ${contentSummary.readyCount} ready (Unlisted) — launching AI Studio workers!`,
+              })
+            } catch (contentErr: unknown) {
+              const cMsg = contentErr instanceof Error ? contentErr.message : String(contentErr)
+              this.appendCombinedLog({
+                workerId: 'SYS',
+                level: 'RETRY',
+                step: 'YT content check warning',
+                message: `Content page check warning (continuing with saved sidecar links): ${cMsg}`,
+              })
+            }
+          }
+        }
+      }
+
+      if (this.stoppingAll) return
+
       const workerCount = this.concurrency
       const workerPromises: Promise<void>[] = []
 
@@ -3270,6 +3388,15 @@ export class StudioParallelManager {
       let movieYoutubeUrl: string | null = latestScanRecord?.movieYoutubeUrl || null
 
       if (windowClip && cfg.encryptedYtCookies) {
+        // If a background YT upload promise is already running for this window, await it first
+        const existingUploadPromise = this.windowYtUploadPromises?.get(win.id)
+        if (existingUploadPromise) {
+          win.stage = 'waiting for YT upload'
+          win.summaryText = `Waiting for YouTube upload on ${workerId}...`
+          this.persistStateToDisk()
+          await existingUploadPromise.catch(() => null)
+        }
+
         const cachedSidecar = readClipYtSidecar(windowClip.clipPath)
         if (cachedSidecar?.ytUrl && !cachedSidecar.ytDeleted) {
           movieYoutubeUrl = cachedSidecar.ytUrl

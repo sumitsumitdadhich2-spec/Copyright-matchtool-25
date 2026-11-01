@@ -909,6 +909,23 @@ export async function POST(req: NextRequest) {
           ytSnapshot: await globalYtStudioController.getSnapshot(true),
         })
       }
+      case 'yt_check_content': {
+        const targetScanId = (body.scanId || '').trim() || undefined
+        const contentSummary = await globalYtStudioController.checkAndVerifyContentPage({
+          scanId: targetScanId,
+          waitForSdReady: Boolean(body.waitForSdReady),
+          maxWaitMs: 45_000,
+          username,
+        })
+        const firstLink = contentSummary.items[0]?.ytUrl || null
+        return NextResponse.json({
+          ok: true,
+          contentProgress: contentSummary,
+          ytUrl: firstLink,
+          message: `Content verified: ${contentSummary.uploadedCount} video(s) found · ${contentSummary.readyCount} SD ready (Unlisted)${firstLink ? ` · Latest link: ${firstLink}` : ''}`,
+          ytSnapshot: await globalYtStudioController.getSnapshot(true),
+        })
+      }
       case 'yt_upload_test': {
         const targetScanId = (body.scanId || '').trim() || 'test'
         let testClipPath = (body.clipPath || '').trim()
@@ -933,16 +950,33 @@ export async function POST(req: NextRequest) {
           }
         }
         const cfg = await loadStudioUserConfig(username)
+        const winNum = body.windowNumber || 1
         const upRes = await globalYtStudioController.uploadWindowClip({
           clipPath: testClipPath,
           scanId: targetScanId,
-          windowNumber: body.windowNumber || 1,
+          windowNumber: winNum,
           visibility: cfg.ytVisibility || 'unlisted',
+          forceUpload: Boolean(body.forceUpload),
+          username,
+        })
+        const contentSummary = await globalYtStudioController.checkAndVerifyContentPage({
+          scanId: targetScanId,
+          expectedWindows: [
+            {
+              windowNumber: winNum,
+              clipPath: testClipPath,
+              title: `cmt-${targetScanId.slice(0, 8)}-w${winNum}`,
+            },
+          ],
+          waitForSdReady: true,
+          maxWaitMs: 30_000,
           username,
         })
         return NextResponse.json({
           ok: true,
           ...upRes,
+          contentProgress: contentSummary,
+          message: `Uploaded & verified in Content -> ${upRes.ytUrl} (${contentSummary.readyCount}/${contentSummary.expectedCount || 1} SD ready)`,
           ytSnapshot: await globalYtStudioController.getSnapshot(true),
         })
       }

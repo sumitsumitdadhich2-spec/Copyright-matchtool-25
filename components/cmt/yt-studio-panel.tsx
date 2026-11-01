@@ -350,6 +350,21 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
               {busyAction === 'upload_test' ? 'Uploading test clip...' : 'Test Upload 1 Clip'}
             </button>
 
+            <button
+              type="button"
+              disabled={busyAction !== null}
+              onClick={() =>
+                callYtControl({ action: 'yt_check_content', waitForSdReady: false }, 'check_content')
+              }
+              className="inline-flex items-center gap-1.5 rounded bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 px-2.5 py-1 text-[11px] font-medium text-emerald-200 disabled:opacity-50"
+              title="Close 'Video processing' popup, go to YouTube Studio Content page, check upload progress, and extract all video links"
+            >
+              <CheckCircle2 className="size-3.5" />
+              {busyAction === 'check_content'
+                ? 'Checking Content...'
+                : 'Close Popup & Check Content Links'}
+            </button>
+
             {!confirmCleanupOpen ? (
               <button
                 type="button"
@@ -388,6 +403,80 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
           </div>
         </div>
       </div>
+
+      {/* Live Channel Content Progress & Extracted Video Links */}
+      {snap?.contentProgress && snap.contentProgress.items.length > 0 && (
+        <div className="rounded-lg border border-emerald-500/35 bg-emerald-950/20 p-3 space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-xs font-semibold text-emerald-200 flex items-center gap-1.5">
+              <CheckCircle2 className="size-3.5 text-emerald-400" />
+              Channel Content Progress:{' '}
+              <span className="font-mono">
+                {snap.contentProgress.uploadedCount}/
+                {snap.contentProgress.expectedCount || snap.contentProgress.uploadedCount} Uploaded
+              </span>{' '}
+              ·{' '}
+              <span className="font-mono text-emerald-300">
+                {snap.contentProgress.readyCount}/
+                {snap.contentProgress.expectedCount || snap.contentProgress.uploadedCount} SD Ready (Unlisted)
+              </span>
+              {snap.contentProgress.processingCount > 0 && (
+                <span className="font-mono text-amber-300">
+                  · {snap.contentProgress.processingCount} Processing SD...
+                </span>
+              )}
+              {snap.contentProgress.claimedCount > 0 && (
+                <span className="font-mono text-cyan-300">
+                  · {snap.contentProgress.claimedCount} Claimed (Link OK)
+                </span>
+              )}
+            </span>
+            <button
+              type="button"
+              disabled={busyAction !== null}
+              onClick={() =>
+                callYtControl({ action: 'yt_check_content', waitForSdReady: true }, 'check_content')
+              }
+              className="rounded bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 px-2 py-0.5 text-[10px] font-mono text-emerald-200"
+            >
+              Refresh Content &amp; Wait SD
+            </button>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-1.5 max-h-36 overflow-y-auto">
+            {snap.contentProgress.items.map((item) => (
+              <div
+                key={item.videoId}
+                className="flex items-center justify-between gap-2 rounded bg-zinc-900/90 border border-zinc-800 px-2.5 py-1 text-[11px] font-mono"
+              >
+                <div className="truncate">
+                  <span className="text-zinc-200 font-semibold">{item.title}</span>{' '}
+                  <span
+                    className={
+                      item.isReady
+                        ? 'text-emerald-400'
+                        : 'text-amber-300'
+                    }
+                  >
+                    ({item.visibility}
+                    {item.hasClaim ? ' · Claimed' : ''})
+                  </span>
+                  <div className="text-cyan-300 truncate">{item.ytUrl}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard?.writeText(item.ytUrl).catch(() => {})
+                    setStatusMsg(`Copied link: ${item.ytUrl}`)
+                  }}
+                  className="shrink-0 rounded bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 px-2 py-0.5 text-[10px] text-zinc-200"
+                >
+                  Copy
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {statusMsg && (
         <div className="rounded border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs text-emerald-300 flex items-center justify-between">
@@ -449,6 +538,19 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
               >
                 <ShieldCheck className="size-3.5" />
                 Verify &ldquo;Next&rdquo; / Switch Popup
+              </button>
+
+              <button
+                type="button"
+                disabled={busyAction !== null}
+                onClick={() =>
+                  callYtControl({ action: 'yt_check_content', waitForSdReady: false }, 'check_content')
+                }
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded text-[11px] font-medium bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border border-emerald-500/40"
+                title="Close 'Video processing' popup, open Content list, and grab video links"
+              >
+                <CheckCircle2 className="size-3.5" />
+                Close Popup &amp; Check Content
               </button>
 
               <button
