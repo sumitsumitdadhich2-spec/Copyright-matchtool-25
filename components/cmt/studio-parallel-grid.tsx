@@ -22,6 +22,11 @@ import {
   Filter,
   FileDown,
   CheckCircle2,
+  MousePointerClick,
+  Keyboard,
+  CornerDownLeft,
+  Cookie,
+  Globe,
 } from 'lucide-react'
 import type {
   ParallelCombinedLogEntry,
@@ -195,11 +200,24 @@ export function StudioParallelGrid({
   scanConcurrency,
   onActionCompleted,
 }: StudioParallelGridProps) {
-  // Strictly bind snapshot to THIS scanId so another scan's Resume/Retry counts never leak
+  // Strictly bind snapshot to THIS scanId (or 'default' when testing workers before selecting a scan)
   const snap = useMemo(() => {
-    if (!parallelSnapshot || !scanId) return null
-    return parallelSnapshot.scanId === scanId ? parallelSnapshot : null
+    if (!parallelSnapshot) return null
+    if (!scanId) return parallelSnapshot
+    return parallelSnapshot.scanId === scanId || parallelSnapshot.scanId === 'default'
+      ? parallelSnapshot
+      : null
   }, [parallelSnapshot, scanId])
+
+  // Per-worker Type & URL input states + click indicator for Login Assist on W01..W10
+  const [workerTypeInputs, setWorkerTypeInputs] = useState<Record<string, string>>({})
+  const [workerUrlInputs, setWorkerUrlInputs] = useState<Record<string, string>>({})
+  const [workerClickPoint, setWorkerClickPoint] = useState<{
+    workerId: string
+    x: number
+    y: number
+  } | null>(null)
+  const [workerStatusToast, setWorkerStatusToast] = useState<Record<string, string>>({})
 
   const effectiveMovieDurationSec = useMemo(() => {
     if (typeof scanMovieDuration === 'number' && scanMovieDuration > 0) return scanMovieDuration
@@ -305,7 +323,8 @@ export function StudioParallelGrid({
   }, [effectiveFoundMinutes, minuteInputSource])
 
   const postParallelControl = async (payload: Record<string, unknown>, label: string) => {
-    if (!scanId) {
+    const isWorkerAction = payload.action === 'parallel_worker_action'
+    if (!scanId && !isWorkerAction) {
       setErrorMsg('Please select or create a scan first to run Parallel Window Scan.')
       return
     }
@@ -316,21 +335,102 @@ export function StudioParallelGrid({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          scanId,
+          scanId: scanId || 'default',
           ...payload,
         }),
       })
       const data = await res.json()
       if (!res.ok || !data.ok) {
         setErrorMsg(data.error || `Failed: ${label}`)
-      } else if (data.parallelSnapshot) {
-        onActionCompleted?.(data.parallelSnapshot as ParallelScanLiveSnapshot)
+      } else {
+        if (data.message && typeof payload.workerId === 'string') {
+          const wId = payload.workerId
+          setWorkerStatusToast((prev) => ({ ...prev, [wId]: String(data.message) }))
+          setTimeout(() => {
+            setWorkerStatusToast((prev) => {
+              const next = { ...prev }
+              delete next[wId]
+              return next
+            })
+          }, 4000)
+        }
+        if (data.parallelSnapshot) {
+          onActionCompleted?.(data.parallelSnapshot as ParallelScanLiveSnapshot)
+        }
       }
     } catch (err) {
       setErrorMsg((err as Error).message)
     } finally {
       setBusyAction(null)
     }
+  }
+
+  const handleWorkerScreenClick = (
+    w: ParallelWorkerCardSnapshot,
+    e: React.MouseEvent<HTMLDivElement>,
+  ) => {
+    e.stopPropagation()
+    if (!w.assistMode) {
+      // If user clicks screen while Login Assist is off, open the expanded modal
+      setSelectedWorkerId(w.workerId)
+      return
+    }
+    const rect = e.currentTarget.getBoundingClientRect()
+    if (!rect.width || !rect.height) return
+    const xRatio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
+    const yRatio = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height))
+    setWorkerClickPoint({
+      workerId: w.workerId,
+      x: Math.round(xRatio * 100),
+      y: Math.round(yRatio * 100),
+    })
+    void postParallelControl(
+      {
+        action: 'parallel_worker_action',
+        workerId: w.workerId,
+        subAction: 'click',
+        xRatio,
+        yRatio,
+      },
+      `w_click_${w.workerId}`,
+    )
+  }
+
+  const handleWorkerTypeSubmit = (workerId: string, e: React.FormEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const txt = workerTypeInputs[workerId] || ''
+    if (!txt) return
+    setWorkerTypeInputs((prev) => ({ ...prev, [workerId]: '' }))
+    void postParallelControl(
+      {
+        action: 'parallel_worker_action',
+        workerId,
+        subAction: 'type',
+        text: txt,
+      },
+      `w_type_${workerId}`,
+    )
+  }
+
+  const handleWorkerNavigateSubmit = (
+    workerId: string,
+    defaultUrl: string,
+    e: React.FormEvent,
+  ) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const targetUrl = (workerUrlInputs[workerId] ?? defaultUrl).trim()
+    if (!targetUrl) return
+    void postParallelControl(
+      {
+        action: 'parallel_worker_action',
+        workerId,
+        subAction: 'navigate',
+        url: targetUrl,
+      },
+      `w_nav_${workerId}`,
+    )
   }
 
   const activeCount = snap?.activeWorkersCount ?? 0
@@ -1019,169 +1119,471 @@ export function StudioParallelGrid({
               </span>
             )}
           </div>
-          <span className="text-[10px] font-normal text-zinc-500">
-            Click any worker card to view large screenshot &amp; [Wxx] step logs (200 lines)
+          <span className="text-[10px] font-normal text-zinc-400">
+            Har Chrome ke upar uske apne <strong>Login Assist · Stop · Type · Enter</strong> buttons hain, beech me live clickable screen, aur niche uske apne step logs
           </span>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3.5">
           {workers.map((w) => {
-            const isIdle = w.status === 'IDLE' || !w.windowId
+            const isAssist = Boolean(w.assistMode)
+            const wTypeText = workerTypeInputs[w.workerId] ?? ''
+            const wUrlText =
+              workerUrlInputs[w.workerId] ??
+              (w.currentUrl || 'https://aistudio.google.com/prompts/new_chat')
+            const wToast = workerStatusToast[w.workerId]
             return (
               <div
                 key={w.workerId}
-                onClick={() => setSelectedWorkerId(w.workerId)}
-                className={`group relative rounded-lg border transition cursor-pointer overflow-hidden flex flex-col ${
-                  w.active
-                    ? 'border-cyan-500/40 bg-zinc-900/70 hover:border-cyan-400/70'
-                    : w.leasedByOtherScan
-                      ? 'border-purple-500/30 bg-purple-950/15 hover:border-purple-400/50'
-                      : 'border-zinc-800/80 bg-zinc-900/30 hover:border-zinc-700'
+                className={`group relative rounded-xl border transition overflow-hidden flex flex-col ${
+                  isAssist
+                    ? 'border-emerald-500/60 bg-zinc-900/90 shadow-lg shadow-emerald-950/20'
+                    : w.active
+                      ? 'border-cyan-500/40 bg-zinc-900/70'
+                      : w.leasedByOtherScan
+                        ? 'border-purple-500/30 bg-purple-950/15'
+                        : 'border-zinc-800/90 bg-zinc-900/40'
                 }`}
               >
-                {/* Live Thumbnail Header */}
-                <div className="relative aspect-video bg-black border-b border-zinc-800/80 flex items-center justify-center overflow-hidden">
+                {/* =========================================================
+                    1. TOP (UPAR BUTTONS): Worker Header + Login Assist / Stop / Type / Enter
+                   ========================================================= */}
+                <div
+                  className="p-2.5 border-b border-zinc-800 bg-zinc-950/90 flex flex-col gap-2"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {/* Row 1: Worker ID, Window badge, Model badge, Status, Expand */}
+                  <div className="flex items-center justify-between gap-1.5 flex-wrap">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="px-1.5 py-0.5 rounded bg-cyan-500/20 border border-cyan-500/40 text-[11px] font-mono font-bold text-cyan-300">
+                        {w.workerId}
+                      </span>
+                      <span className="text-[10px] font-mono text-zinc-400">
+                        {w.profileDirName}
+                      </span>
+                      {w.windowNumber !== null && (
+                        <span className="px-1.5 py-0.5 rounded bg-zinc-900 border border-zinc-700 text-[10px] font-mono text-zinc-100">
+                          #{w.windowNumber} ({w.windowRange})
+                        </span>
+                      )}
+                      <span className="px-1.5 py-0.5 rounded bg-purple-500/15 border border-purple-500/30 text-[10px] font-mono text-purple-300">
+                        {shortModelBadge(w.modelName)}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-1">
+                      <span className="text-[10px] font-mono text-zinc-400">
+                        {w.tokens ? `${Math.round(w.tokens / 1000)}K tok` : '— tok'} ·{' '}
+                        {formatMmSs(w.elapsedSec)}
+                      </span>
+                      <span
+                        className={`px-1.5 py-0.5 rounded border text-[9px] font-mono font-semibold uppercase ${statusBadgeStyle(
+                          w.status,
+                        )}`}
+                      >
+                        {w.leasedByOtherScan ? 'OTHER SCAN' : w.status}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedWorkerId(w.workerId)}
+                        className="p-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700"
+                        title={`Expand ${w.workerId} full screen`}
+                      >
+                        <Maximize2 className="w-3 h-3" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Row 2: Worker Action Buttons (Login Assist, Pause/Resume, Stop, Save Cookies, Test Login) */}
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      disabled={busyAction !== null || w.leasedByOtherScan}
+                      onClick={() =>
+                        postParallelControl(
+                          {
+                            action: 'parallel_worker_action',
+                            workerId: w.workerId,
+                            subAction: 'assist_toggle',
+                            enabled: !isAssist,
+                          },
+                          `w_assist_${w.workerId}`,
+                        )
+                      }
+                      className={`inline-flex items-center gap-1 text-[10px] font-medium px-2 py-1 rounded border transition ${
+                        isAssist
+                          ? 'bg-emerald-500/25 text-emerald-200 border-emerald-500/50 font-semibold'
+                          : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border-zinc-700'
+                      }`}
+                      title={`Toggle interactive Login Assist on ${w.workerId} (${w.profileDirName})`}
+                    >
+                      <MousePointerClick className="w-3 h-3" />
+                      Login Assist: {isAssist ? 'ON' : 'OFF'}
+                    </button>
+
+                    {w.paused ? (
+                      <button
+                        type="button"
+                        disabled={busyAction !== null || w.leasedByOtherScan}
+                        onClick={() =>
+                          postParallelControl(
+                            {
+                              action: 'parallel_worker_action',
+                              workerId: w.workerId,
+                              subAction: 'resume',
+                            },
+                            `w_resume_${w.workerId}`,
+                          )
+                        }
+                        className="inline-flex items-center gap-1 text-[10px] px-2 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40"
+                      >
+                        <Play className="w-2.5 h-2.5" />
+                        Resume
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={busyAction !== null || w.leasedByOtherScan}
+                        onClick={() =>
+                          postParallelControl(
+                            {
+                              action: 'parallel_worker_action',
+                              workerId: w.workerId,
+                              subAction: 'pause',
+                            },
+                            `w_pause_${w.workerId}`,
+                          )
+                        }
+                        className="inline-flex items-center gap-1 text-[10px] px-2 py-1 rounded bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30"
+                      >
+                        <Pause className="w-2.5 h-2.5" />
+                        Pause
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      disabled={busyAction !== null || w.leasedByOtherScan}
+                      onClick={() =>
+                        postParallelControl(
+                          {
+                            action: 'parallel_worker_action',
+                            workerId: w.workerId,
+                            subAction: 'stop',
+                          },
+                          `w_stop_${w.workerId}`,
+                        )
+                      }
+                      className="inline-flex items-center gap-1 text-[10px] px-2 py-1 rounded bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/40"
+                      title={`Stop ${w.workerId} window/browser`}
+                    >
+                      <Square className="w-2.5 h-2.5" />
+                      Stop
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={busyAction !== null || w.leasedByOtherScan}
+                      onClick={() =>
+                        postParallelControl(
+                          {
+                            action: 'parallel_worker_action',
+                            workerId: w.workerId,
+                            subAction: 'save_session',
+                          },
+                          `w_save_cookies_${w.workerId}`,
+                        )
+                      }
+                      className="inline-flex items-center gap-1 text-[10px] px-2 py-1 rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30"
+                      title={`Save ${w.workerId} live Google session cookies to Settings for all workers`}
+                    >
+                      <Cookie className="w-2.5 h-2.5" />
+                      Save Cookies
+                    </button>
+
+                    {w.windowId && !w.leasedByOtherScan && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            postParallelControl(
+                              {
+                                action: 'parallel_window_action',
+                                windowId: w.windowId,
+                                subAction: 'retry',
+                              },
+                              `retry_${w.windowId}`,
+                            )
+                          }
+                          className="px-1.5 py-0.5 rounded bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 text-[10px]"
+                          title="Retry this window"
+                        >
+                          Retry Win
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            postParallelControl(
+                              {
+                                action: 'parallel_window_action',
+                                windowId: w.windowId,
+                                subAction: 'skip',
+                              },
+                              `skip_${w.windowId}`,
+                            )
+                          }
+                          className="px-1.5 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 text-[10px]"
+                          title="Skip this window"
+                        >
+                          Skip Win
+                        </button>
+                      </>
+                    )}
+                  </div>
+
+                  {/* Row 3: Type Input + Type Button + Enter ↵ Button (Always visible on every worker card!) */}
+                  <form
+                    onSubmit={(e) => handleWorkerTypeSubmit(w.workerId, e)}
+                    className="flex items-center gap-1"
+                  >
+                    <Keyboard className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
+                    <input
+                      type="text"
+                      value={wTypeText}
+                      onChange={(e) =>
+                        setWorkerTypeInputs((prev) => ({
+                          ...prev,
+                          [w.workerId]: e.target.value,
+                        }))
+                      }
+                      placeholder={`Type in ${w.workerId} (email / password / text)...`}
+                      className="flex-1 min-w-0 rounded bg-zinc-900 border border-zinc-800 px-2 py-1 text-[11px] text-zinc-200 focus:outline-none focus:border-emerald-500/50"
+                    />
+                    <button
+                      type="submit"
+                      disabled={busyAction !== null || !wTypeText}
+                      className="text-[10px] font-medium px-2 py-1 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/30 disabled:opacity-40 shrink-0"
+                    >
+                      Type
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busyAction !== null}
+                      onClick={() =>
+                        postParallelControl(
+                          {
+                            action: 'parallel_worker_action',
+                            workerId: w.workerId,
+                            subAction: 'key',
+                            key: 'Enter',
+                          },
+                          `w_enter_${w.workerId}`,
+                        )
+                      }
+                      className="inline-flex items-center gap-0.5 text-[10px] font-medium px-2 py-1 rounded bg-cyan-500/20 text-cyan-200 border border-cyan-500/40 hover:bg-cyan-500/30 shrink-0"
+                      title={`Press Enter in ${w.workerId}`}
+                    >
+                      <CornerDownLeft className="w-2.5 h-2.5" />
+                      Enter ↵
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busyAction !== null}
+                      onClick={() =>
+                        postParallelControl(
+                          {
+                            action: 'parallel_worker_action',
+                            workerId: w.workerId,
+                            subAction: 'key',
+                            key: 'Tab',
+                          },
+                          `w_tab_${w.workerId}`,
+                        )
+                      }
+                      className="text-[10px] px-1.5 py-1 rounded bg-zinc-800 text-zinc-300 border border-zinc-700 hover:bg-zinc-700 shrink-0"
+                      title={`Press Tab in ${w.workerId}`}
+                    >
+                      Tab
+                    </button>
+                  </form>
+
+                  {/* Row 4: URL Bar + Go (shown when Login Assist is ON) */}
+                  {isAssist && (
+                    <form
+                      onSubmit={(e) =>
+                        handleWorkerNavigateSubmit(
+                          w.workerId,
+                          w.currentUrl || 'https://aistudio.google.com/prompts/new_chat',
+                          e,
+                        )
+                      }
+                      className="flex items-center gap-1"
+                    >
+                      <Globe className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      <input
+                        type="text"
+                        value={wUrlText}
+                        onChange={(e) =>
+                          setWorkerUrlInputs((prev) => ({
+                            ...prev,
+                            [w.workerId]: e.target.value,
+                          }))
+                        }
+                        placeholder="https://aistudio.google.com/prompts/new_chat"
+                        className="flex-1 min-w-0 rounded bg-zinc-900 border border-zinc-800 px-2 py-0.5 text-[10px] font-mono text-zinc-200 focus:outline-none focus:border-emerald-500/50"
+                      />
+                      <button
+                        type="submit"
+                        disabled={busyAction !== null}
+                        className="text-[10px] px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 shrink-0"
+                      >
+                        Go
+                      </button>
+                    </form>
+                  )}
+
+                  {wToast && (
+                    <div className="text-[10px] font-mono text-emerald-300 bg-emerald-950/40 border border-emerald-500/30 rounded px-2 py-0.5">
+                      {wToast}
+                    </div>
+                  )}
+                </div>
+
+                {/* =========================================================
+                    2. MIDDLE (UPAR SCREEN): Live Clickable Chrome Screen
+                   ========================================================= */}
+                <div
+                  onClick={(e) => handleWorkerScreenClick(w, e)}
+                  className={`relative aspect-video bg-black border-b border-zinc-800/90 flex items-center justify-center overflow-hidden ${
+                    isAssist ? 'cursor-crosshair' : 'cursor-pointer'
+                  }`}
+                  title={
+                    isAssist
+                      ? `Click anywhere on ${w.workerId} screen to click in Chrome`
+                      : `Click to expand ${w.workerId} (or turn ON Login Assist above to click directly)`
+                  }
+                >
                   {w.screenshotBase64 ? (
                     <img
                       src={`data:image/jpeg;base64,${w.screenshotBase64}`}
                       alt={w.workerId}
-                      className="w-full h-full object-cover"
+                      className="w-full h-full object-contain select-none"
+                      draggable={false}
                     />
                   ) : (
-                    <div className="text-[10px] text-zinc-600 font-mono text-center px-2">
+                    <div className="text-[11px] text-zinc-500 font-mono text-center px-3 flex flex-col items-center gap-2">
                       <div>
-                        {w.workerId} · {w.profileDirName}
+                        {w.workerId} · {w.profileDirName} ({w.stage || 'idle'})
                       </div>
-                      {w.leasedByOtherScan && w.leasedByScanLabel && (
-                        <div className="text-[9px] text-purple-300 mt-0.5">
+                      {w.leasedByOtherScan && w.leasedByScanLabel ? (
+                        <div className="text-[10px] text-purple-300">
                           Leased by {w.leasedByScanLabel}
                         </div>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={busyAction !== null}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            void postParallelControl(
+                              {
+                                action: 'parallel_worker_action',
+                                workerId: w.workerId,
+                                subAction: 'assist_toggle',
+                                enabled: true,
+                              },
+                              `w_open_assist_${w.workerId}`,
+                            )
+                          }}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border border-emerald-500/40 text-[10px] font-sans font-medium"
+                        >
+                          <MousePointerClick className="w-3 h-3" />
+                          Open {w.workerId} Chrome (Login Assist)
+                        </button>
                       )}
                     </div>
                   )}
 
-                  {/* Top-left Worker ID + Window # overlay */}
-                  <div className="absolute top-1.5 left-1.5 flex items-center gap-1">
-                    <span className="px-1.5 py-0.5 rounded bg-black/80 border border-zinc-700 text-[10px] font-mono font-bold text-cyan-300">
-                      {w.workerId}
-                    </span>
-                    {w.windowNumber !== null && (
-                      <span className="px-1.5 py-0.5 rounded bg-black/80 border border-zinc-700 text-[10px] font-mono text-zinc-100">
-                        #{w.windowNumber} ({w.windowRange})
-                      </span>
+                  {/* Click coordinate ring when Login Assist is active */}
+                  {isAssist &&
+                    workerClickPoint &&
+                    workerClickPoint.workerId === w.workerId && (
+                      <div
+                        className="pointer-events-none absolute w-5 h-5 -ml-2.5 -mt-2.5 rounded-full border-2 border-emerald-400 bg-emerald-400/25 animate-ping"
+                        style={{
+                          left: `${workerClickPoint.x}%`,
+                          top: `${workerClickPoint.y}%`,
+                        }}
+                      />
                     )}
-                  </div>
 
-                  {/* Top-right Status Badge */}
-                  <div className="absolute top-1.5 right-1.5">
-                    <span
-                      className={`px-1.5 py-0.5 rounded border text-[9px] font-mono font-semibold uppercase ${statusBadgeStyle(
-                        w.status,
-                      )}`}
-                    >
-                      {w.leasedByOtherScan ? 'OTHER SCAN' : w.status}
+                  {/* Bottom bar overlay on screen: stage & Chrome procs */}
+                  <div className="pointer-events-none absolute bottom-1.5 left-1.5 right-1.5 flex items-center justify-between gap-1 text-[9px] font-mono">
+                    <span className="px-1.5 py-0.5 rounded bg-black/80 border border-zinc-800 text-zinc-200 truncate max-w-[70%]">
+                      {w.stage || 'idle'}
                     </span>
-                  </div>
-
-                  {/* Bottom-right expand icon */}
-                  <div className="absolute bottom-1.5 right-1.5 opacity-0 group-hover:opacity-100 transition bg-black/75 p-1 rounded text-zinc-300">
-                    <Maximize2 className="w-3 h-3" />
+                    <span className="px-1.5 py-0.5 rounded bg-black/80 border border-zinc-800 text-zinc-400 shrink-0">
+                      procs:{w.chromeProcessCount ?? 0}
+                      {w.chromeRssMb ? ` · ${w.chromeRssMb}MB` : ''}
+                    </span>
                   </div>
                 </div>
 
-                {/* Card Telemetry Body */}
-                <div className="p-2.5 flex-1 flex flex-col justify-between gap-1.5 text-[11px]">
-                  <div>
-                    <div className="flex items-center justify-between gap-1 text-[10px] font-mono text-zinc-400">
-                      <span className="text-purple-300 font-medium">
-                        {shortModelBadge(w.modelName)}
-                      </span>
+                {/* =========================================================
+                    3. BOTTOM (NICHE LOGS): Worker's Own Scrollable Step Logs
+                   ========================================================= */}
+                <div className="bg-zinc-950/95 flex flex-col">
+                  <div className="px-2.5 py-1 border-b border-zinc-800/80 bg-zinc-900/60 flex items-center justify-between text-[10px] font-mono text-zinc-400">
+                    <span>
+                      [{w.workerId}] Step Log ({w.logs.length}/200)
+                    </span>
+                    {w.attempt > 0 && (
                       <span>
-                        {w.tokens ? `${Math.round(w.tokens / 1000)}K tok` : '— tok'} ·{' '}
-                        {formatMmSs(w.elapsedSec)}
+                        try {w.attempt}/{w.maxAttempts || 5}
+                        {w.permRetry > 0 ? ` · 403:${w.permRetry}` : ''}
                       </span>
-                    </div>
-
-                    <div
-                      className="mt-1 text-[10px] font-mono text-zinc-300 truncate"
-                      title={w.stage}
-                    >
-                      {w.stage || 'idle'}
-                    </div>
-
-                    <div className="mt-1 flex items-center justify-between text-[10px] font-mono text-zinc-400">
-                      <span>
-                        Chrome procs: <strong className="text-zinc-200">{w.chromeProcessCount ?? 0}</strong>
-                        {w.chromeRssMb ? ` (${w.chromeRssMb} MB)` : ''}
-                      </span>
-                      {!isIdle && (
-                        <span>
-                          try {w.attempt || 1}/{w.maxAttempts || 5}
-                          {w.permRetry > 0 ? ` · 403:${w.permRetry}` : ''}
-                        </span>
-                      )}
-                    </div>
+                    )}
                   </div>
-
-                  {/* Per-card controls when a window of THIS scan is assigned */}
-                  {w.windowId && !w.leasedByOtherScan && (
-                    <div
-                      className="pt-1.5 border-t border-zinc-800/80 flex items-center justify-end gap-1"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <button
-                        type="button"
-                        onClick={() =>
-                          postParallelControl(
-                            {
-                              action: 'parallel_window_action',
-                              windowId: w.windowId,
-                              subAction: 'stop',
-                            },
-                            `stop_${w.windowId}`,
-                          )
-                        }
-                        className="px-1.5 py-0.5 rounded bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30 text-[10px]"
-                        title="Stop this window"
-                      >
-                        Stop
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          postParallelControl(
-                            {
-                              action: 'parallel_window_action',
-                              windowId: w.windowId,
-                              subAction: 'retry',
-                            },
-                            `retry_${w.windowId}`,
-                          )
-                        }
-                        className="px-1.5 py-0.5 rounded bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 text-[10px]"
-                        title="Retry this window"
-                      >
-                        Retry
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          postParallelControl(
-                            {
-                              action: 'parallel_window_action',
-                              windowId: w.windowId,
-                              subAction: 'skip',
-                            },
-                            `skip_${w.windowId}`,
-                          )
-                        }
-                        className="px-1.5 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 text-[10px]"
-                        title="Skip this window"
-                      >
-                        Skip
-                      </button>
-                    </div>
-                  )}
+                  <div className="h-32 overflow-y-auto p-2 space-y-1 font-mono text-[10px]">
+                    {w.logs.length === 0 ? (
+                      <div className="text-zinc-600 py-6 text-center">
+                        No step logs yet for {w.workerId}
+                      </div>
+                    ) : (
+                      w.logs
+                        .slice()
+                        .reverse()
+                        .map((log, idx) => (
+                          <div
+                            key={`${log.t}-${idx}`}
+                            className="leading-snug flex items-start gap-1.5"
+                          >
+                            <span className="text-zinc-600 shrink-0">
+                              {new Date(log.t).toLocaleTimeString([], {
+                                hour12: false,
+                                hour: '2-digit',
+                                minute: '2-digit',
+                                second: '2-digit',
+                              })}
+                            </span>
+                            <span
+                              className={
+                                log.level === 'error'
+                                  ? 'text-red-400 break-all'
+                                  : log.level === 'warn'
+                                    ? 'text-amber-300 break-all'
+                                    : log.level === 'success'
+                                      ? 'text-emerald-400 break-all'
+                                      : 'text-zinc-300 break-all'
+                              }
+                            >
+                              <strong className="font-semibold">{log.step}</strong>
+                              {log.detail ? ` — ${log.detail}` : ''}
+                            </span>
+                          </div>
+                        ))
+                    )}
+                  </div>
                 </div>
               </div>
             )
@@ -1721,108 +2123,361 @@ export function StudioParallelGrid({
         </div>
       </div>
 
-      {/* Modal for Worker Large Screenshot + [Wxx] Step Log (200 lines) */}
+      {/* Modal for Worker Large Interactive Screen + Top Buttons + Bottom [Wxx] Step Log */}
       {selectedWorker && (
         <div
           className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
           onClick={() => setSelectedWorkerId(null)}
         >
           <div
-            className="w-full max-w-5xl rounded-xl border border-zinc-700 bg-zinc-950 overflow-hidden shadow-2xl flex flex-col max-h-[90vh]"
+            className="w-full max-w-5xl rounded-xl border border-zinc-700 bg-zinc-950 overflow-hidden shadow-2xl flex flex-col max-h-[92vh]"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="px-4 py-3 border-b border-zinc-800 bg-zinc-900 flex items-center justify-between">
-              <div className="flex items-center gap-2.5 flex-wrap">
-                <span className="px-2 py-0.5 rounded bg-cyan-500/20 border border-cyan-500/40 text-xs font-mono font-bold text-cyan-300">
-                  {selectedWorker.workerId}
-                </span>
-                <span className="text-xs font-mono text-zinc-300">
-                  Profile: {selectedWorker.profileDirName}
-                </span>
-                {selectedWorker.windowNumber !== null && (
-                  <span className="text-xs font-mono text-zinc-100">
-                    · Window #{selectedWorker.windowNumber} ({selectedWorker.windowRange})
+            {/* 1. TOP: Modal Header + Interactive Controls (Login Assist, Stop, Type, Enter, URL) */}
+            <div className="px-4 py-3 border-b border-zinc-800 bg-zinc-900 flex flex-col gap-2">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="px-2 py-0.5 rounded bg-cyan-500/20 border border-cyan-500/40 text-xs font-mono font-bold text-cyan-300">
+                    {selectedWorker.workerId}
                   </span>
-                )}
-                <span
-                  className={`px-2 py-0.5 rounded border text-[10px] font-mono font-semibold uppercase ${statusBadgeStyle(
-                    selectedWorker.status,
-                  )}`}
-                >
-                  {selectedWorker.status}
-                </span>
+                  <span className="text-xs font-mono text-zinc-300">
+                    Profile: {selectedWorker.profileDirName}
+                  </span>
+                  {selectedWorker.windowNumber !== null && (
+                    <span className="text-xs font-mono text-zinc-100">
+                      · Window #{selectedWorker.windowNumber} ({selectedWorker.windowRange})
+                    </span>
+                  )}
+                  <span
+                    className={`px-2 py-0.5 rounded border text-[10px] font-mono font-semibold uppercase ${statusBadgeStyle(
+                      selectedWorker.status,
+                    )}`}
+                  >
+                    {selectedWorker.status}
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() =>
+                      postParallelControl(
+                        {
+                          action: 'parallel_worker_action',
+                          workerId: selectedWorker.workerId,
+                          subAction: 'assist_toggle',
+                          enabled: !selectedWorker.assistMode,
+                        },
+                        `modal_assist_${selectedWorker.workerId}`,
+                      )
+                    }
+                    className={`inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1 rounded border ${
+                      selectedWorker.assistMode
+                        ? 'bg-emerald-500/25 text-emerald-200 border-emerald-500/50'
+                        : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border-zinc-700'
+                    }`}
+                  >
+                    <MousePointerClick className="w-3.5 h-3.5" />
+                    Login Assist: {selectedWorker.assistMode ? 'ON' : 'OFF'}
+                  </button>
+
+                  {selectedWorker.paused ? (
+                    <button
+                      type="button"
+                      disabled={busyAction !== null}
+                      onClick={() =>
+                        postParallelControl(
+                          {
+                            action: 'parallel_worker_action',
+                            workerId: selectedWorker.workerId,
+                            subAction: 'resume',
+                          },
+                          `modal_resume_${selectedWorker.workerId}`,
+                        )
+                      }
+                      className="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
+                    >
+                      <Play className="w-3 h-3" />
+                      Resume
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={busyAction !== null}
+                      onClick={() =>
+                        postParallelControl(
+                          {
+                            action: 'parallel_worker_action',
+                            workerId: selectedWorker.workerId,
+                            subAction: 'pause',
+                          },
+                          `modal_pause_${selectedWorker.workerId}`,
+                        )
+                      }
+                      className="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40"
+                    >
+                      <Pause className="w-3 h-3" />
+                      Pause
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() =>
+                      postParallelControl(
+                        {
+                          action: 'parallel_worker_action',
+                          workerId: selectedWorker.workerId,
+                          subAction: 'stop',
+                        },
+                        `modal_stop_${selectedWorker.workerId}`,
+                      )
+                    }
+                    className="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded bg-red-500/20 text-red-300 border border-red-500/40"
+                  >
+                    <Square className="w-3 h-3" />
+                    Stop
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() =>
+                      postParallelControl(
+                        {
+                          action: 'parallel_worker_action',
+                          workerId: selectedWorker.workerId,
+                          subAction: 'save_session',
+                        },
+                        `modal_save_${selectedWorker.workerId}`,
+                      )
+                    }
+                    className="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30"
+                  >
+                    <Cookie className="w-3 h-3" />
+                    Save Cookies
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setSelectedWorkerId(null)}
+                    className="p-1 rounded hover:bg-zinc-800 text-zinc-400 hover:text-zinc-100"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
               </div>
-              <button
-                type="button"
-                onClick={() => setSelectedWorkerId(null)}
-                className="p-1 rounded hover:bg-zinc-800 text-zinc-400 hover:text-zinc-100"
-              >
-                <X className="w-4 h-4" />
-              </button>
+
+              {/* Modal Type + Enter + URL Row */}
+              <div className="flex flex-wrap items-center gap-2">
+                <form
+                  onSubmit={(e) => handleWorkerTypeSubmit(selectedWorker.workerId, e)}
+                  className="flex-1 min-w-[260px] flex items-center gap-1.5"
+                >
+                  <Keyboard className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+                  <input
+                    type="text"
+                    value={workerTypeInputs[selectedWorker.workerId] ?? ''}
+                    onChange={(e) =>
+                      setWorkerTypeInputs((prev) => ({
+                        ...prev,
+                        [selectedWorker.workerId]: e.target.value,
+                      }))
+                    }
+                    placeholder={`Type text into ${selectedWorker.workerId} (email, password, prompt)...`}
+                    className="flex-1 rounded bg-zinc-950 border border-zinc-800 px-2.5 py-1 text-xs text-zinc-200 focus:outline-none focus:border-emerald-500/50"
+                  />
+                  <button
+                    type="submit"
+                    disabled={
+                      busyAction !== null || !(workerTypeInputs[selectedWorker.workerId] ?? '')
+                    }
+                    className="text-xs px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/30 disabled:opacity-40"
+                  >
+                    Type
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() =>
+                      postParallelControl(
+                        {
+                          action: 'parallel_worker_action',
+                          workerId: selectedWorker.workerId,
+                          subAction: 'key',
+                          key: 'Enter',
+                        },
+                        `modal_enter_${selectedWorker.workerId}`,
+                      )
+                    }
+                    className="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded bg-cyan-500/20 text-cyan-200 border border-cyan-500/40 hover:bg-cyan-500/30"
+                  >
+                    <CornerDownLeft className="w-3 h-3" />
+                    Enter ↵
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() =>
+                      postParallelControl(
+                        {
+                          action: 'parallel_worker_action',
+                          workerId: selectedWorker.workerId,
+                          subAction: 'key',
+                          key: 'Tab',
+                        },
+                        `modal_tab_${selectedWorker.workerId}`,
+                      )
+                    }
+                    className="text-xs px-2 py-1 rounded bg-zinc-800 text-zinc-300 border border-zinc-700 hover:bg-zinc-700"
+                  >
+                    Tab
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() =>
+                      postParallelControl(
+                        {
+                          action: 'parallel_worker_action',
+                          workerId: selectedWorker.workerId,
+                          subAction: 'key',
+                          key: 'Backspace',
+                        },
+                        `modal_bs_${selectedWorker.workerId}`,
+                      )
+                    }
+                    className="text-xs px-2 py-1 rounded bg-zinc-800 text-zinc-300 border border-zinc-700 hover:bg-zinc-700"
+                  >
+                    ⌫
+                  </button>
+                </form>
+
+                <form
+                  onSubmit={(e) =>
+                    handleWorkerNavigateSubmit(
+                      selectedWorker.workerId,
+                      selectedWorker.currentUrl || 'https://aistudio.google.com/prompts/new_chat',
+                      e,
+                    )
+                  }
+                  className="flex items-center gap-1.5 min-w-[260px]"
+                >
+                  <Globe className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  <input
+                    type="text"
+                    value={
+                      workerUrlInputs[selectedWorker.workerId] ??
+                      (selectedWorker.currentUrl || 'https://aistudio.google.com/prompts/new_chat')
+                    }
+                    onChange={(e) =>
+                      setWorkerUrlInputs((prev) => ({
+                        ...prev,
+                        [selectedWorker.workerId]: e.target.value,
+                      }))
+                    }
+                    placeholder="https://aistudio.google.com/prompts/new_chat"
+                    className="flex-1 rounded bg-zinc-950 border border-zinc-800 px-2.5 py-1 text-xs font-mono text-zinc-200 focus:outline-none focus:border-emerald-500/50"
+                  />
+                  <button
+                    type="submit"
+                    disabled={busyAction !== null}
+                    className="text-xs px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700"
+                  >
+                    Go
+                  </button>
+                </form>
+              </div>
             </div>
 
-            <div className="grid grid-cols-1 lg:grid-cols-12 flex-1 overflow-hidden">
-              <div className="lg:col-span-7 bg-black flex items-center justify-center border-b lg:border-b-0 lg:border-r border-zinc-800 p-2">
-                {selectedWorker.screenshotBase64 ? (
-                  <img
-                    src={`data:image/jpeg;base64,${selectedWorker.screenshotBase64}`}
-                    alt={selectedWorker.workerId}
-                    className="max-h-[65vh] w-auto object-contain rounded"
-                  />
-                ) : (
-                  <div className="text-xs font-mono text-zinc-500 py-16">
-                    No live screenshot captured yet for {selectedWorker.workerId}
-                  </div>
-                )}
-              </div>
+            {/* 2. MIDDLE: Large Interactive Clickable Screen */}
+            <div
+              onClick={(e) => handleWorkerScreenClick(selectedWorker, e)}
+              className={`relative bg-black flex items-center justify-center border-b border-zinc-800 p-2 min-h-[320px] max-h-[54vh] overflow-hidden ${
+                selectedWorker.assistMode ? 'cursor-crosshair' : 'cursor-pointer'
+              }`}
+            >
+              {selectedWorker.screenshotBase64 ? (
+                <img
+                  src={`data:image/jpeg;base64,${selectedWorker.screenshotBase64}`}
+                  alt={selectedWorker.workerId}
+                  className="max-h-[52vh] w-auto object-contain rounded select-none"
+                  draggable={false}
+                />
+              ) : (
+                <div className="text-xs font-mono text-zinc-500 py-16 flex flex-col items-center gap-3">
+                  <span>No live screenshot captured yet for {selectedWorker.workerId}</span>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      void postParallelControl(
+                        {
+                          action: 'parallel_worker_action',
+                          workerId: selectedWorker.workerId,
+                          subAction: 'assist_toggle',
+                          enabled: true,
+                        },
+                        `modal_open_${selectedWorker.workerId}`,
+                      )
+                    }}
+                    className="px-3 py-1.5 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border border-emerald-500/40 text-xs font-sans"
+                  >
+                    Open {selectedWorker.workerId} Chrome in Login Assist
+                  </button>
+                </div>
+              )}
+            </div>
 
-              <div className="lg:col-span-5 flex flex-col max-h-[65vh]">
-                <div className="px-3 py-2 border-b border-zinc-800 bg-zinc-900/60 flex items-center justify-between text-[11px] font-mono text-zinc-400">
-                  <span>
-                    [{selectedWorker.workerId}] Step Log ({selectedWorker.logs.length}/200 lines)
-                  </span>
-                  <span>
-                    {shortModelBadge(selectedWorker.modelName)} ·{' '}
-                    {selectedWorker.tokens
-                      ? `${selectedWorker.tokens.toLocaleString()} tok`
-                      : '— tok'}
-                  </span>
-                </div>
-                <div className="flex-1 overflow-y-auto p-3 space-y-1.5 font-mono text-[11px]">
-                  {selectedWorker.logs.length === 0 ? (
-                    <div className="text-zinc-600">No logs recorded yet.</div>
-                  ) : (
-                    selectedWorker.logs
-                      .slice()
-                      .reverse()
-                      .map((log, i) => (
-                        <div key={`${log.t}-${i}`} className="leading-snug flex items-start gap-1.5">
-                          <span className="text-zinc-600 shrink-0">
-                            {new Date(log.t).toLocaleTimeString([], {
-                              hour12: false,
-                              hour: '2-digit',
-                              minute: '2-digit',
-                              second: '2-digit',
-                            })}
-                          </span>
-                          <span
-                            className={
-                              log.level === 'error'
-                                ? 'text-red-400'
-                                : log.level === 'warn'
-                                  ? 'text-amber-300'
-                                  : log.level === 'success'
-                                    ? 'text-emerald-400'
-                                    : 'text-zinc-300'
-                            }
-                          >
-                            <strong className="font-semibold">{log.step}</strong>
-                            {log.detail ? ` — ${log.detail}` : ''}
-                          </span>
-                        </div>
-                      ))
-                  )}
-                </div>
+            {/* 3. BOTTOM: Worker's Step Log right below the screen */}
+            <div className="flex flex-col max-h-[26vh] bg-zinc-950">
+              <div className="px-3 py-1.5 border-b border-zinc-800 bg-zinc-900/60 flex items-center justify-between text-[11px] font-mono text-zinc-400">
+                <span>
+                  [{selectedWorker.workerId}] Step Log ({selectedWorker.logs.length}/200 lines)
+                </span>
+                <span>
+                  {shortModelBadge(selectedWorker.modelName)} ·{' '}
+                  {selectedWorker.tokens
+                    ? `${selectedWorker.tokens.toLocaleString()} tok`
+                    : '— tok'}
+                </span>
+              </div>
+              <div className="flex-1 overflow-y-auto p-3 space-y-1.5 font-mono text-[11px]">
+                {selectedWorker.logs.length === 0 ? (
+                  <div className="text-zinc-600">No logs recorded yet.</div>
+                ) : (
+                  selectedWorker.logs
+                    .slice()
+                    .reverse()
+                    .map((log, i) => (
+                      <div key={`${log.t}-${i}`} className="leading-snug flex items-start gap-1.5">
+                        <span className="text-zinc-600 shrink-0">
+                          {new Date(log.t).toLocaleTimeString([], {
+                            hour12: false,
+                            hour: '2-digit',
+                            minute: '2-digit',
+                            second: '2-digit',
+                          })}
+                        </span>
+                        <span
+                          className={
+                            log.level === 'error'
+                              ? 'text-red-400'
+                              : log.level === 'warn'
+                                ? 'text-amber-300'
+                                : log.level === 'success'
+                                  ? 'text-emerald-400'
+                                  : 'text-zinc-300'
+                          }
+                        >
+                          <strong className="font-semibold">{log.step}</strong>
+                          {log.detail ? ` — ${log.detail}` : ''}
+                        </span>
+                      </div>
+                    ))
+                )}
               </div>
             </div>
           </div>

@@ -241,8 +241,8 @@ export async function loadStudioUserConfig(username: string): Promise<StudioUser
       Math.min(10, Math.round(Number(raw?.studioUploadGateConcurrency) || DEFAULT_STUDIO_UPLOAD_GATE)),
     ),
     studioRunStaggerSec: Math.max(
-      0,
-      Math.min(120, Math.round(Number(raw?.studioRunStaggerSec) ?? DEFAULT_STUDIO_RUN_STAGGER_SEC)),
+      5,
+      Math.min(120, Math.round(Number(raw?.studioRunStaggerSec) || DEFAULT_STUDIO_RUN_STAGGER_SEC)),
     ),
     studioMinuteInput:
       typeof raw?.studioMinuteInput === 'string' && raw.studioMinuteInput.trim()

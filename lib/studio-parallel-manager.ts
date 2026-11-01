@@ -186,6 +186,10 @@ export interface ParallelWorkerCardSnapshot {
   summaryText: string | null
   screenshotBase64: string | null
   screenshotAt: number | null
+  assistMode?: boolean
+  paused?: boolean
+  currentUrl?: string
+  browserOpen?: boolean
   chromeProcessCount?: number
   chromeRssMb?: number
   logs: StudioStepLog[]
@@ -747,6 +751,12 @@ class GlobalProfileSlotPool {
     slot.leasedAt = null
   }
 
+  public getSlotByWorkerId(workerId: string): ProfileSlotEntry {
+    const m = String(workerId || '').match(/(\d+)/)
+    const idx = m ? Math.max(1, Math.min(20, Number(m[1]))) : 1
+    return this.getOrCreateSlot(idx)
+  }
+
   public async closeAndReleaseSlot(slotIndex: number, scanId?: string): Promise<void> {
     const slot = this.slots.get(slotIndex)
     if (!slot) return
@@ -756,10 +766,12 @@ class GlobalProfileSlotPool {
     slot.controller.setPaused(false)
     slot.controller.setStepLogListener(undefined)
     slot.controller.setScanContextTag('')
-    try {
-      await slot.controller.closeContext()
-    } catch {
-      await killWorkerChromeProcessesByProfileDir(slot.profileDirName).catch(() => {})
+    if (!slot.controller.isAssistMode()) {
+      try {
+        await slot.controller.closeContext()
+      } catch {
+        await killWorkerChromeProcessesByProfileDir(slot.profileDirName).catch(() => {})
+      }
     }
     if (!scanId || !slot.leasedByScanId || slot.leasedByScanId === scanId) {
       slot.leasedByScanId = null
@@ -784,8 +796,8 @@ class GlobalProfileSlotPool {
     for (const slot of this.slots.values()) {
       if (slot.leasedByScanId === scanId) {
         closePromises.push(this.closeAndReleaseSlot(slot.slotIndex, scanId))
-      } else if (slot.leasedByScanId === null) {
-        // Also ensure any unleased slot has 0 leftover zombie Chrome processes
+      } else if (slot.leasedByScanId === null && !slot.controller.isAssistMode()) {
+        // Also ensure any unleased slot not in Login Assist mode has 0 leftover zombie Chrome processes
         closePromises.push(
           slot.controller.closeContext().catch(() => {
             return killWorkerChromeProcessesByProfileDir(slot.profileDirName).then(() => {})
@@ -3356,9 +3368,11 @@ export class StudioParallelManager {
       }
       ctrl.setStepLogListener(undefined)
       ctrl.setScanContextTag('')
-      // Ensure this worker's Chrome is completely closed and any leftover processes are killed on DONE/PROHIBITED/FAILED/STOPPED
-      await ctrl.closeContext().catch(() => {})
-      this.recordResourceSnapshotIfNeeded(true, `Worker ${workerId} Chrome closed (${win.status})`)
+      // Ensure this worker's Chrome is closed on DONE/PROHIBITED/FAILED/STOPPED unless user enabled Login Assist on it
+      if (!ctrl.isAssistMode()) {
+        await ctrl.closeContext().catch(() => {})
+        this.recordResourceSnapshotIfNeeded(true, `Worker ${workerId} Chrome closed (${win.status})`)
+      }
     }
   }
 
@@ -3663,6 +3677,159 @@ export class StudioParallelManager {
     return count
   }
 
+  public async performWorkerControlAction(params: {
+    workerId: string
+    username: string
+    subAction:
+      | 'assist_toggle'
+      | 'click'
+      | 'type'
+      | 'key'
+      | 'navigate'
+      | 'save_session'
+      | 'pause'
+      | 'resume'
+      | 'stop'
+      | 'test_login'
+    enabled?: boolean
+    xRatio?: number
+    yRatio?: number
+    text?: string
+    key?: string
+    url?: string
+  }): Promise<{ ok: boolean; message?: string }> {
+    const slot = globalProfileSlotPool.getSlotByWorkerId(params.workerId)
+    const ctrl = slot.controller
+    const workerId = slot.workerId
+
+    switch (params.subAction) {
+      case 'assist_toggle': {
+        const nextVal = Boolean(params.enabled)
+        ctrl.setAssistMode(nextVal)
+        if (nextVal) {
+          await ctrl.ensurePage(params.username)
+          this.appendCombinedLog({
+            workerId,
+            level: 'INFO',
+            step: 'login assist ON',
+            message: `[${workerId}] Login Assist enabled — interactive click/type/URL controls active on ${slot.profileDirName}`,
+          })
+        } else {
+          await ctrl.saveLiveSessionToSettingsIfAuthenticated(params.username).catch(() => 0)
+          this.appendCombinedLog({
+            workerId,
+            level: 'INFO',
+            step: 'login assist OFF',
+            message: `[${workerId}] Login Assist disabled (session cookies synced)`,
+          })
+        }
+        return { ok: true }
+      }
+      case 'click': {
+        if (!ctrl.isAssistMode()) {
+          ctrl.setAssistMode(true)
+        }
+        await ctrl.performAssistAction(params.username, {
+          type: 'click',
+          xRatio: Number(params.xRatio) || 0,
+          yRatio: Number(params.yRatio) || 0,
+        })
+        return { ok: true }
+      }
+      case 'type': {
+        if (!ctrl.isAssistMode()) {
+          ctrl.setAssistMode(true)
+        }
+        await ctrl.performAssistAction(params.username, {
+          type: 'type',
+          text: String(params.text || ''),
+        })
+        return { ok: true }
+      }
+      case 'key': {
+        if (!ctrl.isAssistMode()) {
+          ctrl.setAssistMode(true)
+        }
+        await ctrl.performAssistAction(params.username, {
+          type: 'key',
+          key: String(params.key || 'Enter'),
+        })
+        return { ok: true }
+      }
+      case 'navigate': {
+        if (!ctrl.isAssistMode()) {
+          ctrl.setAssistMode(true)
+        }
+        await ctrl.performAssistAction(params.username, {
+          type: 'navigate',
+          url: String(params.url || 'https://aistudio.google.com/prompts/new_chat'),
+        })
+        return { ok: true }
+      }
+      case 'save_session': {
+        await ctrl.performAssistAction(params.username, {
+          type: 'save_session',
+        })
+        this.appendCombinedLog({
+          workerId,
+          level: 'SUCCESS',
+          step: 'cookies saved',
+          message: `[${workerId}] Saved live Google session cookies to Settings for all workers`,
+        })
+        return { ok: true, message: `Saved live cookies from ${workerId} to Settings` }
+      }
+      case 'pause': {
+        ctrl.setPaused(true)
+        this.appendCombinedLog({
+          workerId,
+          level: 'INFO',
+          step: 'worker paused',
+          message: `[${workerId}] Paused worker automation`,
+        })
+        return { ok: true }
+      }
+      case 'resume': {
+        ctrl.setPaused(false)
+        this.appendCombinedLog({
+          workerId,
+          level: 'INFO',
+          step: 'worker resumed',
+          message: `[${workerId}] Resumed worker automation`,
+        })
+        return { ok: true }
+      }
+      case 'stop': {
+        ctrl.setAssistMode(false)
+        ctrl.setPaused(false)
+        if (slot.leasedByScanId === this.scanId && slot.leasedWindowId) {
+          this.stopWindow(slot.leasedWindowId)
+        } else {
+          ctrl.requestStop()
+          await ctrl.closeContext().catch(() => {})
+          this.appendCombinedLog({
+            workerId,
+            level: 'STOPPED',
+            step: 'worker stopped',
+            message: `[${workerId}] Stopped & closed worker browser (${slot.profileDirName})`,
+          })
+        }
+        return { ok: true }
+      }
+      case 'test_login': {
+        const res = await ctrl.testLogin(params.username)
+        this.appendCombinedLog({
+          workerId,
+          level: res.loggedIn ? 'SUCCESS' : 'ERROR',
+          step: 'worker test login',
+          message: `[${workerId}] ${res.detail}`,
+        })
+        return { ok: true, message: res.detail }
+      }
+      default:
+        return { ok: false, message: 'Unknown worker subAction' }
+    }
+  }
+
   public async getLiveSnapshot(captureThumbnails = true): Promise<ParallelScanLiveSnapshot> {
     this.refreshScanMetadataFromStore()
     const slotPool = globalProfileSlotPool.getSummary(this.maxTotalPoolSlots)
@@ -3710,13 +3877,15 @@ export class StudioParallelManager {
           : null
       const wProcs = chromeStats.perWorkerProcs[slot.workerId] || 0
       const wRssMb = chromeStats.perWorkerRssMb[slot.workerId] || 0
+      const isOpenOrAssist =
+        slot.controller.isBrowserOpen() || slot.controller.isAssistMode()
 
       if (isLeasedByThisScan) {
         const snap = await slot.controller.getSnapshot(
-          captureThumbnails && Boolean(activeWin),
+          captureThumbnails && (Boolean(activeWin) || isOpenOrAssist),
           {
-            quality: 38,
-            minIntervalMs: 3000,
+            quality: isOpenOrAssist && slot.controller.isAssistMode() ? 50 : 38,
+            minIntervalMs: slot.controller.isAssistMode() ? 1000 : 3000,
             maxLogs: 200,
           },
         )
@@ -3746,6 +3915,10 @@ export class StudioParallelManager {
           summaryText: activeWin?.summaryText ?? null,
           screenshotBase64: snap.screenshotBase64,
           screenshotAt: snap.screenshotAt,
+          assistMode: snap.assistMode,
+          paused: snap.paused,
+          currentUrl: snap.currentUrl,
+          browserOpen: isOpenOrAssist,
           chromeProcessCount: wProcs,
           chromeRssMb: wRssMb,
           logs: slot.controller.getLogs(200),
@@ -3775,9 +3948,52 @@ export class StudioParallelManager {
           summaryText: `Busy (${slot.leasedByScanLabel || slot.leasedByScanId})`,
           screenshotBase64: null,
           screenshotAt: null,
+          assistMode: false,
+          paused: false,
+          currentUrl: '',
+          browserOpen: false,
           chromeProcessCount: wProcs,
           chromeRssMb: wRssMb,
           logs: [],
+        })
+      } else if (isOpenOrAssist) {
+        // Worker browser is open (e.g. via per-worker Login Assist or Test Login) while IDLE
+        const snap = await slot.controller.getSnapshot(captureThumbnails, {
+          quality: 50,
+          minIntervalMs: 1000,
+          maxLogs: 200,
+        })
+        const meta = slot.controller.getActiveRunMeta()
+        workerCards.push({
+          workerId: slot.workerId,
+          workerIndex: i,
+          profileDirName: slot.profileDirName,
+          active: true,
+          leasedByScanId: null,
+          leasedByScanLabel: null,
+          leasedByOtherScan: false,
+          status: 'IDLE',
+          windowId: null,
+          windowNumber: null,
+          windowRange: null,
+          runLabel: null,
+          modelName: meta.modelName || 'Gemini 3.8 Flash',
+          stage: snap.assistMode ? `Login Assist (${snap.currentStep || 'ready'})` : snap.currentStep || 'open',
+          tokens: snap.tokenCount,
+          elapsedSec: snap.elapsedSec,
+          attempt: 0,
+          maxAttempts: 5,
+          permRetry: 0,
+          summaryText: snap.assistMode ? 'Login Assist Active' : null,
+          screenshotBase64: snap.screenshotBase64,
+          screenshotAt: snap.screenshotAt,
+          assistMode: snap.assistMode,
+          paused: snap.paused,
+          currentUrl: snap.currentUrl,
+          browserOpen: true,
+          chromeProcessCount: wProcs,
+          chromeRssMb: wRssMb,
+          logs: slot.controller.getLogs(200),
         })
       } else {
         workerCards.push({
@@ -3803,9 +4019,13 @@ export class StudioParallelManager {
           summaryText: null,
           screenshotBase64: null,
           screenshotAt: null,
+          assistMode: slot.controller.isAssistMode(),
+          paused: false,
+          currentUrl: '',
+          browserOpen: false,
           chromeProcessCount: wProcs,
           chromeRssMb: wRssMb,
-          logs: [],
+          logs: slot.controller.getLogs(200),
         })
       }
     }

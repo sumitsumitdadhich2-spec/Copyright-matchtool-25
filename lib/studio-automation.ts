@@ -968,9 +968,53 @@ export class StudioBrowserController {
     return false
   }
 
-  public setAssistMode(val: boolean) {
+  public setAssistMode(val: boolean, username?: string) {
+    const wasAssist = this.assistMode
     this.assistMode = val
     this.logStep(val ? 'login assist ON' : 'login assist OFF', undefined, 'info')
+    if (wasAssist && !val && this.context) {
+      void this.saveLiveSessionToSettingsIfAuthenticated(username || this.activeUsername || 'admin').catch(
+        () => {},
+      )
+    }
+  }
+
+  public isAssistMode(): boolean {
+    return this.assistMode
+  }
+
+  public isBrowserOpen(): boolean {
+    return Boolean(this.page && !this.page.isClosed() && !this.pageCrashed)
+  }
+
+  public async saveLiveSessionToSettingsIfAuthenticated(username: string): Promise<number> {
+    if (!this.context) return 0
+    try {
+      const allCookies = await this.context.cookies([
+        'https://aistudio.google.com',
+        'https://accounts.google.com',
+        'https://www.google.com',
+      ])
+      const hasGoogleAuth = allCookies.some((c) =>
+        /^(SID|HSID|SSID|APISID|SAPISID|__Secure-1PSID|__Secure-3PSID)$/i.test(c.name),
+      )
+      if (!hasGoogleAuth || allCookies.length === 0) return 0
+
+      const state = await this.context.storageState()
+      const { saveUserGoogleCookies } = await import('./studio-settings')
+      await saveUserGoogleCookies(username || 'admin', JSON.stringify(state))
+      const newFp = await getSettingsCookieFingerprint(username || 'admin')
+      this.appliedCookieFingerprint = newFp
+      this.writeProfileCookieFingerprint(newFp)
+      this.logStep(
+        'session synced',
+        `Saved ${allCookies.length} live Google cookie(s) to Settings (id=${newFp.slice(0, 8)}) for all workers`,
+        'success',
+      )
+      return allCookies.length
+    } catch {
+      return 0
+    }
   }
 
   public async waitIfPausedOrThrowIfStopped(scope?: { scanId?: string | null; username?: string | null }) {
@@ -1047,8 +1091,31 @@ export class StudioBrowserController {
 
   private appliedCookieFingerprint: string | null = null
 
+  private readProfileCookieFingerprint(): string | null {
+    try {
+      const fpFile = path.join(DATA_DIR, this.profileDirName, '.cookie-fingerprint')
+      if (fs.existsSync(fpFile)) {
+        return fs.readFileSync(fpFile, 'utf8').trim() || null
+      }
+    } catch {
+      /* ignore */
+    }
+    return null
+  }
+
+  private writeProfileCookieFingerprint(fp: string) {
+    try {
+      const profileDir = path.join(DATA_DIR, this.profileDirName)
+      fs.mkdirSync(profileDir, { recursive: true })
+      fs.writeFileSync(path.join(profileDir, '.cookie-fingerprint'), fp, 'utf8')
+    } catch {
+      /* ignore */
+    }
+  }
+
   private wipeProfileSessionFilesOnDisk(profileDir: string) {
     const pathsToRemove = [
+      path.join(profileDir, '.cookie-fingerprint'),
       path.join(profileDir, 'storage-state.json'),
       path.join(profileDir, 'Default', 'Cookies'),
       path.join(profileDir, 'Default', 'Cookies-journal'),
@@ -1072,6 +1139,7 @@ export class StudioBrowserController {
 
   public async clearAllBrowserCookiesAndStorage(): Promise<void> {
     this.appliedCookieFingerprint = null
+    this.writeProfileCookieFingerprint('NONE')
     if (this.context) {
       try {
         await this.context.clearCookies()
@@ -1116,10 +1184,20 @@ export class StudioBrowserController {
     }
 
     const cookies = await loadDecryptedPlaywrightCookies(username)
-    // Always wipe any existing browser cookies/storage first when syncing or switching cookies
-    await this.clearAllBrowserCookiesAndStorage()
+    const diskFp = this.readProfileCookieFingerprint()
 
     if (cookies.length === 0) {
+      // If user is actively in Login Assist mode, do NOT wipe their in-progress login!
+      if (this.assistMode) {
+        this.appliedCookieFingerprint = 'ASSIST'
+        return
+      }
+      // If browser already has authenticated Google cookies from Login Assist, save them to Settings instead of wiping!
+      const savedCount = await this.saveLiveSessionToSettingsIfAuthenticated(username)
+      if (savedCount > 0) {
+        return
+      }
+      await this.clearAllBrowserCookiesAndStorage()
       this.appliedCookieFingerprint = 'NONE'
       this.lastInjectedCookieUser = null
       this.logStep(
@@ -1130,10 +1208,16 @@ export class StudioBrowserController {
       return
     }
 
+    // Only wipe existing origin storage if switching to a DIFFERENT cookie fingerprint from what was previously on disk
+    if (diskFp && diskFp !== 'NONE' && diskFp !== 'ASSIST' && diskFp !== fingerprint && !this.assistMode) {
+      await this.clearAllBrowserCookiesAndStorage()
+    }
+
     try {
       await this.context.addCookies(cookies)
       this.appliedCookieFingerprint = fingerprint
       this.lastInjectedCookieUser = username
+      this.writeProfileCookieFingerprint(fingerprint)
       this.logStep(
         'cookies loaded from Settings',
         `${cookies.length} Google cookie(s) applied from Settings (id=${fingerprint.slice(0, 8)})`,
@@ -1149,6 +1233,7 @@ export class StudioBrowserController {
   }
 
   public async ensurePage(username: string): Promise<Page> {
+    this.activeUsername = username || 'admin'
     if (this.pageCrashed) {
       await this.forceRestartDeadBrowser()
     }
@@ -1181,8 +1266,18 @@ export class StudioBrowserController {
 
         const profileDir = path.join(DATA_DIR, this.profileDirName)
         if (!fs.existsSync(profileDir)) fs.mkdirSync(profileDir, { recursive: true })
-        // Wipe any stale disk cookies/session files inside the profile dir before launching so Settings is the sole source of truth
-        this.wipeProfileSessionFilesOnDisk(profileDir)
+        // Only wipe disk session files if Settings cookies were deleted or changed to a different account
+        const currentFp = await getSettingsCookieFingerprint(username)
+        const diskFp = this.readProfileCookieFingerprint()
+        if (
+          !this.assistMode &&
+          diskFp &&
+          diskFp !== 'ASSIST' &&
+          ((currentFp === 'NONE' && diskFp !== 'NONE') ||
+            (currentFp !== 'NONE' && diskFp !== 'NONE' && diskFp !== currentFp))
+        ) {
+          this.wipeProfileSessionFilesOnDisk(profileDir)
+        }
         this.appliedCookieFingerprint = null
 
         const displayEnv = await this.ensureXvfbDisplay()
@@ -1480,7 +1575,10 @@ export class StudioBrowserController {
       const state = await this.context.storageState()
       const { saveUserGoogleCookies } = await import('./studio-settings')
       await saveUserGoogleCookies(username, JSON.stringify(state))
-      this.logStep('session saved', `Saved ${state.cookies.length} cookies from live browser`, 'success')
+      const newFp = await getSettingsCookieFingerprint(username)
+      this.appliedCookieFingerprint = newFp
+      this.writeProfileCookieFingerprint(newFp)
+      this.logStep('session saved', `Saved ${state.cookies.length} cookies from live browser (id=${newFp.slice(0, 8)})`, 'success')
     }
     await new Promise((r) => setTimeout(r, 350))
     return this.getSnapshot(true)
@@ -1540,6 +1638,10 @@ export class StudioBrowserController {
 
     const promptLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.promptInput, 4000)
     const loggedIn = !isGoogleLoginRedirect && Boolean(promptLoc || url.includes('aistudio.google.com/prompts') || url.includes('aistudio.google.com/app'))
+
+    if (loggedIn) {
+      await this.saveLiveSessionToSettingsIfAuthenticated(username).catch(() => {})
+    }
 
     await saveStudioUserConfig(username, {
       lastLoginStatus: loggedIn ? 'logged_in' : 'logged_out',
@@ -2359,7 +2461,7 @@ export class StudioBrowserController {
 
     const selectCategoryChipInDrawer = async (chipLabel: 'All' | 'Gemini'): Promise<void> => {
       try {
-        const tagged = await page.evaluate((targetLabel) => {
+        const status = await page.evaluate((targetLabel) => {
           document
             .querySelectorAll('[data-cmt-model-filter-chip]')
             .forEach((el) => el.removeAttribute('data-cmt-model-filter-chip'))
@@ -2393,67 +2495,65 @@ export class StudioBrowserController {
 
           const root = drawerRoot || document.body
           const buttons = Array.from(
-            root.querySelectorAll('button, mat-chip-option, mat-chip, [role="tab"], [role="button"], span'),
+            root.querySelectorAll('button, mat-chip-option, mat-chip, [role="tab"], [role="option"], [role="button"], span'),
           )
           const re = new RegExp(`^${targetLabel}$`, 'i')
           for (const b of buttons) {
             if (!isVis(b)) continue
             const r = b.getBoundingClientRect()
-            if (r.height > 55 || r.width > 140 || r.width < 24) continue
+            if (r.height > 55 || r.width > 140 || r.width < 22) continue
             const txt = (b.innerText || b.textContent || '').trim()
             if (re.test(txt)) {
-              const clickEl = (b.closest('button, mat-chip-option, mat-chip, [role="tab"], [role="button"]') as HTMLElement) || b
+              const clickEl =
+                (b.closest('mat-chip-option, mat-chip, button, [role="tab"], [role="option"], [role="button"]') as HTMLElement) ||
+                (b as HTMLElement)
+              const cls = `${clickEl.className || ''} ${b.className || ''}`.toLowerCase()
+              const ariaSelected =
+                clickEl.getAttribute('aria-selected') === 'true' ||
+                clickEl.getAttribute('aria-pressed') === 'true' ||
+                clickEl.getAttribute('aria-checked') === 'true' ||
+                b.getAttribute('aria-selected') === 'true' ||
+                b.getAttribute('aria-pressed') === 'true' ||
+                /\b(mat-mdc-chip-selected|mdc-evolution-chip--selected|selected|active|checked)\b/.test(cls)
+              if (ariaSelected) {
+                return 'already_selected'
+              }
               clickEl.setAttribute('data-cmt-model-filter-chip', 'true')
-              clickEl.click()
-              return true
+              return 'tagged'
             }
           }
-          return false
+          return 'not_found'
         }, chipLabel)
 
-        if (tagged) {
+        if (status === 'tagged') {
           const chipLoc = page.locator('[data-cmt-model-filter-chip="true"]').first()
           if ((await chipLoc.count()) > 0 && (await chipLoc.isVisible().catch(() => false))) {
             await chipLoc.click({ timeout: 1500 }).catch(() => {})
+          } else {
+            await page
+              .evaluate(() => {
+                const el = document.querySelector('[data-cmt-model-filter-chip="true"]') as HTMLElement | null
+                if (el) el.click()
+              })
+              .catch(() => {})
           }
-          await new Promise((r) => setTimeout(r, 350))
+          await new Promise((r) => setTimeout(r, 400))
         }
       } catch {
         /* ignore */
       }
     }
 
-    const tagAndClickModelInDrawer = async (params: {
-      ver: string
-      wantFlash: boolean
-      wantArgon: boolean
-      fullLabel: string
-    }): Promise<string | null> => {
-      const taggedText = await page
-        .evaluate(({ ver, wantFlash, wantArgon, fullLabel }) => {
-          document
-            .querySelectorAll('[data-cmt-pick-model-title], [data-cmt-pick-model-card]')
-            .forEach((el) => {
-              el.removeAttribute('data-cmt-pick-model-title')
-              el.removeAttribute('data-cmt-pick-model-card')
-            })
-
-          const isVis = (el: Element | null): el is HTMLElement => {
-            if (!el) return false
-            const h = el as HTMLElement
-            const r = h.getBoundingClientRect()
-            return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
-          }
-
-          // Locate the open Model selection drawer container
+    const scrollModelDrawerList = async (scrollTopPx: number): Promise<void> => {
+      await page
+        .evaluate((topPx) => {
           const searchInput = document.querySelector(
             'input[placeholder*="Search for a model" i], input[placeholder*="Search models" i], input[aria-label*="Search for a model" i]',
           )
           let drawerRoot: HTMLElement | null =
             (document.querySelector(
-              '.ms-sliding-right-panel-dialog, [class*="ms-sliding-right-panel-dialog" i], ms-model-picker, ms-model-selection, .model-selection-panel, .cdk-overlay-pane mat-dialog-container, .cdk-overlay-pane [role="listbox"]',
+              '.ms-sliding-right-panel-dialog, [class*="ms-sliding-right-panel-dialog" i], ms-model-picker, ms-model-selection, .model-selection-panel',
             ) as HTMLElement | null) || null
-
           if (!drawerRoot && searchInput) {
             let curr: HTMLElement | null = searchInput as HTMLElement
             for (let d = 0; d < 9 && curr && curr !== document.body; d++) {
@@ -2465,125 +2565,189 @@ export class StudioBrowserController {
               curr = curr.parentElement
             }
           }
-
-          const roots: HTMLElement[] = []
-          if (drawerRoot && isVis(drawerRoot)) roots.push(drawerRoot)
-          Array.from(
-            document.querySelectorAll(
-              '.ms-sliding-right-panel-dialog, .cdk-overlay-pane, mat-dialog-container, [role="dialog"], [role="listbox"], ms-model-picker, ms-model-selection, .model-selection-panel',
-            ),
-          ).forEach((el) => {
-            if (isVis(el) && !roots.includes(el as HTMLElement)) {
-              roots.push(el as HTMLElement)
+          if (!drawerRoot) return
+          const scrollables = [drawerRoot, ...Array.from(drawerRoot.querySelectorAll('*'))] as HTMLElement[]
+          for (const el of scrollables) {
+            if (el.scrollHeight > el.clientHeight + 30 && el.clientHeight >= 150) {
+              el.scrollTop = topPx
             }
-          })
-
-          const targetSlug = wantArgon
-            ? 'gemini-4-argon'
-            : ver && wantFlash
-              ? `gemini-${ver}-flash`
-              : ''
-
-          const isExcludedText = (txt: string): boolean => {
-            if (/\b(tts|lite|image|audio|live)\b/i.test(txt)) return true
-            if (wantFlash && /\bpro\b/i.test(txt) && !/\bflash\b/i.test(txt)) return true
-            return false
           }
+        }, scrollTopPx)
+        .catch(() => {})
+      await new Promise((r) => setTimeout(r, 220))
+    }
 
-          const matchesModel = (txt: string): boolean => {
-            if (!txt || isExcludedText(txt)) return false
-            if (wantArgon) {
-              return /\bargon\b/i.test(txt)
-            }
-            if (ver) {
-              return txt.includes(ver) && (!wantFlash || /flash/i.test(txt))
-            }
-            return txt.toLowerCase().includes(fullLabel.toLowerCase())
-          }
+    const tagAndClickModelInDrawer = async (params: {
+      ver: string
+      wantFlash: boolean
+      wantArgon: boolean
+      fullLabel: string
+    }): Promise<string | null> => {
+      const scrollSteps = [0, 320, 640, 960, 1300]
+      let taggedText: string | null = null
 
-          // Pass A: Look for exact slug or title leaf element inside the drawer
-          const allNodes: HTMLElement[] = []
-          for (const root of roots) {
-            root.querySelectorAll('*').forEach((n) => {
-              if (isVis(n)) allNodes.push(n as HTMLElement)
+      for (const scrollPx of scrollSteps) {
+        if (scrollPx > 0) {
+          await scrollModelDrawerList(scrollPx)
+        }
+        taggedText = await page
+          .evaluate(({ ver, wantFlash, wantArgon, fullLabel }) => {
+            document
+              .querySelectorAll('[data-cmt-pick-model-title], [data-cmt-pick-model-card]')
+              .forEach((el) => {
+                el.removeAttribute('data-cmt-pick-model-title')
+                el.removeAttribute('data-cmt-pick-model-card')
+              })
+
+            const isVis = (el: Element | null): el is HTMLElement => {
+              if (!el) return false
+              const h = el as HTMLElement
+              const r = h.getBoundingClientRect()
+              return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+            }
+
+            // Locate the open Model selection drawer container
+            const searchInput = document.querySelector(
+              'input[placeholder*="Search for a model" i], input[placeholder*="Search models" i], input[aria-label*="Search for a model" i]',
+            )
+            let drawerRoot: HTMLElement | null =
+              (document.querySelector(
+                '.ms-sliding-right-panel-dialog, [class*="ms-sliding-right-panel-dialog" i], ms-model-picker, ms-model-selection, .model-selection-panel, .cdk-overlay-pane mat-dialog-container, .cdk-overlay-pane [role="listbox"]',
+              ) as HTMLElement | null) || null
+
+            if (!drawerRoot && searchInput) {
+              let curr: HTMLElement | null = searchInput as HTMLElement
+              for (let d = 0; d < 9 && curr && curr !== document.body; d++) {
+                const r = curr.getBoundingClientRect()
+                if (r.height >= 260 && r.width >= 240) {
+                  drawerRoot = curr
+                  break
+                }
+                curr = curr.parentElement
+              }
+            }
+
+            const roots: HTMLElement[] = []
+            if (drawerRoot && isVis(drawerRoot)) roots.push(drawerRoot)
+            Array.from(
+              document.querySelectorAll(
+                '.ms-sliding-right-panel-dialog, .cdk-overlay-pane, mat-dialog-container, [role="dialog"], [role="listbox"], ms-model-picker, ms-model-selection, .model-selection-panel',
+              ),
+            ).forEach((el) => {
+              if (isVis(el) && !roots.includes(el as HTMLElement)) {
+                roots.push(el as HTMLElement)
+              }
             })
-          }
 
-          let matchedTitleEl: HTMLElement | null = null
-          let matchedCardEl: HTMLElement | null = null
-          let bestScore = -1
+            const targetSlug = wantArgon
+              ? 'gemini-4-argon'
+              : ver && wantFlash
+                ? `gemini-${ver}-flash`
+                : ''
 
-          for (const el of allNodes) {
-            // Skip inputs, close buttons, filter chips, and icon-only buttons
-            const tag = el.tagName.toLowerCase()
-            if (tag === 'input' || tag === 'mat-icon') continue
-            const r = el.getBoundingClientRect()
-            if (r.height < 12 || r.height > 230 || r.width < 45) continue
-
-            const txt = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ')
-            if (!txt || txt.length > 360) continue
-            if (/^search\s+for\s+a\s+model/i.test(txt) || /^model\s+selection/i.test(txt)) continue
-            if (!matchesModel(txt)) continue
-
-            // Ensure this node does not wrap MULTIPLE different model cards
-            const slugMatches = txt.match(/\bgemini-[0-9a-z.-]+\b/gi) || []
-            const uniqueSlugs = new Set(slugMatches.map((s) => s.toLowerCase()))
-            if (uniqueSlugs.size > 1) continue
-
-            let score = 0
-            if (targetSlug && txt.toLowerCase() === targetSlug) score += 100
-            else if (targetSlug && uniqueSlugs.has(targetSlug)) score += 80
-            if (wantArgon && /^gemini\s*4\s*argon$/i.test(txt)) score += 95
-            if (ver && new RegExp(`^gemini\\s*${ver.replace('.', '\\.')}\\s*flash$`, 'i').test(txt)) {
-              score += 95
+            const isExcludedText = (txt: string): boolean => {
+              if (/\b(tts|lite|image|audio|live)\b/i.test(txt)) return true
+              if (wantFlash && /\bpro\b/i.test(txt) && !/\bflash\b/i.test(txt)) return true
+              return false
             }
-            // Prefer compact leaf/title or single card over huge container
-            if (el.children.length <= 2 && r.height <= 45) score += 30
-            else if (r.height >= 45 && r.height <= 160 && r.width >= 200) score += 20
 
-            if (score > bestScore) {
-              bestScore = score
-              matchedTitleEl = el
+            const matchesModel = (txt: string): boolean => {
+              if (!txt || isExcludedText(txt)) return false
+              if (wantArgon) {
+                return /\bargon\b/i.test(txt)
+              }
+              if (ver) {
+                return txt.includes(ver) && (!wantFlash || /flash/i.test(txt))
+              }
+              return txt.toLowerCase().includes(fullLabel.toLowerCase())
             }
-          }
 
-          if (!matchedTitleEl) return null
-
-          // Climb from matchedTitleEl to find the single model card/row container
-          let curr: HTMLElement | null = matchedTitleEl
-          for (let d = 0; d < 7 && curr && curr !== document.body; d++) {
-            const r = curr.getBoundingClientRect()
-            const txt = (curr.innerText || curr.textContent || '').trim().replace(/\s+/g, ' ')
-            const slugMatches = txt.match(/\bgemini-[0-9a-z.-]+\b/gi) || []
-            const uniqueSlugs = new Set(slugMatches.map((s) => s.toLowerCase()))
-            if (uniqueSlugs.size > 1 || r.height > 220) break
-            if (
-              !isExcludedText(txt) &&
-              r.height >= 42 &&
-              r.height <= 200 &&
-              r.width >= 180
-            ) {
-              matchedCardEl = curr
+            // Pass A: Look for exact slug or title leaf element inside the drawer
+            const allNodes: HTMLElement[] = []
+            for (const root of roots) {
+              root.querySelectorAll('*').forEach((n) => {
+                if (isVis(n)) allNodes.push(n as HTMLElement)
+              })
             }
-            curr = curr.parentElement
-          }
 
-          matchedTitleEl.scrollIntoView({ block: 'center', inline: 'nearest' })
-          matchedTitleEl.setAttribute('data-cmt-pick-model-title', 'true')
-          if (matchedCardEl) {
-            matchedCardEl.setAttribute('data-cmt-pick-model-card', 'true')
-          }
+            let matchedTitleEl: HTMLElement | null = null
+            let matchedCardEl: HTMLElement | null = null
+            let bestScore = -1
 
-          const cardText = (
-            (matchedCardEl || matchedTitleEl).innerText ||
-            (matchedCardEl || matchedTitleEl).textContent ||
-            ''
-          )
-            .trim()
-            .replace(/\s+/g, ' ')
-          return cardText || fullLabel
-        }, params)
-        .catch(() => null)
+            for (const el of allNodes) {
+              // Skip inputs, close buttons, filter chips, and icon-only buttons
+              const tag = el.tagName.toLowerCase()
+              if (tag === 'input' || tag === 'mat-icon') continue
+              const r = el.getBoundingClientRect()
+              if (r.height < 12 || r.height > 230 || r.width < 45) continue
+
+              const txt = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ')
+              if (!txt || txt.length > 360) continue
+              if (/^search\s+for\s+a\s+model/i.test(txt) || /^model\s+selection/i.test(txt)) continue
+              if (!matchesModel(txt)) continue
+
+              // Ensure this node does not wrap MULTIPLE different model cards
+              const slugMatches = txt.match(/\bgemini-[0-9a-z.-]+\b/gi) || []
+              const uniqueSlugs = new Set(slugMatches.map((s) => s.toLowerCase()))
+              if (uniqueSlugs.size > 1) continue
+
+              let score = 0
+              if (targetSlug && txt.toLowerCase() === targetSlug) score += 100
+              else if (targetSlug && uniqueSlugs.has(targetSlug)) score += 80
+              if (wantArgon && /^gemini\s*4\s*argon$/i.test(txt)) score += 95
+              if (ver && new RegExp(`^gemini\\s*${ver.replace('.', '\\.')}\\s*flash$`, 'i').test(txt)) {
+                score += 95
+              }
+              // Prefer compact leaf/title or single card over huge container
+              if (el.children.length <= 2 && r.height <= 45) score += 30
+              else if (r.height >= 45 && r.height <= 160 && r.width >= 200) score += 20
+
+              if (score > bestScore) {
+                bestScore = score
+                matchedTitleEl = el
+              }
+            }
+
+            if (!matchedTitleEl) return null
+
+            // Climb from matchedTitleEl to find the single model card/row container
+            let curr: HTMLElement | null = matchedTitleEl
+            for (let d = 0; d < 7 && curr && curr !== document.body; d++) {
+              const r = curr.getBoundingClientRect()
+              const txt = (curr.innerText || curr.textContent || '').trim().replace(/\s+/g, ' ')
+              const slugMatches = txt.match(/\bgemini-[0-9a-z.-]+\b/gi) || []
+              const uniqueSlugs = new Set(slugMatches.map((s) => s.toLowerCase()))
+              if (uniqueSlugs.size > 1 || r.height > 220) break
+              if (
+                !isExcludedText(txt) &&
+                r.height >= 42 &&
+                r.height <= 200 &&
+                r.width >= 180
+              ) {
+                matchedCardEl = curr
+              }
+              curr = curr.parentElement
+            }
+
+            matchedTitleEl.scrollIntoView({ block: 'center', inline: 'nearest' })
+            matchedTitleEl.setAttribute('data-cmt-pick-model-title', 'true')
+            if (matchedCardEl) {
+              matchedCardEl.setAttribute('data-cmt-pick-model-card', 'true')
+            }
+
+            const cardText = (
+              (matchedCardEl || matchedTitleEl).innerText ||
+              (matchedCardEl || matchedTitleEl).textContent ||
+              ''
+            )
+              .trim()
+              .replace(/\s+/g, ' ')
+            return cardText || fullLabel
+          }, params)
+          .catch(() => null)
+
+        if (taggedText) break
+      }
 
       if (!taggedText) return null
 
@@ -2652,9 +2816,10 @@ export class StudioBrowserController {
         return { matched: matchesModelText(recheck, desired), cardText: recheck }
       }
 
-      // CRITICAL: Click "All" category filter chip inside the Model selection drawer first!
+      // CRITICAL: Click "All" category filter chip inside the Model selection drawer ONCE if not already active!
       // By default, "Featured" is selected in AI Studio, which hides Gemini 3.7 Flash & Gemini 3.6 Flash.
       await selectCategoryChipInDrawer('All')
+      await scrollModelDrawerList(0)
 
       // Pass 1: Filter via search input + click model card
       try {
@@ -2663,10 +2828,12 @@ export class StudioBrowserController {
           const searchQuery = isArgon ? 'argon' : desiredVersion ? `${desiredVersion}` : desired
           await searchInput.click({ timeout: 1500 }).catch(() => {})
           await searchInput.fill('').catch(() => {})
-          await searchInput.fill(searchQuery).catch(() => {})
+          await searchInput.type(searchQuery, { delay: 30 }).catch(async () => {
+            await searchInput.fill(searchQuery).catch(() => {})
+          })
           await searchInput.dispatchEvent('input').catch(() => {})
           await searchInput.dispatchEvent('change').catch(() => {})
-          await new Promise((r) => setTimeout(r, 450))
+          await new Promise((r) => setTimeout(r, 550))
         }
       } catch {
         /* ignore */
@@ -2679,26 +2846,58 @@ export class StudioBrowserController {
         fullLabel: desired,
       })
 
-      // Pass 2: If not found with search query (or if search filter hid results), clear search, click "Gemini" / "All", and scan drawer list
+      // Pass 2: If not found with search query (or if search filter hid results), clear search, click "Gemini" / "All", and scan + scroll drawer list
       if (!clickedModel) {
         try {
           const searchInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSearchInput, 800)
           if (searchInput) {
+            await searchInput.click({ clickCount: 3 }).catch(() => {})
+            await searchInput.press('Backspace').catch(() => {})
             await searchInput.fill('').catch(() => {})
             await searchInput.dispatchEvent('input').catch(() => {})
             await searchInput.dispatchEvent('change').catch(() => {})
-            await new Promise((r) => setTimeout(r, 350))
+            await new Promise((r) => setTimeout(r, 400))
           }
         } catch {
           /* ignore */
         }
         await selectCategoryChipInDrawer('Gemini')
+        await scrollModelDrawerList(0)
         clickedModel = await tagAndClickModelInDrawer({
           ver: desiredVersion,
           wantFlash: isFlash,
           wantArgon: isArgon,
           fullLabel: desired,
         })
+      }
+
+      // Pass 3: If still not found under "Gemini", try "All" with empty search box + full scroll
+      if (!clickedModel) {
+        await selectCategoryChipInDrawer('All')
+        await scrollModelDrawerList(0)
+        clickedModel = await tagAndClickModelInDrawer({
+          ver: desiredVersion,
+          wantFlash: isFlash,
+          wantArgon: isArgon,
+          fullLabel: desired,
+        })
+      }
+
+      if (!clickedModel) {
+        const availableSlugs = await page
+          .evaluate(() => {
+            const txt = document.body?.innerText || ''
+            const m = txt.match(/\bgemini-[0-9a-z.-]+\b/gi) || []
+            return Array.from(new Set(m.map((s) => s.toLowerCase()))).slice(0, 12)
+          })
+          .catch(() => [] as string[])
+        if (availableSlugs.length > 0) {
+          this.logStep(
+            'drawer models check',
+            `"${desired}" card not visible in drawer (visible slugs: ${availableSlugs.join(', ')})`,
+            'warn',
+          )
+        }
       }
 
       await new Promise((r) => setTimeout(r, 450))
@@ -5130,6 +5329,14 @@ export class StudioBrowserController {
       0,
       MODEL_FALLBACK_CHAIN.findIndex((m) => m.toLowerCase() === activeModelName.toLowerCase()),
     )
+    const buildNewChatUrlForModel = (mName: string): string => {
+      const canon = canonicalizeStudioModelName(mName || '')
+      if (/argon/i.test(canon)) return `${STUDIO_URLS.newChat}?model=gemini-4-argon`
+      if (/3\.8/i.test(canon)) return `${STUDIO_URLS.newChat}?model=gemini-3.8-flash`
+      if (/3\.7/i.test(canon)) return `${STUDIO_URLS.newChat}?model=gemini-3.7-flash`
+      if (/3\.6/i.test(canon)) return `${STUDIO_URLS.newChat}?model=gemini-3.6-flash`
+      return STUDIO_URLS.newChat
+    }
     let resetOnPermissionDenied = false
     let pendingInternalErrorAction:
       | 'none'
@@ -5254,7 +5461,7 @@ export class StudioBrowserController {
             this.logStep(`${resetPrefix} -> hard reset (page+cache)`, resetDetail, 'info')
             onLog?.('info', `${resetPrefix} -> hard reset (page+cache): ${resetDetail}`)
 
-            await page.goto(STUDIO_URLS.newChat, {
+            await page.goto(buildNewChatUrlForModel(activeModelName), {
               waitUntil: 'domcontentloaded',
               timeout: 45_000,
             })
@@ -5299,7 +5506,7 @@ export class StudioBrowserController {
             this.logStep(`${resetPrefix} -> browser restart`, restartDetail, 'info')
             onLog?.('info', `${resetPrefix} -> browser restart: ${restartDetail}`)
 
-            await page.goto(STUDIO_URLS.newChat, {
+            await page.goto(buildNewChatUrlForModel(activeModelName), {
               waitUntil: 'domcontentloaded',
               timeout: 45_000,
             })
@@ -5370,7 +5577,7 @@ export class StudioBrowserController {
           const restartDetail = `${jobLabel} (refresh ${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH}, model=${activeModelName}) — persistent profile (${this.profileDirName}) relaunched (cookies & origin storage preserved)`
           this.logStep(restartLogStep, restartDetail, 'info')
           onLog?.('info', `${restartLogStep}: ${restartDetail}`)
-          await page.goto(STUDIO_URLS.newChat, {
+          await page.goto(buildNewChatUrlForModel(activeModelName), {
             waitUntil: 'domcontentloaded',
             timeout: 45_000,
           })
@@ -5382,8 +5589,9 @@ export class StudioBrowserController {
             this.logStep(lastResortStep, lastResortDetail, 'warn')
             onLog?.('warn', `${lastResortStep}: ${lastResortDetail}`)
           }
-          this.logStep('opening new chat', `${jobLabel} (attempt ${attempt}/${MAX_ATTEMPTS}, model=${activeModelName})`)
-          await page.goto(STUDIO_URLS.newChat, {
+          const targetNewChatUrl = buildNewChatUrlForModel(activeModelName)
+          this.logStep('opening new chat', `${jobLabel} (attempt ${attempt}/${MAX_ATTEMPTS}, model=${activeModelName}, url=${targetNewChatUrl})`)
+          await page.goto(targetNewChatUrl, {
             waitUntil: 'domcontentloaded',
             timeout: 45_000,
           })
@@ -5992,6 +6200,7 @@ export class StudioBrowserController {
         let permissionDeniedTriggered = false
         let internalErrorDetected = false
         let internalErrorContinueTriedInChat = false
+        let internalErrorSameChatRetries = 0
         let quotaContinuePartialText: string | null = null
         let quotaSwitchRetryNewChat = false
         let transientBannerReason: string | null = null
@@ -6042,6 +6251,133 @@ export class StudioBrowserController {
           }, [...STUDIO_SELECTORS.modelTurnContainers])
           .catch(() => ({ count: 0, lastHadInternalError: false }))
 
+        const trySameChatInternalErrorRerun = async (reasonDetail: string): Promise<boolean> => {
+          if (internalErrorSameChatRetries >= 2) return false
+          const partialCheck = await this.extractFinalAnswerWithoutThoughts(page)
+          const hasValidPartial =
+            Boolean(
+              partialCheck &&
+                /\bHISSA\s*1\b/i.test(partialCheck) &&
+                !isThinkingOnlyText(partialCheck) &&
+                !/^(?:an\s+internal\s+error|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i.test(
+                  partialCheck.trim(),
+                ),
+            )
+          if (hasValidPartial) {
+            // Let post-loop Continue in same chat stitch the partial HISSA 1 output
+            return false
+          }
+
+          internalErrorSameChatRetries += 1
+          await cancelStuckStopButtonIfVisible()
+          await this.markPageErrorBannersHandled(page)
+
+          // On 2nd same-chat internal error retry, switch to the next non-exhausted model in MODEL_FALLBACK_CHAIN
+          if (internalErrorSameChatRetries === 2) {
+            const prevMod = activeModelName
+            const quotaSnap = await loadStudioModelQuotaState()
+            const nonExhausted = MODEL_FALLBACK_CHAIN.filter(
+              (m) => !quotaSnap.exhausted[canonicalizeStudioModelName(m)],
+            )
+            const pool = nonExhausted.length > 0 ? nonExhausted : MODEL_FALLBACK_CHAIN
+            const curIdx = pool.findIndex((m) => m.toLowerCase() === prevMod.toLowerCase())
+            const nextMod = pool[(curIdx + 1) % pool.length] || prevMod
+            if (nextMod.toLowerCase() !== prevMod.toLowerCase()) {
+              this.logStep(
+                'internal error -> switch model (same chat)',
+                `${jobLabel}: switching ${prevMod} -> ${nextMod} after repeated HTTP 500 internal error`,
+                'warn',
+              )
+              onLog?.(
+                'warn',
+                `${jobLabel}: switching model ${prevMod} -> ${nextMod} in same chat after HTTP 500 internal error`,
+              )
+              const swRes = await this.selectModelInRunSettings(page, nextMod, MODEL_FALLBACK_CHAIN)
+              if (swRes.selectedModelName) {
+                activeModelName = swRes.selectedModelName
+                this.activeModelName = activeModelName
+              }
+            }
+          }
+
+          const waitSec = internalErrorSameChatRetries * 5
+          this.logStep(
+            `internal error -> same-chat Rerun (${internalErrorSameChatRetries}/2)`,
+            `${jobLabel} [${activeModelName}] (${reasonDetail.slice(0, 100)}) — waiting ${waitSec}s without reloading so attached videos stay intact`,
+            'warn',
+          )
+          onLog?.(
+            'warn',
+            `${jobLabel}: HTTP 500 internal error — retrying Rerun/Run in same chat (${internalErrorSameChatRetries}/2) after ${waitSec}s [${activeModelName}]`,
+          )
+          await new Promise((r) => setTimeout(r, waitSec * 1000))
+          await this.closeModelSelectionPanelIfOpen(page)
+          await this.markPageErrorBannersHandled(page)
+
+          // Respect Run stagger gate so parallel workers never collide on retry
+          const retryStaggerSec = parallelMode
+            ? Math.max(20, userCfg.studioRunStaggerSec || DEFAULT_STUDIO_RUN_STAGGER_SEC)
+            : userCfg.studioRunStaggerSec ?? DEFAULT_STUDIO_RUN_STAGGER_SEC
+          globalStudioRunStaggerGate.setStaggerMs(retryStaggerSec * 1000)
+          await globalStudioRunStaggerGate.acquireRunSlot(jobLabel, {
+            isAborted: () => this.isStopping(scope),
+          })
+
+          // Refresh preRunTurnSnap so the failed turn on page doesn't re-trigger immediately
+          const updatedTurnSnap = await page
+            .evaluate((turnSels) => {
+              for (const sel of turnSels) {
+                if (sel.includes(':has-text(')) continue
+                try {
+                  const found = Array.from(document.querySelectorAll(sel))
+                  if (found.length > 0) return found.length
+                } catch {
+                  /* ignore */
+                }
+              }
+              return 0
+            }, [...STUDIO_SELECTORS.modelTurnContainers])
+            .catch(() => preRunTurnSnap.count)
+          preRunTurnSnap.count = updatedTurnSnap
+          preRunTurnSnap.lastHadInternalError = true
+
+          capturedRunError = null
+          capturedFinishReason = null
+          internalErrorDetected = false
+          transientBannerReason = null
+          runStarted = Date.now()
+          stopEverSeen = false
+          stopGoneConsecutivePolls = 0
+          stableSeconds = 0
+          lastCandidateText = ''
+
+          const rerunBtnNow = await findFirstVisibleLocator(
+            page,
+            [
+              'button[aria-label*="Rerun" i]',
+              'button[mattooltip*="Rerun" i]',
+              'ms-chat-turn button:has-text("Rerun")',
+            ],
+            2000,
+          )
+          if (rerunBtnNow && (await rerunBtnNow.isEnabled().catch(() => false))) {
+            await rerunBtnNow.click().catch(() => {})
+            globalStudioRunStaggerGate.recordRunPressed()
+            this.logStep('re-press Rerun (same chat)', `${jobLabel} [${activeModelName}]`, 'info')
+            return true
+          }
+
+          const runBtnNow = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 2000)
+          if (runBtnNow && (await runBtnNow.isEnabled().catch(() => false))) {
+            await runBtnNow.click().catch(() => {})
+            globalStudioRunStaggerGate.recordRunPressed()
+            this.logStep('re-press Run (same chat)', `${jobLabel} [${activeModelName}]`, 'info')
+            return true
+          }
+
+          return false
+        }
+
         try {
           // Ensure Model selection panel is closed before clicking Run
           await this.closeModelSelectionPanelIfOpen(page)
@@ -6050,8 +6386,10 @@ export class StudioBrowserController {
           await this.markPageErrorBannersHandled(page)
 
           // 20-second Run Stagger Gate across all windows:
-          // If any window pressed Run (e.g. 3.8 Flash), wait at least 20s before another window presses Run
-          const staggerSec = userCfg.studioRunStaggerSec ?? DEFAULT_STUDIO_RUN_STAGGER_SEC
+          // In parallelMode, always enforce >= 20s between Run clicks across workers so 2 heavy video requests never collide with HTTP 500
+          const staggerSec = parallelMode
+            ? Math.max(20, userCfg.studioRunStaggerSec || DEFAULT_STUDIO_RUN_STAGGER_SEC)
+            : userCfg.studioRunStaggerSec ?? DEFAULT_STUDIO_RUN_STAGGER_SEC
           globalStudioRunStaggerGate.setStaggerMs(staggerSec * 1000)
           await globalStudioRunStaggerGate.acquireRunSlot(jobLabel, {
             isAborted: () => this.isStopping(scope),
@@ -6413,6 +6751,9 @@ export class StudioBrowserController {
                   errBannerText,
                 )
               ) {
+                if (await trySameChatInternalErrorRerun(`${errBannerText}${netDetail}`)) {
+                  continue
+                }
                 internalErrorDetected = true
                 transientBannerReason = `internal_error:${errBannerText.slice(0, 80)}`
                 break
@@ -6492,8 +6833,16 @@ export class StudioBrowserController {
                 (!stopVisible && !spinnerVisible && turnInternalError) ||
                 (netInternalError && !stopVisible && !spinnerVisible)
               ) {
+                const ieReason = (
+                  turnInternalError ||
+                  capturedRunError?.body ||
+                  'HTTP 500 INTERNAL'
+                ).slice(0, 120)
+                if (await trySameChatInternalErrorRerun(ieReason)) {
+                  continue
+                }
                 internalErrorDetected = true
-                transientBannerReason = `internal_error:${(turnInternalError || capturedRunError?.body || 'HTTP 500 INTERNAL').slice(0, 80)}`
+                transientBannerReason = `internal_error:${ieReason.slice(0, 80)}`
                 break
               }
 

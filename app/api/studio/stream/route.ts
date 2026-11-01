@@ -24,7 +24,7 @@ export async function GET(req: NextRequest) {
   const getSnapshotsForRequest = async () => {
     const [snap, parallelSnapshot] = await Promise.all([
       studioController.getSnapshot(true),
-      scanId ? getStudioParallelManager(scanId).getLiveSnapshot(true) : Promise.resolve(null),
+      getStudioParallelManager(scanId || 'default').getLiveSnapshot(true),
     ])
     return { ...snap, parallelSnapshot }
   }

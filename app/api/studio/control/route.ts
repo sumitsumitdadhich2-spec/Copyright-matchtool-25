@@ -123,7 +123,20 @@ export async function POST(req: NextRequest) {
     concurrency?: number
     resumeExisting?: boolean
     windowId?: string
-    subAction?: 'stop' | 'retry' | 'skip'
+    workerId?: string
+    subAction?:
+      | 'stop'
+      | 'retry'
+      | 'skip'
+      | 'assist_toggle'
+      | 'click'
+      | 'type'
+      | 'key'
+      | 'navigate'
+      | 'save_session'
+      | 'pause'
+      | 'resume'
+      | 'test_login'
   }
 
   try {
@@ -432,6 +445,8 @@ export async function POST(req: NextRequest) {
         studioController.setAssistMode(nextVal)
         if (nextVal) {
           await studioController.ensurePage(username)
+        } else {
+          await studioController.saveLiveSessionToSettingsIfAuthenticated(username).catch(() => 0)
         }
         return NextResponse.json({ ok: true, snapshot: await studioController.getSnapshot(true) })
       }
@@ -699,6 +714,39 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({
           ok: true,
           parallelSnapshot: await parallelMgr.getLiveSnapshot(false),
+        })
+      }
+      case 'parallel_worker_action': {
+        const targetScanId = (body.scanId || '').trim() || 'default'
+        if (!body.workerId || !body.subAction) {
+          return NextResponse.json({ ok: false, error: 'Missing workerId or subAction' }, { status: 400 })
+        }
+        const parallelMgr = getStudioParallelManager(targetScanId)
+        const workerRes = await parallelMgr.performWorkerControlAction({
+          workerId: body.workerId,
+          username,
+          subAction: body.subAction as
+            | 'assist_toggle'
+            | 'click'
+            | 'type'
+            | 'key'
+            | 'navigate'
+            | 'save_session'
+            | 'pause'
+            | 'resume'
+            | 'stop'
+            | 'test_login',
+          enabled: body.enabled,
+          xRatio: body.xRatio,
+          yRatio: body.yRatio,
+          text: body.text,
+          key: body.key,
+          url: body.url,
+        })
+        return NextResponse.json({
+          ok: workerRes.ok,
+          message: workerRes.message,
+          parallelSnapshot: await parallelMgr.getLiveSnapshot(true),
         })
       }
       default:
