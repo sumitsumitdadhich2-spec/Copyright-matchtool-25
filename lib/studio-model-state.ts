@@ -8,6 +8,13 @@ export const STUDIO_MODEL_OPTIONS = [
 
 export type StudioModelOption = (typeof STUDIO_MODEL_OPTIONS)[number]
 
+/**
+ * Since 1 Window = 1 Model is strictly enforced and only 3 models exist
+ * ('Argon', 'Gemini 3.8 Flash', 'Gemini 3.6 Flash'), at most 3 parallel windows
+ * can run simultaneously without two windows sharing the same model.
+ */
+export const MAX_CONCURRENT_MODEL_WINDOWS = STUDIO_MODEL_OPTIONS.length
+
 export const DEFAULT_STUDIO_MODEL_NAME: StudioModelOption = 'Argon'
 
 export const ARGON_MAX_OUTPUT_TOKENS = 1_000_000
@@ -176,6 +183,26 @@ export function orderChainByUnleasedFirst(
     if (countA !== countB) return countA - countB
     return normalizedChain.indexOf(a) - normalizedChain.indexOf(b)
   })
+}
+
+/**
+ * Keep `targetModelName` strictly at index 0 (so an explicit model switch e.g. Argon -> Gemini 3.6 Flash
+ * is never reversed by `selectModelInRunSettings`), while ordering all remaining fallback candidates
+ * with unleased models first.
+ */
+export function orderFallbacksKeepingTargetFirst(
+  holderKey: string | undefined,
+  targetModelName: string,
+  chain: readonly string[],
+): StudioModelOption[] {
+  const targetCanon = canonicalizeStudioModelName(targetModelName)
+  const rest = chain.filter(
+    (m) => canonicalizeStudioModelName(m).toLowerCase() !== targetCanon.toLowerCase(),
+  )
+  const orderedRest = orderChainByUnleasedFirst(holderKey, rest).filter(
+    (m) => m.toLowerCase() !== targetCanon.toLowerCase(),
+  )
+  return [targetCanon, ...orderedRest]
 }
 
 function getTzWallParts(

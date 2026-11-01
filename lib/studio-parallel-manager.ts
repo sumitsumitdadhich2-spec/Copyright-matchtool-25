@@ -43,6 +43,7 @@ import {
 } from './studio-settings'
 import {
   DEFAULT_STUDIO_MODEL_NAME,
+  MAX_CONCURRENT_MODEL_WINDOWS,
   getEffectiveModel,
   releaseExclusiveStudioModel,
   resolveEffectiveMaxOutputTokensForModel,
@@ -458,12 +459,13 @@ function syncWorkerProfileFromBase(slotIndex: number): string {
   const baseCookiesPath = path.join(baseDir, 'Default', 'Cookies')
   const targetCookiesPath = path.join(targetDir, 'Default', 'Cookies')
 
+  // Only seed from base profile (`studio-chrome-profile`) ONCE when the worker profile does not yet
+  // have its own Cookies file on disk. Once created, each worker (`w01`, `w02`, `w03`) maintains its
+  // own isolated session cookies and IndexedDB/LocalStorage independently.
   const shouldCopyFromBase =
     fs.existsSync(baseDir) &&
     (!fs.existsSync(targetDir) ||
-      (fs.existsSync(baseCookiesPath) &&
-        (!fs.existsSync(targetCookiesPath) ||
-          fs.statSync(baseCookiesPath).mtimeMs > fs.statSync(targetCookiesPath).mtimeMs)))
+      (fs.existsSync(baseCookiesPath) && !fs.existsSync(targetCookiesPath)))
 
   if (shouldCopyFromBase) {
     try {
@@ -1129,7 +1131,7 @@ export class StudioParallelManager {
             !this.active &&
             !this.starting
           ) {
-            this.concurrency = scan.studioParallelConcurrency
+            this.concurrency = Math.min(MAX_CONCURRENT_MODEL_WINDOWS, scan.studioParallelConcurrency)
           }
 
           const foundCompact = extractScanFoundMinutesCompact(scan)
@@ -1220,7 +1222,10 @@ export class StudioParallelManager {
             : raw.minuteInputSource === 'manual'
               ? (raw.minuteInput || '').trim()
               : ''
-        this.concurrency = raw.concurrency || DEFAULT_STUDIO_CONCURRENCY
+        this.concurrency = Math.min(
+          MAX_CONCURRENT_MODEL_WINDOWS,
+          raw.concurrency || DEFAULT_STUDIO_CONCURRENCY,
+        )
 
         // Strictly accept saved paths ONLY if they belong to data/media/<this.scanId>/
         this.shortLocalPath = this.isPathStrictlyInsideThisScanMediaDir(raw.shortLocalPath)
@@ -1629,7 +1634,10 @@ export class StudioParallelManager {
       this.minuteInput = this.foundMinutesInput
     }
     if (concurrency !== undefined && Number.isFinite(Number(concurrency))) {
-      this.concurrency = Math.max(1, Math.min(20, Math.round(Number(concurrency))))
+      this.concurrency = Math.max(
+        1,
+        Math.min(MAX_CONCURRENT_MODEL_WINDOWS, Math.round(Number(concurrency))),
+      )
     }
     if (movieDurationSec !== undefined && movieDurationSec > 0) {
       this.movieDurationSec = movieDurationSec
@@ -1875,7 +1883,10 @@ export class StudioParallelManager {
 
       const globalMaxSlots = Math.max(
         1,
-        Math.min(20, Number(cfg.studioConcurrency || DEFAULT_STUDIO_CONCURRENCY)),
+        Math.min(
+          MAX_CONCURRENT_MODEL_WINDOWS,
+          Number(cfg.studioConcurrency || DEFAULT_STUDIO_CONCURRENCY),
+        ),
       )
       this.maxTotalPoolSlots = globalMaxSlots
       globalProfileSlotPool.setMaxTotalSlots(globalMaxSlots)
@@ -1889,7 +1900,7 @@ export class StudioParallelManager {
       this.concurrency = Math.max(
         1,
         Math.min(
-          20,
+          MAX_CONCURRENT_MODEL_WINDOWS,
           Number(params.concurrency ?? this.concurrency ?? cfg.studioConcurrency ?? DEFAULT_STUDIO_CONCURRENCY),
         ),
       )

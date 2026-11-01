@@ -261,7 +261,7 @@ export function StudioParallelGrid({
   const [minuteInputSource, setMinuteInputSource] = useState<'auto' | 'manual'>(initialSource)
   const [minuteInput, setMinuteInput] = useState<string>(resolveInitialMinutes)
   const [concurrency, setConcurrency] = useState<number>(
-    snap?.concurrency || scanConcurrency || 4,
+    Math.min(3, snap?.concurrency || scanConcurrency || 3),
   )
   const [confirmClearStateOpen, setConfirmClearStateOpen] = useState<boolean>(false)
   const [busyAction, setBusyAction] = useState<string | null>(null)

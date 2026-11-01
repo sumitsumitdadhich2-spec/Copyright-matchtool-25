@@ -1,3 +1,4 @@
+import crypto from 'crypto'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
@@ -17,10 +18,11 @@ import {
   loadDecryptedPlaywrightCookies,
   loadStudioUserConfig,
   saveStudioUserConfig,
+  type PlaywrightCookie,
 } from './studio-settings'
 import {
   DEFAULT_STUDIO_MODEL_NAME,
-   buildStudioFallbackCycle,
+  buildStudioFallbackCycle,
   buildStudioModelChain,
   canonicalizeStudioModelName,
   getEffectiveModel,
@@ -28,6 +30,7 @@ import {
   markModelExhausted,
   normalizeStudioThinkingLevel,
   orderChainByUnleasedFirst,
+  orderFallbacksKeepingTargetFirst,
   releaseExclusiveStudioModel,
   resolveEffectiveMaxOutputTokensForModel,
   thinkingLevelToDisplayLabel,
@@ -991,6 +994,110 @@ export class StudioBrowserController {
     return Boolean(this.page && !this.page.isClosed() && !this.pageCrashed)
   }
 
+  private getWorkerShortId(): string {
+    const m = this.profileDirName.match(/-w(\d+)$/i)
+    if (m) return `w${m[1]}`
+    return 'live'
+  }
+
+  private computeWorkerCookieId(cookies: Array<{ name: string; value: string }>): string {
+    const prefix = this.getWorkerShortId()
+    const canonical = [...cookies]
+      .filter((c) => c && c.name && c.value)
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((c) => `${c.name}=${c.value}`)
+      .join(';')
+    const hash = crypto
+      .createHash('sha256')
+      .update(`${this.profileDirName}|${canonical}`)
+      .digest('hex')
+      .slice(0, 8)
+    return `${prefix}-${hash}`
+  }
+
+  private readWorkerLocalCookiesFromDisk(): PlaywrightCookie[] {
+    try {
+      const localFile = path.join(DATA_DIR, this.profileDirName, 'worker-cookies.json')
+      if (!fs.existsSync(localFile)) return []
+      const parsed = JSON.parse(fs.readFileSync(localFile, 'utf8'))
+      if (Array.isArray(parsed)) {
+        return parsed.filter((c) => c && typeof c.name === 'string' && typeof c.value === 'string')
+      }
+    } catch {
+      /* ignore */
+    }
+    return []
+  }
+
+  private writeWorkerLocalCookiesToDisk(cookies: PlaywrightCookie[]): string {
+    const cookieId = this.computeWorkerCookieId(cookies)
+    try {
+      const profileDir = path.join(DATA_DIR, this.profileDirName)
+      fs.mkdirSync(profileDir, { recursive: true })
+      fs.writeFileSync(
+        path.join(profileDir, 'worker-cookies.json'),
+        JSON.stringify(cookies, null, 2),
+        'utf8',
+      )
+      fs.writeFileSync(path.join(profileDir, '.worker-cookie-id'), cookieId, 'utf8')
+    } catch {
+      /* ignore */
+    }
+    return cookieId
+  }
+
+  /**
+   * Save live Google session cookies strictly inside THIS worker's own isolated profile
+   * (`data/<profileDirName>/worker-cookies.json`) and re-apply them to this worker's browser context,
+   * WITHOUT overwriting the global Settings cookies used by other parallel workers.
+   */
+  public async saveWorkerLocalSessionIfAuthenticated(): Promise<{
+    saved: boolean
+    count: number
+    cookieId: string
+  }> {
+    if (!this.context) return { saved: false, count: 0, cookieId: '' }
+    try {
+      const allCookies = await this.context.cookies([
+        'https://aistudio.google.com',
+        'https://accounts.google.com',
+        'https://www.google.com',
+      ])
+      const hasGoogleAuth = allCookies.some((c) =>
+        /^(SID|HSID|SSID|APISID|SAPISID|__Secure-1PSID|__Secure-3PSID)$/i.test(c.name),
+      )
+      if (!hasGoogleAuth || allCookies.length === 0) {
+        return { saved: false, count: 0, cookieId: '' }
+      }
+
+      const normalized: PlaywrightCookie[] = allCookies.map((c) => ({
+        name: c.name,
+        value: c.value,
+        domain: c.domain,
+        path: c.path || '/',
+        ...(typeof c.expires === 'number' && c.expires > 0 ? { expires: c.expires } : {}),
+        ...(typeof c.httpOnly === 'boolean' ? { httpOnly: c.httpOnly } : {}),
+        ...(typeof c.secure === 'boolean' ? { secure: c.secure } : {}),
+        ...(c.sameSite ? { sameSite: c.sameSite } : {}),
+      }))
+
+      await this.context.addCookies(normalized).catch(() => {})
+      const cookieId = this.writeWorkerLocalCookiesToDisk(normalized)
+      this.logStep(
+        'cookies saved',
+        `Saved ${normalized.length} live Google cookie(s) in isolated profile ${this.profileDirName} (id=${cookieId})`,
+        'success',
+      )
+      return { saved: true, count: normalized.length, cookieId }
+    } catch {
+      return { saved: false, count: 0, cookieId: '' }
+    }
+  }
+
+  /**
+   * Explicit user action (Login Assist OFF or clicking "Save Cookies" button):
+   * Saves the live browser session to BOTH this worker's isolated profile AND global Settings.
+   */
   public async saveLiveSessionToSettingsIfAuthenticated(username: string): Promise<number> {
     if (!this.context) return 0
     try {
@@ -1004,15 +1111,17 @@ export class StudioBrowserController {
       )
       if (!hasGoogleAuth || allCookies.length === 0) return 0
 
+      await this.saveWorkerLocalSessionIfAuthenticated()
       const state = await this.context.storageState()
       const { saveUserGoogleCookies } = await import('./studio-settings')
       await saveUserGoogleCookies(username || 'admin', JSON.stringify(state))
       const newFp = await getSettingsCookieFingerprint(username || 'admin')
       this.appliedCookieFingerprint = newFp
       this.writeProfileCookieFingerprint(newFp)
+      const workerCookieId = this.computeWorkerCookieId(allCookies)
       this.logStep(
         'session synced',
-        `Saved ${allCookies.length} live Google cookie(s) to Settings (id=${newFp.slice(0, 8)}) for all workers`,
+        `Saved ${allCookies.length} live Google cookie(s) from ${this.profileDirName} (workerId=${workerCookieId}, settingsId=${newFp.slice(0, 8)})`,
         'success',
       )
       return allCookies.length
@@ -1187,8 +1296,54 @@ export class StudioBrowserController {
       return
     }
 
+    // 1. Check if this worker already has its own isolated live session cookies in its persistent profile
+    try {
+      const existingContextCookies = await this.context.cookies([
+        'https://aistudio.google.com',
+        'https://accounts.google.com',
+        'https://www.google.com',
+      ])
+      const hasLiveGoogleAuth = existingContextCookies.some((c) =>
+        /^(SID|HSID|SSID|APISID|SAPISID|__Secure-1PSID|__Secure-3PSID)$/i.test(c.name),
+      )
+      if (hasLiveGoogleAuth && existingContextCookies.length > 0 && fingerprint !== 'NONE') {
+        const localSaved = await this.saveWorkerLocalSessionIfAuthenticated()
+        this.appliedCookieFingerprint = fingerprint
+        this.lastInjectedCookieUser = username
+        this.writeProfileCookieFingerprint(fingerprint)
+        this.logStep(
+          'isolated worker session ready',
+          `Using ${existingContextCookies.length} isolated profile cookie(s) for ${this.profileDirName} (id=${localSaved.cookieId || this.computeWorkerCookieId(existingContextCookies)})`,
+          'info',
+        )
+        return
+      }
+    } catch {
+      /* ignore and fall through to worker disk or Settings seed */
+    }
+
+    // 2. Check if this worker has saved isolated cookies on disk (`worker-cookies.json`)
+    const workerDiskCookies = this.readWorkerLocalCookiesFromDisk()
+    if (workerDiskCookies.length > 0 && fingerprint !== 'NONE') {
+      try {
+        await this.context.addCookies(workerDiskCookies)
+        const workerCookieId = this.computeWorkerCookieId(workerDiskCookies)
+        this.appliedCookieFingerprint = fingerprint
+        this.lastInjectedCookieUser = username
+        this.writeProfileCookieFingerprint(fingerprint)
+        this.logStep(
+          'worker cookies restored',
+          `${workerDiskCookies.length} isolated worker cookie(s) restored for ${this.profileDirName} (id=${workerCookieId})`,
+          'info',
+        )
+        return
+      } catch {
+        /* fall through to Settings seed */
+      }
+    }
+
+    // 3. Initial seed from Settings when this worker profile has no session yet
     const cookies = await loadDecryptedPlaywrightCookies(username)
-    const diskFp = this.readProfileCookieFingerprint()
 
     if (cookies.length === 0) {
       // If user is actively in Login Assist mode, do NOT wipe their in-progress login!
@@ -1196,9 +1351,8 @@ export class StudioBrowserController {
         this.appliedCookieFingerprint = 'ASSIST'
         return
       }
-      // If browser already has authenticated Google cookies from Login Assist, save them to Settings instead of wiping!
-      const savedCount = await this.saveLiveSessionToSettingsIfAuthenticated(username)
-      if (savedCount > 0) {
+      const savedLocal = await this.saveWorkerLocalSessionIfAuthenticated()
+      if (savedLocal.saved) {
         return
       }
       await this.clearAllBrowserCookiesAndStorage()
@@ -1212,20 +1366,15 @@ export class StudioBrowserController {
       return
     }
 
-    // Do not wipe existing origin storage when another worker saves rotated live cookies to Settings;
-    // simply apply the latest cookies into the browser context so active sessions stay intact.
-    if (diskFp && diskFp !== 'NONE' && diskFp !== 'ASSIST' && diskFp !== fingerprint && !this.assistMode && cookies.length === 0) {
-      await this.clearAllBrowserCookiesAndStorage()
-    }
-
     try {
       await this.context.addCookies(cookies)
+      const workerCookieId = this.writeWorkerLocalCookiesToDisk(cookies)
       this.appliedCookieFingerprint = fingerprint
       this.lastInjectedCookieUser = username
       this.writeProfileCookieFingerprint(fingerprint)
       this.logStep(
-        'cookies loaded from Settings',
-        `${cookies.length} Google cookie(s) applied from Settings (id=${fingerprint.slice(0, 8)})`,
+        'cookies seeded from Settings',
+        `${cookies.length} Google cookie(s) seeded into ${this.profileDirName} (workerId=${workerCookieId}, settingsId=${fingerprint.slice(0, 8)})`,
         'info',
       )
     } catch (err) {
@@ -1248,7 +1397,8 @@ export class StudioBrowserController {
           origin: 'https://aistudio.google.com',
         })
         .catch(() => {})
-      await this.syncContextCookiesWithSettings(username, false)
+      // Do NOT re-inject Settings cookies into an already-open live worker browser!
+      // That would overwrite rotated session tokens mid-run and trigger 403/500 errors.
       if (!this.browserLaunchInfo) {
         const pwPath = chromium.executablePath()
         const sysChrome = ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium'].find((p) =>
@@ -1271,15 +1421,16 @@ export class StudioBrowserController {
 
         const profileDir = path.join(DATA_DIR, this.profileDirName)
         if (!fs.existsSync(profileDir)) fs.mkdirSync(profileDir, { recursive: true })
-        // Only wipe disk session files if Settings cookies were deleted or changed to a different account
+        // Only wipe disk session files if Settings cookies were explicitly deleted (currentFp === 'NONE').
+        // NEVER wipe a worker's persistent profile just because another worker rotated cookies!
         const currentFp = await getSettingsCookieFingerprint(username)
         const diskFp = this.readProfileCookieFingerprint()
         if (
           !this.assistMode &&
           diskFp &&
           diskFp !== 'ASSIST' &&
-          ((currentFp === 'NONE' && diskFp !== 'NONE') ||
-            (currentFp !== 'NONE' && diskFp !== 'NONE' && diskFp !== currentFp))
+          currentFp === 'NONE' &&
+          diskFp !== 'NONE'
         ) {
           this.wipeProfileSessionFilesOnDisk(profileDir)
         }
@@ -2946,8 +3097,13 @@ export class StudioBrowserController {
     })
     const baseCandidates =
       nonExhaustedCandidates.length > 0 ? nonExhaustedCandidates : orderedCandidates
-    // Prioritize models not currently leased by another active window (1 window = 1 model)
-    const candidatesToTry = orderChainByUnleasedFirst(this.profileDirName, baseCandidates)
+    // Keep targetModelName strictly at index 0 (so explicit model switches never revert back),
+    // while ordering any fallback models with unleased models first (1 window = 1 model).
+    const candidatesToTry = orderFallbacksKeepingTargetFirst(
+      this.profileDirName,
+      targetModelName,
+      baseCandidates,
+    )
 
     for (let i = 0; i < candidatesToTry.length; i++) {
       const candidateModel = candidatesToTry[i]
@@ -5475,11 +5631,9 @@ export class StudioBrowserController {
       0,
       MODEL_FALLBACK_CHAIN.findIndex((m) => m.toLowerCase() === activeModelName.toLowerCase()),
     )
-    const buildNewChatUrlForModel = (mName: string): string => {
-      const canon = canonicalizeStudioModelName(mName || '')
-      if (/argon/i.test(canon)) return `${STUDIO_URLS.newChat}?model=gemini-4-argon`
-      if (/3\.8/i.test(canon)) return `${STUDIO_URLS.newChat}?model=gemini-3.8-flash`
-      if (/3\.6/i.test(canon)) return `${STUDIO_URLS.newChat}?model=gemini-3.6-flash`
+    // Always navigate to clean https://aistudio.google.com/prompts/new_chat (just like Gemini Studio Live Login Assist)
+    // and select the model via the Run Settings UI panel so invalid ?model=... URL params never cause HTTP 500.
+    const buildNewChatUrlForModel = (_mName?: string): string => {
       return STUDIO_URLS.newChat
     }
     let resetOnPermissionDenied = false
@@ -5779,9 +5933,9 @@ export class StudioBrowserController {
             )
           }
 
-          // Requirement: Immediately after opening a new page (new_chat), automatically run "Save Cookies"
-          // so fresh live Google session cookies are saved to Settings before starting work (preventing 403 permission errors).
-          const savedLiveCookies = await this.saveLiveSessionToSettingsIfAuthenticated(username)
+          // Requirement: Immediately after opening a new page (new_chat), save live Google session cookies
+          // strictly to THIS worker's isolated profile (never overwriting global Settings or other workers' cookies!).
+          const savedLiveCookies = await this.saveWorkerLocalSessionIfAuthenticated()
           if (!savedLiveCookies.saved) {
             await this.saveRotatedSessionFromContext(username)
           }

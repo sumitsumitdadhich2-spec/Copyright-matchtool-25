@@ -1,0 +1,6 @@
+{
+  "summary":  "Root-cause analysis of the latest parallel scan log (parallel-log-9717ec27349eeac6-full-2026-11-01T09-54-14.pdf) and implementation plan to isolate per-worker cookies/sessions (preventing cross-worker cookie overwrites and 403/500 errors), remove invalid ?model= URL query strings on new_chat, fix model-switching reversal in selectModelInRunSettings, and enforce strict 1-window-per-model concurrency across the 3 available models (Argon, Gemini 3.8 Flash, Gemini 3.6 Flash).",
+  "updatedAt":  "2026-11-01T10:00:47.405572213Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

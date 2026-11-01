@@ -134,7 +134,7 @@ export function computeEffectiveMaxInputTokens(
   return STUDIO_CONTEXT_WINDOW_TOKENS - out - STUDIO_SAFETY_MARGIN_TOKENS
 }
 
-export const DEFAULT_STUDIO_CONCURRENCY = 4
+export const DEFAULT_STUDIO_CONCURRENCY = 3
 export const DEFAULT_STUDIO_UPLOAD_GATE = 2
 export const DEFAULT_STUDIO_RUN_STAGGER_SEC = 20
 export const DEFAULT_STUDIO_MINUTE_INPUT =
