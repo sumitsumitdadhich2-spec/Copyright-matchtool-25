@@ -861,6 +861,108 @@ export function extractHissa1And2EntriesFromResponse(rawText: string): {
 
 const SEAM_TOL = 1.5
 
+export function detectAndFilterHallucinatedExtrapolation(
+  hissa2Entries: Array<{
+    shortStartSec: number
+    shortEndSec: number
+    found: boolean
+    movieStartSec: number | null
+    movieEndSec: number | null
+  }>,
+  windowStartSec: number,
+): {
+  isHallucinated: boolean
+  reason: string
+  strippedCount: number
+} {
+  const foundIndices: number[] = []
+  const shortCopyIndices: number[] = []
+
+  for (let i = 0; i < hissa2Entries.length; i++) {
+    const e = hissa2Entries[i]
+    if (!e.found || e.movieStartSec === null || e.movieEndSec === null) continue
+    foundIndices.push(i)
+
+    if (e.shortStartSec >= 10) {
+      const localStart =
+        windowStartSec > 0 && e.movieStartSec >= windowStartSec - 2
+          ? e.movieStartSec - windowStartSec
+          : e.movieStartSec
+      const localEnd =
+        windowStartSec > 0 && e.movieEndSec >= windowStartSec - 2
+          ? e.movieEndSec - windowStartSec
+          : e.movieEndSec
+      if (
+        Math.abs(localStart - e.shortStartSec) <= 1.5 &&
+        Math.abs(localEnd - e.shortEndSec) <= 1.5
+      ) {
+        shortCopyIndices.push(i)
+      }
+    }
+  }
+
+  let strippedCount = 0
+  let reason = ''
+
+  // Check A: Short-timestamp copy-paste into Movie column (>= 4 segments with localMovieStart == shortStart)
+  if (shortCopyIndices.length >= 4) {
+    for (const idx of shortCopyIndices) {
+      hissa2Entries[idx].found = false
+      hissa2Entries[idx].movieStartSec = null
+      hissa2Entries[idx].movieEndSec = null
+      strippedCount++
+    }
+    reason = `short_ts_copied_as_movie_ts (${shortCopyIndices.length} segments copied short timestamps as movie timestamps)`
+  }
+
+  // Check B: Runaway constant-offset linear extrapolation across >= 6 segments spanning > 22s of short
+  const remainingFound = foundIndices.filter((idx) => hissa2Entries[idx].found)
+  if (remainingFound.length >= 6) {
+    for (let i = 0; i < remainingFound.length; i++) {
+      const baseEntry = hissa2Entries[remainingFound[i]]
+      if (!baseEntry.found || baseEntry.movieStartSec === null) continue
+      const baseOffset = baseEntry.movieStartSec - baseEntry.shortStartSec
+      const cluster: number[] = []
+      let minShort = Infinity
+      let maxShort = -Infinity
+
+      for (const idx of remainingFound) {
+        const cand = hissa2Entries[idx]
+        if (!cand.found || cand.movieStartSec === null || cand.movieEndSec === null) continue
+        const offset = cand.movieStartSec - cand.shortStartSec
+        const durDiff = Math.abs(
+          cand.movieEndSec - cand.movieStartSec - (cand.shortEndSec - cand.shortStartSec),
+        )
+        if (Math.abs(offset - baseOffset) <= 1.5 && durDiff <= 1.5) {
+          cluster.push(idx)
+          minShort = Math.min(minShort, cand.shortStartSec)
+          maxShort = Math.max(maxShort, cand.shortEndSec)
+        }
+      }
+
+      if (cluster.length >= 6 && maxShort - minShort > 22) {
+        for (const idx of cluster) {
+          if (hissa2Entries[idx].found) {
+            hissa2Entries[idx].found = false
+            hissa2Entries[idx].movieStartSec = null
+            hissa2Entries[idx].movieEndSec = null
+            strippedCount++
+          }
+        }
+        if (!reason) {
+          reason = `constant_offset_extrapolation_span (${cluster.length} segments spanning ${(maxShort - minShort).toFixed(1)}s with fixed offset)`
+        }
+      }
+    }
+  }
+
+  return {
+    isHallucinated: strippedCount > 0,
+    reason,
+    strippedCount,
+  }
+}
+
 function findBestHissa1Description(
   hissa1Entries: Array<{ shortStartSec: number; shortEndSec: number; description: string }>,
   shortStartSec: number,
@@ -974,6 +1076,7 @@ export function mergeParallelWindowResults(params: {
 
     if (!w.rawResponseText) continue
     const { hissa1Entries, hissa2Entries } = extractHissa1And2EntriesFromResponse(w.rawResponseText)
+    detectAndFilterHallucinatedExtrapolation(hissa2Entries, w.startSec)
 
     for (const h2 of hissa2Entries) {
       const desc = findBestHissa1Description(hissa1Entries, h2.shortStartSec, h2.shortEndSec)

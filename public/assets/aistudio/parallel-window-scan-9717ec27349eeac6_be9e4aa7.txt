@@ -1,0 +1,271 @@
+# PARALLEL WINDOW SCAN MERGED REPORT
+# Windows: 9/13 DONE (4 FAILED, 0 PROHIBITED)
+# Segments: 132 total | 122 FOUND | 5 NOT FOUND | 5 CONFLICT
+
+HISSA 1
+0:00 to 0:01 - Adi football field par baithkar hath me paint lagane ki taiyari karta hai
+0:00 to 0:02 - Adi safed paint me ungliyan dubokar joote ki taraf badhata hai
+0:01 to 0:02 - Adi paint lagi ungliyon ko kaale joote par kheenchkar stripes banata hai
+0:02 to 0:03 - Adi joote par teen safed stripes banakar hath hata leta hai
+0:03 to 0:05 - Khiladi ground par naye joote pehankar aage daudta hai
+0:05 to 0:06 - Khiladi corner flag ki taraf daudte hue jaata hai
+0:05 to 0:07 - Ground par khiladiyon ke joote aur taangein dikhayi deti hain
+0:06 to 0:07 - Ek khiladi foreground me daudkar nikalta hai, joote par stripes dikhti hain
+0:07 to 0:08 - Coat pehne Adi Dassler bahar khada hokar gambhirta se dekhta hai
+0:07 to 0:08 - Ken Duken (Adi) ka close-up face, baarish me right side dekhte hue.
+0:07 to 0:09 - Adi Dassler raste ki taraf dekhta rehta hai
+0:08 to 0:10 - Shehar ke patthar ke pul par Puma truck aage badhta hai
+0:10 to 0:11 - Puma truck pul paar karke makanon ki taraf jaata hai
+0:10 to 0:12 - Truck ke canvas par bane Puma logo ka close-up shot
+0:11 to 0:13 - Dono Dassler bhai suit me khade muskura rahe hain
+0:13 to 0:14 - Photographer purane camera se photo kheench raha hai
+0:14 to 0:17 - Dono bhai ek doosre ke gale mil kar muskura rahe hain
+0:17 to 0:19 - Workshop me hathon se shoe ke heel par kaam kiya ja raha hai.
+0:19 to 0:20 - Adi workshop ke desk par baith kar shoe last par leather fit kar raha hai.
+0:20 to 0:22 - Close-up me hathori se shoe ke heel me chhota keel thoka ja raha hai.
+0:22 to 0:23 - Adi desk par baith kar leather strap ko dhyaan se dekh raha hai.
+0:23 to 0:25 - Wide shot me Adi roshni wali workshop me shoe last pakde hue hai.
+0:25 to 0:26 - Sole par white leather part par chhotey keelein thokne ka close-up.
+0:26 to 0:28 - Adi shoe ke paas baith kar udaas aur disappointed nazar aata hai.
+0:28 to 0:30 - Adi pareshan hokar sir par haath rakh leta hai
+0:30 to 0:31 - Vintage car kachhi sadak par drift karti hai, Adi side me khada hai.
+0:30 to 0:32 - Purani car dhool udate hue kachhe raste par chal rahi hai
+0:31 to 0:32 - Car dhool udate hue rukti hai aur Adi car ki taraf badhta hai.
+0:32 to 0:34 - Rudy car me sunglasses aur cap pehne muskurata hai.
+0:33 to 0:34 - Rudy car chalate hue peeche mudkar Adi ko dekhta hai.
+0:34 to 0:35 - Rudolf car ke bahar apni hat ko touch karke salute karta hai
+0:34 to 0:35 - Rudy muskurate hue apni cap ko touch karta hai.
+0:35 to 0:36 - Rudolf factory ki machine chala raha hai
+0:36 to 0:39 - Rudolf suit me factory ke bahar se nikal raha hai
+0:36 to 0:38 - Factory courtyard me coat pakde aadmi aur apron wali aurat chalti hai.
+0:38 to 0:39 - Courtyard me log aate-jaate hain, suit pehna aadmi khada hai.
+0:39 to 0:40 - Raat me Adi workbench par baithkar joote sil raha hai
+0:40 to 0:41 - Adi sui-dhaga pakde dhyan se soch me padta hai
+0:41 to 0:42 - Adi joote ki silai jari rakhta hai
+0:42 to 0:43 - Adi spiked sports shoe ko haath me uthakar dekhta hai
+0:43 to 0:44 - Adi sole par lage spikes ko ungliyon se dabata hai
+0:44 to 0:45 - Adi ka close-up, gale par haath rakhe neeche dekh raha hai
+0:45 to 0:46 - Adi thakawat me gehri saans leta hai
+0:46 to 0:47 - Adi pareshan hokar palkein jhuka leta hai
+0:46 to 0:48 - Adi apna haath uthakar maathe par rakh leta hai
+0:47 to 0:48 - Adi sar jhukaye mayus baitha hua hai
+0:48 to 0:49 - Rudi workshop ka darwaza kholkar andar dekhta hai
+0:49 to 0:50 - Rudi chot-lage chehre ke saath aage badhta hai
+0:50 to 0:51 - Rudi Adi ke table ke paas chalkar aata hai
+0:51 to 0:52 - Adi gale par haath rakhkar Rudi ki taraf dekhta hai
+0:52 to 0:53 - Rudi neeche Adi ki taraf dekhkar baat karta hai
+0:52 to 0:54 - Rudi jhuk kar bolta hai: "Was Großes..."
+0:53 to 0:54 - Rudi bolta rehta hai
+0:54 to 0:55 - Adi desk par baithkar Rudi ki baat sunta hai.
+0:55 to 0:56 - Rudi aur Adi aapas me haath milate hain.
+0:56 to 0:57 - Truck se Rudi lohe ki rod le kar utarta hai.
+0:57 to 0:58 - Rudi aangan me ghoom kar utsah se baat karta hai.
+0:58 to 1:00 - Rudi chalte hue karkhane ki taraf ghoomta hai.
+1:00 to 1:01 - Rudi aur Adi bhuuse ke samne khade baat karte hain.
+1:01 to 1:02 - Sadak par log bheed me soup table par khana khate hain.
+1:01 to 1:04 - Purane shahar ki sadak par food stall par log khade hain
+1:02 to 1:03 - Log katoron me soup le rahe hain.
+1:03 to 1:05 - Ek aadmi beige jacket me bheed ke paas se guzarta hai.
+1:04 to 1:07 - Topi pehna aadmi bade bartan se soup paros raha hai
+1:05 to 1:06 - Mahila bade pateele se soup baantti hai.
+1:06 to 1:07 - Log line me khade hokar soup lete hain.
+1:06 to 1:08 - Soup ka karcha katori me pour hota hai
+1:07 to 1:09 - Haathon me parcha dikhta hai: "Jetzt ist es Zeit...".
+1:09 to 1:11 - Banker parcha padhte hue apni desk ki taraf jata hai.
+1:09 to 1:12 - Grey suit me banker desk par baithkar kaghaz padhta hai
+1:11 to 1:12 - Banker kursi par baith kar kagazat samne rakhta hai.
+1:12 to 1:13 - Rudi aur Adi samne baithe hain; Rudi bolna shuru karta hai.
+1:13 to 1:15 - Adi chinta me hoth dabakar neeche dekhta hai.
+1:15 to 1:18 - Banker jooti ko modkar dekh raha hai aur na me sir hilata hai
+1:15 to 1:16 - Banker black sports shoe ko dono hath me ghuma kar dekhta hai
+1:16 to 1:18 - Banker shoe ko bend aur twist karta hai
+1:18 to 1:22 - Adi shant baitha hai, banker jooti ko haath me ghuma raha hai
+1:18 to 1:19 - Adi banker ki taraf dekhkar nazrein jhukata hai
+1:19 to 1:20 - Adi dheere se banker ki taraf dekhta hai
+1:20 to 1:21 - Rudi banker ko tezi se samjhata hai
+1:21 to 1:23 - Banker shoe pakad kar aashcharya se bolta hai
+1:22 to 1:26 - Banker kanti waale talwe ko dekhkar sir hilata hai aur joota neeche rakhta hai
+1:23 to 1:24 - Banker shoe ko ulta karke uska sole dekhta hai
+1:24 to 1:26 - Banker sole ke cleats par ungli lagakar bolta hai
+1:26 to 1:28 - Adi aur Rudi bank ki building se bahar nikalte hain
+1:26 to 1:27 - Adi bank se nikal kar box lekar gali me chalta hai
+1:27 to 1:28 - Rudi peeche se aakar Adi ka kandha pakadta hai
+1:28 to 1:29 - Rudi Adi ko rok kar aamne-saamne karta hai
+1:29 to 1:34 - Rudi Adi ko rokta hai aur sadak par shanti se baat karta hai
+1:29 to 1:31 - Rudi gusse me: "Der Kerl arbeitet bei einer Bank..."
+1:31 to 1:32 - Rudi: "...der braucht Zahlen und Fakten!"
+1:32 to 1:34 - Adi chupchaap Rudi ki baat sunta hai
+1:34 to 1:37 - Car ke pichhe "Gebrüder Dassler" ke jooton ke dibbe rakhe hain
+1:37 to 1:39 - Rudi car chalate hue track ki taraf dekh raha hai
+1:39 to 1:43 - Rudi goal post ke paas chalkar khiladiyon se baat kar raha hai
+1:43 to 1:49 - Rudi ghaas par baithe khiladiyon ko jooti ka talwa dikha raha hai
+1:49 to 1:50 - Coach track ke kinare khiladi se baat kar raha hai
+1:50 to 1:53 - Rudi jooton ke dibbe liye khushi se muskurata hai
+1:53 to 1:58 - Convertible car ki pichhli seat ka drishya jab wo chal rahi hai
+1:58 to 1:59 - Mazdoor factory se jooton ke dibbe bahar le ja rahe hain
+1:59 to 2:02 - Adi workshop me jooti par kaam karte hue soch raha hai
+1:59 to 2:01 - Adi workshop me scraper auzar se sole ko ghis raha hai
+2:01 to 2:02 - Adi sole par phoonk maarkar chamde ko dhyan se dekhta hai
+2:02 to 2:03 - Adi jooti ke talwe ko ghaur se dekh raha hai
+2:03 to 2:04 - Keel waale chamde ke talwe ka close-up
+2:04 to 2:07 - Adi workshop me chaku se tyre kaat raha hai
+2:04 to 2:05 - Adi bench par baitha kaam kar raha hai, peeche Rudi aata hai
+2:05 to 2:07 - Aage se ladka gujarta hai, Adi bench par sole jod raha hai
+2:07 to 2:09 - Tyre ke rubber ka close-up, Adi paseena ponchhta hai
+2:07 to 2:08 - Cycle ke pahiye par kata hua car ka tyre dikhta hai
+2:08 to 2:09 - Pasiine me lathpath Adi joothe ke sole par kaam kar raha hai
+2:09 to 2:10 - Adi thakan me apna maatha aur gardan pochhta hai
+2:09 to 2:13 - Rudi workshop me aata hai, tyre kata dekhkar gussa hota hai
+2:10 to 2:11 - Adi thak kar gehri saans leta hua upar dekhta hai
+2:11 to 2:12 - Rudi gusse me Adi ki taraf badhta hai: "Wir haben schon wieder..."
+2:12 to 2:13 - Rudi bolte hue aage aata hai: "...eine Stunde Minus..."
+2:13 to 2:14 - Adi haath me pencil aur notepad pakad kar Rudi ko dekhta hai
+2:13 to 2:16 - Rudi desk par baithe Adi ke samne khada hokar chillata hai
+2:14 to 2:15 - Adi likhte hue kehta hai: "Unsere Schuhe sind die besten."
+2:15 to 2:16 - Adi table par chupchap likhta rehta hai
+2:16 to 2:19 - Rudi gusse me Adi par cheekhta hai
+2:16 to 2:18 - Rudi cheekh kar gussa karta hai: "In deiner Arroganz perfektionierst du..."
+2:18 to 2:19 - Rudi baal peeche karke chilata hai: "...vollkommen am Bedarf vorbei! Lass das!"
+2:19 to 2:20 - Rudi Adi ke hath se jootha chheen kar phenkta hai: "Das Ding, lass die Experimente!"
+2:19 to 2:21 - Rudi tyre ka tukda desk par fekta hai
+2:20 to 2:21 - Adi jhatke me shock hokar piche hat-ta hai
+2:21 to 2:23 - Rudi gusse me workshop se bahar chala jata hai
+2:21 to 2:23 - Rudi mud kar tezi se bahar nikalta hai
+2:22 to 2:24 - Rudi workshop ke glass door se bahar chala jata hai
+2:23 to 2:26 - Adi desk par akela baitha hai, chehra ਹੈran aur hairan
+2:23 to 2:25 - Adi stabdh hokar Rudi ke peeche dekhta rehta hai
+2:25 to 2:26 - Adi ke chehre par dukh aur ascharya ke bhaav rehte hain
+
+HISSA 2
+0:00 to 0:01 = 1:38:53 to 1:38:55 [W12]
+0:00 to 0:02 = 1:38:54 to 1:38:55 [W12]
+0:01 to 0:02 = 1:38:55 to 1:38:56 [W12]
+0:02 to 0:03 = 1:38:56 to 1:38:57 [W12]
+0:03 to 0:05 = 1:39:09 to 1:39:10 [W12]
+0:05 to 0:06 = 1:39:10 to 1:39:11 [W12]
+0:05 to 0:07 = 1:39:23 to 1:39:24 [W12]
+0:06 to 0:07 = 1:39:23 to 1:39:25 [W12]
+0:07 to 0:08 = 1:39:44 to 1:39:45 [W12]
+0:07 to 0:08 = 2:07 to 2:08 [W01]
+0:07 to 0:09 = 1:39:45 to 1:39:46 [W12]
+0:08 to 0:10 = 1:39:35 to 1:39:36 [W12]
+0:10 to 0:11 = 1:39:36 to 1:39:37 [W12]
+0:10 to 0:12 = 1:39:42 to 1:39:43 [W12]
+0:11 to 0:13 = NOT FOUND
+0:13 to 0:14 = NOT FOUND
+0:14 to 0:17 = NOT FOUND
+0:17 to 0:19 = 2:20 to 2:22 [W01]
+0:19 to 0:20 = 2:26 to 2:28 [W01]
+0:20 to 0:22 = 2:29 to 2:30 [W01]
+0:22 to 0:23 = 2:32 to 2:34 [W01]
+0:23 to 0:25 = 2:48 to 2:49 [W01]
+0:25 to 0:26 = 2:45 to 2:46 [W01]
+0:26 to 0:28 = 2:49 to 2:51 [W01]
+0:28 to 0:30 = NOT FOUND
+0:30 to 0:31 = 3:12 to 3:13 [W02]
+0:30 to 0:32 = 38:44 to 38:45 [W09]
+0:31 to 0:32 = 3:13 to 3:14 [W02]
+0:32 to 0:34 = 3:14 to 3:15 [W02]
+0:33 to 0:34 = 3:38 to 3:39 [W02]
+0:34 to 0:35 = 38:35 to 38:36 [W09]
+0:34 to 0:35 = 3:39 to 3:40 [W02]
+0:35 to 0:36 = NOT FOUND
+0:36 to 0:39 = 38:36 to 38:39 [W09]
+0:36 to 0:38 = 4:38 to 4:39 [W02]
+0:38 to 0:39 = 4:39 to 4:41 [W02]
+0:39 to 0:40 = 8:52 to 8:53 [W03]
+0:40 to 0:41 = 8:53 to 8:54 [W03]
+0:41 to 0:42 = 8:53 to 8:55 [W03]
+0:42 to 0:43 = 8:58 to 8:59 [W03]
+0:43 to 0:44 = 8:59 to 9:00 [W03]
+0:44 to 0:45 = 10:22 to 10:23 [W03]
+0:45 to 0:46 = 10:23 to 10:24 [W03]
+0:46 to 0:47 = 10:24 to 10:25 [W03]
+0:46 to 0:48 = 9:07 to 9:08 [W03]
+0:47 to 0:48 = 9:07 to 9:09 [W03]
+0:48 to 0:49 = 9:16 to 9:18 [W03]
+0:49 to 0:50 = 9:27 to 9:28 [W03]
+0:50 to 0:51 = 9:28 to 9:29 [W03]
+0:51 to 0:52 = 9:34 to 9:35 [W03]
+0:52 to 0:53 = 9:36 to 9:37 [W03]
+0:52 to 0:54 = 10:53 to 10:54 [W04]
+0:53 to 0:54 = 9:37 to 9:38 [W03]
+0:54 to 0:55 = 11:19 to 11:20 [W04]
+0:55 to 0:56 = 11:28 to 11:29 [W04]
+0:56 to 0:57 = 11:35 to 11:36 [W04]
+0:57 to 0:58 = 11:47 to 11:48 [W04]
+0:58 to 1:00 = 11:48 to 11:49 [W04]
+1:00 to 1:01 = 11:51 to 11:52 [W04]
+1:01 to 1:02 = 12:44 to 12:45 [W04]
+1:01 to 1:04 = 22:01 to 22:04 [W06]
+1:02 to 1:03 = 12:45 to 12:47 [W04]
+1:03 to 1:05 = 12:47 to 12:48 [W04]
+1:04 to 1:07 = 22:04 to 22:07 [W06]
+1:05 to 1:06 = 12:48 to 12:49 [W04]
+1:06 to 1:07 = 12:49 to 12:51 [W04]
+1:06 to 1:08 = 22:06 to 22:08 [W06]
+1:07 to 1:09 = 22:07 to 22:09 [W06]
+1:09 to 1:11 = CONFLICT: 14:54 to 14:56 (W05) | 13:25 to 13:26 (W04)
+1:09 to 1:12 = 22:09 to 22:12 [W06]
+1:11 to 1:12 = CONFLICT: 14:56 to 14:57 (W05) | 13:26 to 13:28 (W04)
+1:12 to 1:13 = 22:12 to 22:13 [W06]
+1:13 to 1:15 = 22:13 to 22:15 [W06]
+1:15 to 1:18 = 22:15 to 22:18 [W06]
+1:15 to 1:16 = 14:11 to 14:12 [W05]
+1:16 to 1:18 = 14:12 to 14:14 [W05]
+1:18 to 1:22 = 22:18 to 22:22 [W06]
+1:18 to 1:19 = 14:14 to 14:15 [W05]
+1:19 to 1:20 = 14:15 to 14:16 [W05]
+1:20 to 1:21 = 14:23 to 14:24 [W05]
+1:21 to 1:23 = 14:25 to 14:27 [W05]
+1:22 to 1:26 = 22:22 to 22:26 [W06]
+1:23 to 1:24 = 14:27 to 14:28 [W05]
+1:24 to 1:26 = 14:28 to 14:30 [W05]
+1:26 to 1:28 = 22:26 to 22:28 [W06]
+1:26 to 1:27 = 15:04 to 15:05 [W05]
+1:27 to 1:28 = 15:06 to 15:07 [W05]
+1:28 to 1:29 = CONFLICT: 15:07 to 15:08 (W05) | 22:28 to 22:29 (W06)
+1:29 to 1:34 = 22:29 to 22:34 [W06]
+1:29 to 1:31 = 15:08 to 15:10 [W05]
+1:31 to 1:32 = 15:10 to 15:11 [W05]
+1:32 to 1:34 = 15:12 to 15:13 [W05]
+1:34 to 1:37 = 22:34 to 22:37 [W06]
+1:37 to 1:39 = 22:37 to 22:39 [W06]
+1:39 to 1:43 = 22:39 to 22:43 [W06]
+1:43 to 1:49 = 22:43 to 22:49 [W06]
+1:49 to 1:50 = 22:49 to 22:50 [W06]
+1:50 to 1:53 = 22:50 to 22:53 [W06]
+1:53 to 1:58 = 22:53 to 22:58 [W06]
+1:58 to 1:59 = 22:58 to 22:59 [W06]
+1:59 to 2:02 = 22:59 to 23:02 [W06]
+1:59 to 2:01 = 25:55 to 25:57 [W07]
+2:01 to 2:02 = 25:57 to 25:58 [W07]
+2:02 to 2:03 = CONFLICT: 23:02 to 23:03 (W06) | 26:08 to 26:09 (W07)
+2:03 to 2:04 = CONFLICT: 23:03 to 23:04 (W06) | 26:09 to 26:10 (W07)
+2:04 to 2:07 = 23:04 to 23:07 [W06]
+2:04 to 2:05 = 27:01 to 27:02 [W07]
+2:05 to 2:07 = 27:02 to 27:03 [W07]
+2:07 to 2:09 = 23:07 to 23:09 [W06]
+2:07 to 2:08 = 27:05 to 27:06 [W07]
+2:08 to 2:09 = 27:06 to 27:07 [W07]
+2:09 to 2:10 = 27:07 to 27:08 [W07]
+2:09 to 2:13 = 23:09 to 23:13 [W06]
+2:10 to 2:11 = 27:08 to 27:09 [W07]
+2:11 to 2:12 = 27:12 to 27:13 [W07]
+2:12 to 2:13 = 27:13 to 27:14 [W07]
+2:13 to 2:14 = 27:16 to 27:18 [W07]
+2:13 to 2:16 = 23:13 to 23:16 [W06]
+2:14 to 2:15 = 27:18 to 27:19 [W07]
+2:15 to 2:16 = 27:19 to 27:20 [W07]
+2:16 to 2:19 = 23:16 to 23:19 [W06]
+2:16 to 2:18 = 27:41 to 27:42 [W07]
+2:18 to 2:19 = 27:42 to 27:43 [W07]
+2:19 to 2:20 = 27:44 to 27:45 [W07]
+2:19 to 2:21 = 23:19 to 23:21 [W06]
+2:20 to 2:21 = 27:45 to 27:46 [W07]
+2:21 to 2:23 = 23:21 to 23:23 [W06]
+2:21 to 2:23 = 27:46 to 27:47 [W07]
+2:22 to 2:24 = 27:47 to 27:48 [W07]
+2:23 to 2:26 = 23:23 to 23:26 [W06]
+2:23 to 2:25 = 27:48 to 27:50 [W07]
+2:25 to 2:26 = 27:50 to 27:51 [W07]

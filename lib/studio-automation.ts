@@ -48,7 +48,11 @@ import {
   validateStudioAnswer,
   type StudioValidationResult,
 } from './studio-result-validator'
-import { extractHissa1And2EntriesFromResponse, formatParallelTimecode } from './studio-window-planner'
+import {
+  detectAndFilterHallucinatedExtrapolation,
+  extractHissa1And2EntriesFromResponse,
+  formatParallelTimecode,
+} from './studio-window-planner'
 import { maxMovieEndSecInHissa2, shiftMovieTimestampsInHissa2 } from './studio-clip-offset'
 import { fmtTime } from './format'
 import type { ChunkMatch } from './types'
@@ -6520,6 +6524,30 @@ export class StudioBrowserController {
                 /PERMISSION_DENIED|caller does not have permission/i.test(capturedRunError.body))
 
             if (domPermissionDenied || netPermissionDenied) {
+              // If HISSA 2 was already generated in the DOM before the late 403 (e.g. background Drive autosave 403),
+              // rescue the completed output immediately instead of discarding it and waiting 15s!
+              if (hissa2FirstSeenLogged || /HISSA\s*2\b/i.test(lastCandidateText)) {
+                const candidateNow = await this.extractFinalAnswerWithoutThoughts(page).catch(() => '')
+                const bestCandidate =
+                  candidateNow && candidateNow.length >= lastCandidateText.length
+                    ? candidateNow
+                    : lastCandidateText
+                if (/HISSA\s*1\b/i.test(bestCandidate) && /HISSA\s*2\b/i.test(bestCandidate)) {
+                  lastCandidateText = bestCandidate
+                  doneIndicator = 'RESCUED_ON_LATE_403'
+                  this.logStep(
+                    'late 403 ignored (result ready)',
+                    `${jobLabel}: late 403 PERMISSION_DENIED ignored because HISSA 1 + HISSA 2 already generated (${bestCandidate.length} chars) — proceeding to validate`,
+                    'info',
+                  )
+                  onLog?.(
+                    'info',
+                    `${jobLabel}: late 403 ignored — HISSA 1 + HISSA 2 already generated (${bestCandidate.length} chars), validating result`,
+                  )
+                  break
+                }
+              }
+
               if (!capturedRunError) {
                 await new Promise((r) => setTimeout(r, 500))
               }
@@ -6994,29 +7022,6 @@ export class StudioBrowserController {
           page.off('response', onRunResponse)
         }
 
-        if (permissionDeniedTriggered) {
-          await this.saveRotatedSessionFromContext(username)
-          resetOnPermissionDenied = true
-          // Do NOT consume normal MAX_ATTEMPTS = 3; perform hard page reset or browser restart at the top of the loop and redo the full window setup
-          attempt -= 1
-          continue
-        }
-
-        if (quotaSwitchRetryNewChat) {
-          await this.saveRotatedSessionFromContext(username)
-          this.logStep(
-            'quota switch -> retry in new chat',
-            `${jobLabel}: retrying window with switched model "${activeModelName}" in a fresh chat`,
-            'info',
-          )
-          onLog?.(
-            'info',
-            `${jobLabel}: retrying window with switched model "${activeModelName}" in a fresh chat`,
-          )
-          attempt -= 1
-          continue
-        }
-
         // Fetch and validate answer (with Fix 6: 10s wait + single re-fetch if validation is INCOMPLETE,
         // and Fix 3: diagnostics + up to 2 CONTINUE follow-up attempts in the same chat)
         currentStage = 'run/validate'
@@ -7086,7 +7091,7 @@ export class StudioBrowserController {
           // FIX 4: Clean HISSA 1 + HISSA 2 text (no UI noise, no Grounding Sources, no thumb_up/duration)
           let candidateCleanAnswer = cleanStudioAnswerText(curVal.cleanedText)
 
-          // FIX 1: Coverage check (never compare HISSA 1 count with HISSA 2 count!) + out-of-window check
+          // FIX 1: Coverage check (never compare HISSA 1 count with HISSA 2 count!) + out-of-window check + hallucinated extrapolation check
           if (parallelMode) {
             const parsedEntries = extractHissa1And2EntriesFromResponse(candidateCleanAnswer)
             const cov = checkHissa2ShortCoverage(parsedEntries.hissa2Entries, shortDurationSec)
@@ -7107,6 +7112,20 @@ export class StudioBrowserController {
               if (outOfWin && outOfWin.movieStartSec !== null && outOfWin.movieEndSec !== null) {
                 candidateCleanAnswer = ''
                 validationReason = `out-of-window (${formatParallelTimecode(outOfWin.movieStartSec)}-${formatParallelTimecode(outOfWin.movieEndSec)} outside ${formatParallelTimecode(movieStartSec)}-${formatParallelTimecode(movieEndSec)} ±5s)`
+              } else {
+                const extrapCheck = detectAndFilterHallucinatedExtrapolation(
+                  parsedEntries.hissa2Entries,
+                  movieStartSec,
+                )
+                if (extrapCheck.isHallucinated) {
+                  candidateCleanAnswer = ''
+                  validationReason = extrapCheck.reason
+                  this.logStep(
+                    'validate hallucinated extrapolation',
+                    `${jobLabel}: rejected hallucinated HISSA 2 matches — ${extrapCheck.reason}`,
+                    'warn',
+                  )
+                }
               }
             }
           }
@@ -7135,6 +7154,53 @@ export class StudioBrowserController {
           fetchedSource = fetched.source
           accumulatedUnshiftedText = fetched.text || lastCandidateText
           shiftValidateAndCheckCoverage(accumulatedUnshiftedText)
+        }
+
+        // Rescue check: if a late 403 or transient banner fired right after HISSA 2 was already generated,
+        // validate the completed answer first before discarding it!
+        if (
+          (permissionDeniedTriggered || internalErrorDetected || transientBannerReason) &&
+          (hissa2FirstSeenLogged || /HISSA\s*2\b/i.test(lastCandidateText))
+        ) {
+          await fetchShiftAndValidateOnce().catch(() => null)
+          if (rawAnswer) {
+            this.logStep(
+              'rescued valid result on late error',
+              `${jobLabel}: accepted valid HISSA 1 + HISSA 2 result (${rawAnswer.length} chars) despite late error/403`,
+              'success',
+            )
+            onLog?.(
+              'success',
+              `${jobLabel}: rescued valid HISSA 1 + HISSA 2 result (${rawAnswer.length} chars) despite late error/403`,
+            )
+            permissionDeniedTriggered = false
+            internalErrorDetected = false
+            transientBannerReason = ''
+            validationReason = ''
+          }
+        }
+
+        if (permissionDeniedTriggered) {
+          await this.saveRotatedSessionFromContext(username)
+          resetOnPermissionDenied = true
+          // Do NOT consume normal MAX_ATTEMPTS = 3; perform hard page reset or browser restart at the top of the loop and redo the full window setup
+          attempt -= 1
+          continue
+        }
+
+        if (quotaSwitchRetryNewChat) {
+          await this.saveRotatedSessionFromContext(username)
+          this.logStep(
+            'quota switch -> retry in new chat',
+            `${jobLabel}: retrying window with switched model "${activeModelName}" in a fresh chat`,
+            'info',
+          )
+          onLog?.(
+            'info',
+            `${jobLabel}: retrying window with switched model "${activeModelName}" in a fresh chat`,
+          )
+          attempt -= 1
+          continue
         }
 
         // Requirement 4: If quota was exceeded after a partial answer arrived (or after prompt turn was sent),
