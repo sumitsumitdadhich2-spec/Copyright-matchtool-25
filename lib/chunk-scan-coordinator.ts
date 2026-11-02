@@ -255,9 +255,13 @@ export function allocateScanKeyPair(
     }
   }
 
-  let slot = 1
-  while (usedSlotsByOthers.has(slot)) {
-    slot += 1
+  const preferredSlot = Math.max(1, ensureScanChunkTicket(scanId))
+  let slot = preferredSlot
+  if (usedSlotsByOthers.has(slot)) {
+    slot = 1
+    while (usedSlotsByOthers.has(slot)) {
+      slot += 1
+    }
   }
   const keyPair: [number, number] = [2 * slot - 1, 2 * slot]
   gState.activeKeySlotsByScanId.set(scanId, slot)
@@ -392,6 +396,17 @@ export function selectScanKeyPairWithFallback<
     }
   }
 
+  // Secondary fallback if all non-conflicting keys had 0 quota: pick highest-quota key overall with totalRemaining > 0
+  if (selected.length < 2) {
+    const anyQuotaPool = allCandidates
+      .filter((c) => c.totalRemaining > 0 && !selected.some((s) => s.keyIdx === c.keyIdx))
+      .sort((a, b) => b.totalRemaining - a.totalRemaining || a.keyIdx - b.keyIdx)
+    for (const fb of anyQuotaPool) {
+      if (selected.length >= 2) break
+      selected.push(fb)
+    }
+  }
+
   // Last-resort fallback if all keys have 0 counter quota or fewer than 2 keys are configured:
   // still prefer the assigned pair or keys not in another active scan's pair
   if (selected.length === 0) {
@@ -419,6 +434,66 @@ export function selectScanKeyPairWithFallback<
     keyPair,
     selected: finalSelected,
   }
+}
+
+/**
+ * Dynamically claim a replacement API key with the HIGHEST remaining quota (`totalRemaining > 0`)
+ * when an active key's quota becomes exhausted in the middle of a scan (Minute Finder or Backup Finder).
+ */
+export function claimReplacementKeyForScan<
+  T extends {
+    keyIdx: number
+    apiKey: string
+    totalRemaining: number
+    hasCachedUploads?: boolean
+    isActiveInOtherScan?: boolean
+  },
+>(
+  scanId: string,
+  allCandidates: T[],
+  excludeKeyIndices: Set<number>,
+): T | null {
+  // 1. Prefer keys with totalRemaining > 0 that are NOT in excludeKeyIndices and NOT in another active scan's keyPair
+  const primaryPool = allCandidates
+    .filter(
+      (c) =>
+        c.totalRemaining > 0 &&
+        !excludeKeyIndices.has(c.keyIdx) &&
+        !isKeyInOtherActiveScanPair(c.keyIdx, scanId) &&
+        !c.isActiveInOtherScan,
+    )
+    .sort((a, b) => {
+      if (b.totalRemaining !== a.totalRemaining) return b.totalRemaining - a.totalRemaining
+      if (Boolean(b.hasCachedUploads) !== Boolean(a.hasCachedUploads)) {
+        return b.hasCachedUploads ? 1 : -1
+      }
+      return a.keyIdx - b.keyIdx
+    })
+
+  let chosen: T | null = primaryPool[0] ?? null
+
+  // 2. If all non-conflicting keys are exhausted or already tried, pick any unused key with highest remaining quota > 0
+  if (!chosen) {
+    const secondaryPool = allCandidates
+      .filter((c) => c.totalRemaining > 0 && !excludeKeyIndices.has(c.keyIdx))
+      .sort((a, b) => {
+        if (b.totalRemaining !== a.totalRemaining) return b.totalRemaining - a.totalRemaining
+        if (Boolean(b.hasCachedUploads) !== Boolean(a.hasCachedUploads)) {
+          return b.hasCachedUploads ? 1 : -1
+        }
+        return a.keyIdx - b.keyIdx
+      })
+    chosen = secondaryPool[0] ?? null
+  }
+
+  if (chosen) {
+    const existing = gState.activeAssignedKeysByScanId.get(scanId) || []
+    if (!existing.includes(chosen.keyIdx)) {
+      gState.activeAssignedKeysByScanId.set(scanId, [...existing, chosen.keyIdx])
+    }
+  }
+
+  return chosen
 }
 
 /**

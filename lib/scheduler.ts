@@ -1757,7 +1757,10 @@ class Scheduler {
           scanId: scan.id,
           minuteInput,
           minuteInputSource: scan.studioMinuteInputSource || 'auto',
-          concurrency: scan.studioParallelConcurrency ?? undefined,
+          concurrency:
+            scan.studioParallelConcurrency && scan.studioParallelConcurrency > 4
+              ? scan.studioParallelConcurrency
+              : 10,
           shortDurationSec: scan.shortDuration || 150,
           movieDurationSec: (scan.movieTrimEnd ?? scan.movieDuration) || undefined,
           resumeExisting: job.resume,

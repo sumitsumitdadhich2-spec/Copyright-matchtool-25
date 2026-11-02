@@ -1412,7 +1412,7 @@ export class YtStudioBrowserController {
       scanId,
       expectedWindows = [],
       waitForSdReady = false,
-      maxWaitMs = 90_000,
+      maxWaitMs = 0,
       username = 'admin',
       onProgress,
     } = opts || {};
@@ -1524,29 +1524,41 @@ export class YtStudioBrowserController {
               '.tablecell-restrictions, ytcp-video-list-cell-restrictions'
             );
             const rowText = (row.textContent || '').replace(/\s+/g, ' ').trim();
-            const visibility = (visCell?.textContent || '').replace(/\s+/g, ' ').trim() ||
-              (/unlisted/i.test(rowText)
-                ? 'Unlisted'
-                : /private/i.test(rowText)
-                  ? 'Private'
-                  : /public/i.test(rowText)
-                    ? 'Public'
-                    : /pending|processing/i.test(rowText)
-                      ? 'Processing SD'
-                      : 'Unlisted');
-
+            const rawVisText = (visCell?.textContent || '').replace(/\s+/g, ' ').trim();
             const restrictions = (restCell?.textContent || '').replace(/\s+/g, ' ').trim() ||
               (/copyright|claimed/i.test(rowText) ? 'Copyright' : 'None');
 
+            const isBlocked = /\bblocked\b/i.test(
+              `${rawVisText} ${restrictions} ${rowText}`
+            );
+
             const isUploadingOrSdPending =
-              /\b(uploading|processing\s+up\s+to\s+sd|processing\s+will\s+begin|pending|draft)\b/i.test(
-                visibility
-              ) || /\buploading\s+\d+%/i.test(rowText);
+              !isBlocked &&
+              (/\b(uploading|processing\s+up\s+to\s+sd|processing\s+will\s+begin|pending|draft|checking)\b/i.test(
+                rawVisText
+              ) ||
+                /\buploading\s+\d+%/i.test(rowText) ||
+                /\bprocessing\s+up\s+to\s+sd\b/i.test(rowText));
+
+            const visibility = isBlocked
+              ? 'Unlisted (Blocked)'
+              : rawVisText ||
+                (/unlisted/i.test(rowText)
+                  ? 'Unlisted'
+                  : /private/i.test(rowText)
+                    ? 'Private'
+                    : /public/i.test(rowText)
+                      ? 'Public'
+                      : /pending|processing/i.test(rowText)
+                        ? 'Processing SD'
+                        : 'Unlisted');
 
             const isUnlistedOrPrivateReady =
-              /\b(unlisted|private|public)\b/i.test(visibility) && !isUploadingOrSdPending;
+              !isUploadingOrSdPending &&
+              (isBlocked || /\b(unlisted|private|public|blocked)\b/i.test(visibility));
 
-            const hasClaim = /\b(copyright|claimed|blocked)\b/i.test(restrictions + ' ' + rowText);
+            const hasClaim =
+              isBlocked || /\b(copyright|claimed|blocked)\b/i.test(restrictions + ' ' + rowText);
 
             extracted.push({
               title: title || videoId,
@@ -1681,16 +1693,31 @@ export class YtStudioBrowserController {
         );
       }
 
-      if (!waitForSdReady || allReady || Date.now() - startTime >= maxWaitMs) {
+      if (
+        this.stopRequested ||
+        !waitForSdReady ||
+        allReady ||
+        (maxWaitMs > 0 && Date.now() - startTime >= maxWaitMs)
+      ) {
         break;
       }
 
-      await page.waitForTimeout(4000);
-      if (Date.now() - lastReloadAt >= 18_000) {
-        lastReloadAt = Date.now();
-        await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-        await page.waitForTimeout(2500);
+      // Wait 15 seconds (checking stopRequested every 1s) then refresh Content page to check SD processing
+      for (let w = 0; w < 15; w++) {
+        if (this.stopRequested) break;
+        await page.waitForTimeout(1000);
       }
+      if (this.stopRequested) break;
+
+      lastReloadAt = Date.now();
+      this.log(
+        'content refresh',
+        `Refreshing YouTube Studio Content page (15s interval) — ${readyCount}/${expectedCount || uploadedCount} ready, ${processingCount} still processing SD...`,
+        'info'
+      );
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await page.waitForTimeout(2500);
+      await this.dismissAllUploadDialogs(page).catch(() => {});
     }
 
     return this.contentProgress!;
@@ -1739,6 +1766,7 @@ export class YtStudioBrowserController {
         }
 
         this.log('cleanup', `Deleting batch #${round} (${rowCount} visible video rows)...`, 'info');
+        await this.dismissAllUploadDialogs(page).catch(() => {});
 
         const selectAllCheckbox = page.locator(
           '#selection-checkbox, ytcp-checkbox-lit#selection-checkbox, ytcp-video-section-content #selection-checkbox'
@@ -1750,30 +1778,31 @@ export class YtStudioBrowserController {
         }
 
         await selectAllCheckbox.click({ timeout: 6000 });
-        await page.waitForTimeout(800);
+        await page.waitForTimeout(2000);
 
         const moreActionsBtn = page.locator(
           'ytcp-button:has-text("More actions"), #additional-action-options-button, button[aria-label="More actions"]'
         ).first();
         await moreActionsBtn.click({ timeout: 6000 });
-        await page.waitForTimeout(600);
+        await page.waitForTimeout(2000);
 
         const deleteForeverItem = page.locator(
           'tp-yt-paper-item:has-text("Delete forever"), ytcp-ve:has-text("Delete forever")'
         ).first();
         await deleteForeverItem.click({ timeout: 6000 });
-        await page.waitForTimeout(1000);
+        await page.waitForTimeout(2000);
 
         const confirmCheckbox = page.locator(
           'ytcp-confirmation-dialog ytcp-checkbox-lit, ytcp-dialog #confirm-checkbox, ytcp-checkbox-lit: near(:text("permanently deleted"))'
         ).first();
         await confirmCheckbox.click({ timeout: 6000 });
-        await page.waitForTimeout(500);
+        await page.waitForTimeout(2000);
 
         const confirmDeleteBtn = page.locator(
           'ytcp-confirmation-dialog #confirm-button, ytcp-dialog ytcp-button:has-text("Delete forever"), button:has-text("Delete forever")'
         ).first();
         await confirmDeleteBtn.click({ timeout: 8000 });
+        await page.waitForTimeout(2000);
 
         deletedBatches++;
         this.log('cleanup', `Batch #${round} deletion submitted — waiting for YouTube Studio to finish...`, 'info');

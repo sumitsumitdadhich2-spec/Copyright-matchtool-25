@@ -36,6 +36,7 @@ import {
   globalChunkScanCoordinator,
   ensureScanTicketAndKeyPair,
   selectScanKeyPairWithFallback,
+  claimReplacementKeyForScan,
   skipScanTicket,
 } from './chunk-scan-coordinator'
 import { deductTokens, refundTokens, SCAN_TOKEN_COST } from './tokens'
@@ -500,47 +501,62 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   // 2. Keys with cached uploads for THIS scan first (0s upload wait).
   // 3. Keys that are NOT busy in other parallel scans first (allows 2-3 scans to partition 16 keys cleanly).
   // 4. Higher remaining quota.
-  const allKeysWithQuota = apiKeys.map((k, i) => {
-    const keyId = apiKeyHash(k)
-    const availableLanes = CHUNK_MODEL_POOL.filter((m) => !globalGeminiCoordinator.isModelExhausted(k, m.id, m.rpd))
-    const totalRemaining = CHUNK_MODEL_POOL.reduce((sum, m) => sum + (globalGeminiCoordinator.isModelExhausted(k, m.id, m.rpd) ? 0 : Math.max(0, m.rpd - getModelUsage(m.id, k))), 0)
-    const sObj = getScan(id)
-    const hasCachedUploads = Boolean(
-      (ctrl.state.uploads[keyId]?.movieUri && ctrl.state.uploads[keyId]?.shortUri) ||
-      (sObj && findReusableGeminiMovieUpload(
-        sObj.movieName || '',
-        sObj.movieSize || 0,
+  const buildCandidatesSnapshot = () =>
+    apiKeys.map((k, i) => {
+      const keyId = apiKeyHash(k)
+      const availableLanes = CHUNK_MODEL_POOL.filter(
+        (m) => !globalGeminiCoordinator.isModelExhausted(k, m.id, m.rpd),
+      )
+      const totalRemaining = CHUNK_MODEL_POOL.reduce(
+        (sum, m) =>
+          sum +
+          (globalGeminiCoordinator.isModelExhausted(k, m.id, m.rpd)
+            ? 0
+            : Math.max(0, m.rpd - getModelUsage(m.id, k))),
+        0,
+      )
+      const sObj = getScan(id)
+      const hasCachedUploads = Boolean(
+        (ctrl.state.uploads[keyId]?.movieUri && ctrl.state.uploads[keyId]?.shortUri) ||
+          (sObj &&
+            findReusableGeminiMovieUpload(
+              sObj.movieName || '',
+              sObj.movieSize || 0,
+              keyId,
+              ctrl.state.movieCopy?.trimStart ?? 0,
+              ctrl.state.movieCopy?.trimEnd ?? sObj.movieDuration ?? 0,
+              id,
+            )),
+      )
+      const isActiveInOtherScan = globalGeminiCoordinator.isKeyActiveInOtherScan(k, id)
+      return {
+        keyIdx: i + 1,
+        apiKey: k,
         keyId,
-        ctrl.state.movieCopy?.trimStart ?? 0,
-        ctrl.state.movieCopy?.trimEnd ?? sObj.movieDuration ?? 0,
-        id,
-      ))
-    )
-    const isActiveInOtherScan = globalGeminiCoordinator.isKeyActiveInOtherScan(k, id)
-    return {
-      keyIdx: i + 1,
-      apiKey: k,
-      keyId,
-      ai: getClient(k),
-      availableLanesCount: availableLanes.length,
-      totalRemaining,
-      hasCachedUploads,
-      isActiveInOtherScan,
-    }
-  })
+        ai: getClient(k),
+        availableLanesCount: availableLanes.length,
+        totalRemaining,
+        hasCachedUploads,
+        isActiveInOtherScan,
+      }
+    })
+
+  const allKeysWithQuota = buildCandidatesSnapshot()
 
   // PER-SCAN DEDICATED 2-KEY PAIR ALLOCATION (Slot N -> Keys [2N-1, 2N]):
-  // Scan #1 gets Slot 1 (Keys 1 & 2), Scan #2 gets Slot 2 (Keys 3 & 4), Scan #3 gets Slot 3 (Keys 5 & 6), etc.
+  // Scan #1 gets Slot 1 (Keys 1 & 2), Scan #2 gets Slot 2 (Keys 3 & 4), Scan #3 gets Slot 3 (Keys 5 & 6),
+  // Scan #4 gets Slot 4 (Keys 7 & 8), Scan #5 gets Slot 5 (Keys 9 & 10), Scan #6 gets Slot 6 (Keys 11 & 12), etc.
   // If a key in this scan's assigned pair is quota-exhausted (0 remaining), falls back to the highest-quota
   // key that is NOT in another active scan's assigned keyPair.
   const keySelection = selectScanKeyPairWithFallback(id, allKeysWithQuota)
   const pool = keySelection.selected.slice(0, 2)
+  const triedKeyIndices = new Set<number>(pool.map((k) => k.keyIdx))
   log(
     id,
     'info',
     `[Gemini Minute Finder] Slot ${keySelection.keySlot} — Keys ${keySelection.keyPair[0]} & ${keySelection.keyPair[1]} assigned (active keys: ${pool
       .map((k) => `Key ${k.keyIdx} (${k.totalRemaining} reqs quota remaining)`)
-      .join(', ')}) — max 2 keys per scan`,
+      .join(', ')}) — max 2 keys per scan (auto-failover to highest-quota key if exhausted mid-scan)`,
   )
 
   persist(id, ctrl, { status: 'uploading', progress: `Uploading to Gemini (0/${pool.length} keys)...` })
@@ -550,8 +566,10 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   const laneWorkers: Promise<void>[] = []
   const env: LaneEnv = { shortFile, copyPath, trimStart, trimEnd }
 
-  let uploadsFinished = false
+  let initialUploadsDone = false
+  let replenishingCount = 0
   let scanStarted = false
+  const isAllUploadsSettled = () => initialUploadsDone && replenishingCount === 0
 
   const startLanesForKey = (k: (typeof pool)[0]) => {
     if (lanesByKey.some((existing) => existing.keyId === k.keyId)) return
@@ -586,8 +604,34 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
       }
 
       for (const lane of keyLanes) {
-        laneWorkers.push(laneWorker(id, ctrl, lane, env, 'normal', lanes, () => uploadsFinished))
+        laneWorkers.push(laneWorker(id, ctrl, lane, env, 'normal', lanes, isAllUploadsSettled))
       }
+    }
+  }
+
+  const tryReplenishExhaustedNormalKey = async (): Promise<boolean> => {
+    if (ctrl.stopping) return false
+    const nextCand = claimReplacementKeyForScan(id, buildCandidatesSnapshot(), triedKeyIndices)
+    if (!nextCand) return false
+    triedKeyIndices.add(nextCand.keyIdx)
+    replenishingCount += 1
+    log(
+      id,
+      'warn',
+      `[Quota Failover] Active key quota exhausted mid-scan — switching to highest-quota Key ${nextCand.keyIdx} (${nextCand.totalRemaining} reqs remaining). Uploading movie & short to Key ${nextCand.keyIdx}...`,
+    )
+    try {
+      await ensureUploads(id, ctrl, nextCand.keyId, nextCand.keyIdx, nextCand.ai, shortFile, copyPath)
+      if (!ctrl.stopping) {
+        startLanesForKey(nextCand)
+      }
+      return true
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      log(id, 'warn', `[Quota Failover] Key ${nextCand.keyIdx} upload failed: ${msg.slice(0, 160)}`)
+      return false
+    } finally {
+      replenishingCount = Math.max(0, replenishingCount - 1)
     }
   }
 
@@ -605,18 +649,35 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
 
   // Track uploads completion in background
   void Promise.all(uploadPromises).then(() => {
-    uploadsFinished = true
+    initialUploadsDone = true
   })
 
+  const targetActiveKeys = Math.min(2, apiKeys.length)
+
   // Main coordinator wait loop: wait until all windows are either 'done' or 'failed',
-  // or until all uploads are done and all live lanes are dead/complete.
+  // and dynamically fail over to the highest-quota unused key if any key's quota runs out mid-scan!
   while (true) {
     if (ctrl.stopping) return
     const ws = ctrl.state.windows
     const allDoneOrFailed = ws.length > 0 && ws.every((w) => w.status === 'done' || w.status === 'failed')
     if (allDoneOrFailed) break
 
-    if (uploadsFinished) {
+    const liveKeyCount = lanesByKey.filter((k) =>
+      lanes.some((l) => l.keyId === k.keyId && !l.dead),
+    ).length
+    const hasPendingWork = ctrl.queue.length > 0 || ctrl.inFlight.size > 0
+
+    if (
+      initialUploadsDone &&
+      hasPendingWork &&
+      liveKeyCount < targetActiveKeys &&
+      replenishingCount === 0
+    ) {
+      const spawned = await tryReplenishExhaustedNormalKey()
+      if (spawned) continue
+    }
+
+    if (isAllUploadsSettled()) {
       if (lanesByKey.length === 0) {
         throw new Error('Kisi bhi API key par upload nahi hua (short + movie copy) — key/quota check karke Retry karo.')
       }
@@ -644,7 +705,17 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   }
 
   // ---- [3b] BACKUP pass: missing short parts → high-fps clip → every window ----
-  await runBackupPass(id, ctrl, lanes, lanesByKey, env, shortDuration, mediaDir)
+  await runBackupPass(
+    id,
+    ctrl,
+    lanes,
+    lanesByKey,
+    env,
+    shortDuration,
+    mediaDir,
+    triedKeyIndices,
+    buildCandidatesSnapshot,
+  )
   if (ctrl.stopping) return
 
   // ---- Aggregate minute list (normal + backup windows) ----
@@ -1322,6 +1393,17 @@ async function runBackupPass(
   env: LaneEnv,
   shortDuration: number,
   mediaDir: string,
+  triedKeyIndices?: Set<number>,
+  buildCandidatesSnapshot?: () => Array<{
+    keyIdx: number
+    apiKey: string
+    keyId: string
+    ai: GoogleGenAI
+    availableLanesCount: number
+    totalRemaining: number
+    hasCachedUploads: boolean
+    isActiveInOtherScan: boolean
+  }>,
 ): Promise<void> {
   const { covered, found } = normalCoverage(ctrl.state.windows)
   const gaps = missingRanges(covered, shortDuration)
@@ -1406,8 +1488,37 @@ async function runBackupPass(
   }
   if (ctrl.stopping) return
 
+  // If fewer than 2 live keys remain before starting backup pass, replenish with highest-quota key(s)
+  let liveKeys = lanesByKey.filter((k) => lanes.some((l) => l.keyId === k.keyId && !l.dead))
+  if (liveKeys.length < 2 && triedKeyIndices && buildCandidatesSnapshot) {
+    while (liveKeys.length < 2 && !ctrl.stopping) {
+      const nextCand = claimReplacementKeyForScan(id, buildCandidatesSnapshot(), triedKeyIndices)
+      if (!nextCand) break
+      triedKeyIndices.add(nextCand.keyIdx)
+      log(
+        id,
+        'warn',
+        `[Backup Quota Failover] Switching to highest-quota Key ${nextCand.keyIdx} (${nextCand.totalRemaining} reqs remaining) — uploading movie & short before backup pass...`,
+      )
+      try {
+        await ensureUploads(id, ctrl, nextCand.keyId, nextCand.keyIdx, nextCand.ai, env.shortFile, env.copyPath)
+        lanesByKey.push(nextCand)
+        for (const m of CHUNK_MODEL_POOL) {
+          if (globalGeminiCoordinator.isModelExhausted(nextCand.apiKey, m.id, m.rpd)) continue
+          lanes.push({ ...nextCand, model: m, label: `key ${nextCand.keyIdx} · ${m.id}`, dead: false })
+        }
+        liveKeys = lanesByKey.filter((k) => lanes.some((l) => l.keyId === k.keyId && !l.dead))
+      } catch (err) {
+        log(
+          id,
+          'warn',
+          `[Backup Quota Failover] Key ${nextCand.keyIdx} upload failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 160)}`,
+        )
+      }
+    }
+  }
+
   // ---- upload clip per key (only keys whose lanes are still alive) ----
-  const liveKeys = lanesByKey.filter((k) => lanes.some((l) => l.keyId === k.keyId && !l.dead))
   if (liveKeys.length === 0) {
     b.status = 'error'
     b.error = 'Saari lanes exhausted (RPD) — backup pass Retry se baad me chalega'
@@ -1462,7 +1573,79 @@ async function runBackupPass(
       .join(' ')} (found range first); ${liveLanes.length} lane(s)`,
   )
 
-  await Promise.all(liveLanes.map((lane) => laneWorker(id, ctrl, lane, env, 'backup', liveLanes)))
+  let backupReplenishingCount = 0
+  const isBackupUploadsSettled = () => backupReplenishingCount === 0
+  const backupWorkers: Promise<void>[] = liveLanes.map((lane) =>
+    laneWorker(id, ctrl, lane, env, 'backup', liveLanes, isBackupUploadsSettled),
+  )
+
+  while (true) {
+    if (ctrl.stopping) return
+    const allBackupDoneOrFailed =
+      b.windows.length > 0 && b.windows.every((w) => w.status === 'done' || w.status === 'failed')
+    if (allBackupDoneOrFailed) break
+
+    const activeBackupKeys = lanesByKey.filter((k) =>
+      liveLanes.some((l) => l.keyId === k.keyId && !l.dead),
+    ).length
+    const hasBackupPending = ctrl.backupQueue.length > 0 || ctrl.backupInFlight.size > 0
+
+    if (
+      hasBackupPending &&
+      activeBackupKeys < 2 &&
+      backupReplenishingCount === 0 &&
+      triedKeyIndices &&
+      buildCandidatesSnapshot
+    ) {
+      const nextCand = claimReplacementKeyForScan(id, buildCandidatesSnapshot(), triedKeyIndices)
+      if (nextCand) {
+        triedKeyIndices.add(nextCand.keyIdx)
+        backupReplenishingCount += 1
+        log(
+          id,
+          'warn',
+          `[Backup Quota Failover] Key quota exhausted mid-backup — switching to highest-quota Key ${nextCand.keyIdx} (${nextCand.totalRemaining} reqs remaining). Uploading movie & backup clip...`,
+        )
+        try {
+          await ensureUploads(id, ctrl, nextCand.keyId, nextCand.keyIdx, nextCand.ai, env.shortFile, env.copyPath)
+          await ensureClipUpload(id, ctrl, nextCand.keyId, nextCand.keyIdx, nextCand.ai)
+          if (!ctrl.stopping) {
+            lanesByKey.push(nextCand)
+            for (const m of CHUNK_MODEL_POOL) {
+              if (globalGeminiCoordinator.isModelExhausted(nextCand.apiKey, m.id, m.rpd)) continue
+              const newLane: Lane = {
+                ...nextCand,
+                model: m,
+                label: `key ${nextCand.keyIdx} · ${m.id}`,
+                dead: false,
+              }
+              lanes.push(newLane)
+              liveLanes.push(newLane)
+              backupWorkers.push(
+                laneWorker(id, ctrl, newLane, env, 'backup', liveLanes, isBackupUploadsSettled),
+              )
+            }
+          }
+          continue
+        } catch (err) {
+          log(
+            id,
+            'warn',
+            `[Backup Quota Failover] Key ${nextCand.keyIdx} upload failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 160)}`,
+          )
+        } finally {
+          backupReplenishingCount = Math.max(0, backupReplenishingCount - 1)
+        }
+      }
+    }
+
+    if (isBackupUploadsSettled() && (liveLanes.length === 0 || liveLanes.every((l) => l.dead))) {
+      break
+    }
+    await sleep(1000)
+  }
+
+  await Promise.all(backupWorkers)
   if (ctrl.stopping) return
 
   for (const w of b.windows) {
@@ -1619,6 +1802,9 @@ export async function waitForChunking(id: string, ctrl: { stopping?: boolean }):
   s.verifierEnabled = false
   s.chunkingProgress = 100
   s.shortSegmentingProgress = 100
+  if (!s.chunkCount || s.chunkCount <= 0) {
+    s.chunkCount = Math.max(1, Math.ceil((s.movieDuration || 60) / 60))
+  }
   if (s.status === 'chunking' || s.status === 'created') {
     s.status = 'ready'
   }

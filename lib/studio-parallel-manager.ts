@@ -3,7 +3,7 @@ import os from 'os'
 import path from 'path'
 import { execFileSync } from 'child_process'
 import { DATA_DIR, MEDIA_DIR } from './paths'
-import { addLog, getScan, saveScan } from './store'
+import { addLog, getScan, listScans, saveScan } from './store'
 import {
   StudioBrowserController,
   globalStudioUploadGate,
@@ -1141,7 +1141,11 @@ export class StudioParallelManager {
             !this.active &&
             !this.starting
           ) {
-            this.concurrency = Math.min(MAX_CONCURRENT_MODEL_WINDOWS, scan.studioParallelConcurrency)
+            const effC =
+              scan.studioParallelConcurrency <= 4
+                ? DEFAULT_STUDIO_CONCURRENCY
+                : scan.studioParallelConcurrency
+            this.concurrency = Math.min(MAX_CONCURRENT_MODEL_WINDOWS, effC)
           }
 
           const foundCompact = extractScanFoundMinutesCompact(scan)
@@ -1232,9 +1236,10 @@ export class StudioParallelManager {
             : raw.minuteInputSource === 'manual'
               ? (raw.minuteInput || '').trim()
               : ''
+        const restoredC = raw.concurrency || DEFAULT_STUDIO_CONCURRENCY
         this.concurrency = Math.min(
           MAX_CONCURRENT_MODEL_WINDOWS,
-          raw.concurrency || DEFAULT_STUDIO_CONCURRENCY,
+          restoredC <= 4 ? DEFAULT_STUDIO_CONCURRENCY : restoredC,
         )
 
         // Strictly accept saved paths ONLY if they belong to data/media/<this.scanId>/
@@ -1899,13 +1904,7 @@ export class StudioParallelManager {
 
       globalYtStudioUploadGate.setMaxConcurrent(cfg.ytUploadConcurrency || 3)
 
-      const globalMaxSlots = Math.max(
-        1,
-        Math.min(
-          MAX_CONCURRENT_MODEL_WINDOWS,
-          Number(cfg.studioConcurrency || DEFAULT_STUDIO_CONCURRENCY),
-        ),
-      )
+      const globalMaxSlots = MAX_CONCURRENT_MODEL_WINDOWS
       this.maxTotalPoolSlots = globalMaxSlots
       globalProfileSlotPool.setMaxTotalSlots(globalMaxSlots)
 
@@ -1915,11 +1914,14 @@ export class StudioParallelManager {
       )
       globalStudioUploadGate.setMaxConcurrent(uploadGateLimit)
 
+      const rawReqConcurrency = Number(
+        params.concurrency ?? this.concurrency ?? cfg.studioConcurrency ?? DEFAULT_STUDIO_CONCURRENCY,
+      )
       this.concurrency = Math.max(
         1,
         Math.min(
           MAX_CONCURRENT_MODEL_WINDOWS,
-          Number(params.concurrency ?? this.concurrency ?? cfg.studioConcurrency ?? DEFAULT_STUDIO_CONCURRENCY),
+          rawReqConcurrency <= 4 ? DEFAULT_STUDIO_CONCURRENCY : rawReqConcurrency,
         ),
       )
 
@@ -2894,7 +2896,7 @@ export class StudioParallelManager {
                 scanId: this.scanId,
                 expectedWindows: expectedForContent,
                 waitForSdReady: true,
-                maxWaitMs: 90_000,
+                maxWaitMs: 0,
                 username: this.username || 'admin',
                 onProgress: (prog) => {
                   this.appendCombinedLog({
@@ -2975,6 +2977,44 @@ export class StudioParallelManager {
         }
       }
 
+      // End-of-scan YouTube Studio auto-delete cleanup FIRST (Select All -> More actions -> Delete forever)
+      // BEFORE marking scan done or releasing the chunk scan lock, so the next scan starts on a clean YT channel!
+      try {
+        const cleanupCfg = await loadStudioUserConfig(this.username || 'admin')
+        if (
+          cleanupCfg.encryptedYtCookies &&
+          (cleanupCfg.ytAutoDeleteAtEnd ?? true) &&
+          !isAnyOtherParallelScanActive(this.scanId)
+        ) {
+          this.appendCombinedLog({
+            workerId: 'SYS',
+            level: 'INFO',
+            step: 'YT cleanup start',
+            message: 'Running end-of-scan YouTube Studio channel cleanup (Select All -> Delete forever)...',
+          })
+          const delRes = await globalYtStudioController.deleteAllChannelVideos(
+            this.username || 'admin',
+          )
+          for (const w of this.windows) {
+            markClipYtDeleted(this.scanId, w.windowNumber)
+          }
+          this.appendCombinedLog({
+            workerId: 'SYS',
+            level: 'SUCCESS',
+            step: 'YT cleanup done',
+            message: delRes.message,
+          })
+        }
+      } catch (cleanupErr: unknown) {
+        const cMsg = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)
+        this.appendCombinedLog({
+          workerId: 'SYS',
+          level: 'ERROR',
+          step: 'YT cleanup failed',
+          message: `YouTube Studio end-of-scan cleanup failed: ${cMsg}`,
+        })
+      }
+
       this.active = false
       this.starting = false
       this.waitingForWorkerSlots = false
@@ -3003,43 +3043,6 @@ export class StudioParallelManager {
       // Finalize scan record (status='done', report built, verifier OFF, key pair released)
       this.finalizeScanRecordOnCompletion()
 
-      // End-of-scan YouTube Studio auto-delete cleanup (if enabled and no other parallel scan is active)
-      try {
-        const cleanupCfg = await loadStudioUserConfig(this.username || 'admin')
-        if (
-          cleanupCfg.encryptedYtCookies &&
-          (cleanupCfg.ytAutoDeleteAtEnd ?? true) &&
-          !isAnyOtherParallelScanActive(this.scanId)
-        ) {
-          this.appendCombinedLog({
-            workerId: 'SYS',
-            level: 'INFO',
-            step: 'YT cleanup start',
-            message: 'Running end-of-scan YouTube Studio channel cleanup (Delete all videos)...',
-          })
-          const delRes = await globalYtStudioController.deleteAllChannelVideos(
-            this.username || 'admin',
-          )
-          for (const w of this.windows) {
-            markClipYtDeleted(this.scanId, w.windowNumber)
-          }
-          this.appendCombinedLog({
-            workerId: 'SYS',
-            level: 'SUCCESS',
-            step: 'YT cleanup done',
-            message: delRes.message,
-          })
-        }
-      } catch (cleanupErr: unknown) {
-        const cMsg = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)
-        this.appendCombinedLog({
-          workerId: 'SYS',
-          level: 'ERROR',
-          step: 'YT cleanup failed',
-          message: `YouTube Studio end-of-scan cleanup failed: ${cMsg}`,
-        })
-      }
-
       // Immediately release chunk scan lock so the next ticket in queue starts with zero delay!
       if (releaseChunkLock) {
         try {
@@ -3058,6 +3061,59 @@ export class StudioParallelManager {
             `All ${this.windows.length} Studio parallel windows completed`,
           )
         }
+      }
+
+      // Auto-trigger next ready scan on disk if its Minute Finder + Backup Finder already finished
+      // and no waiter in waitQueue claimed the lock within 1.5s
+      if (!this.stoppingAll) {
+        setTimeout(() => {
+          try {
+            const coordStatus = globalChunkScanCoordinator.getStatus()
+            if (coordStatus.activeScanId || coordStatus.queueLength > 0) return
+            if (isAnyOtherParallelScanActive(this.scanId)) return
+
+            const candidates: Scan[] = []
+            for (const sum of listScans()) {
+              if (sum.id === this.scanId) continue
+              const s = getScan(sum.id)
+              if (!s || s.chunkWindowsDone) continue
+              if (s.status === 'done' || s.status === 'stopped' || s.status === 'error') continue
+              const prescanDone =
+                s.geminiPrescan?.status === 'done' || s.geminiPrescan?.status === 'starting_scan'
+              const foundMins =
+                (s.studioMinuteInput || '').trim() || extractScanFoundMinutesCompact(s)
+              if (prescanDone && foundMins) {
+                candidates.push(s)
+              }
+            }
+            if (candidates.length === 0) return
+            candidates.sort((a, b) => (a.chunkTicket || 9999) - (b.chunkTicket || 9999))
+            const nextScan = candidates[0]
+            const nextMgr = getStudioParallelManager(nextScan.id)
+            if (nextMgr.isRunning()) return
+            const nextMins =
+              (nextScan.studioMinuteInput || '').trim() || extractScanFoundMinutesCompact(nextScan)
+            if (!nextMins) return
+
+            addLog(
+              nextScan,
+              'success',
+              `[Auto Ticket Handoff] Previous scan completed — automatically starting YouTube upload & 10-window Parallel Scan for Ticket #${nextScan.chunkTicket || 1} (${nextScan.shortName || nextScan.id})!`,
+            )
+            saveScan(nextScan)
+            void nextMgr.startParallelScan({
+              username: nextScan.ownerUsername || this.username || 'admin',
+              scanId: nextScan.id,
+              minuteInput: nextMins,
+              minuteInputSource: nextScan.studioMinuteInputSource || 'auto',
+              concurrency: DEFAULT_STUDIO_CONCURRENCY,
+              shortDurationSec: nextScan.shortDuration || 150,
+              movieDurationSec: (nextScan.movieTrimEnd ?? nextScan.movieDuration) || undefined,
+            })
+          } catch {
+            /* ignore auto-handoff error */
+          }
+        }, 1500)
       }
     }
   }
@@ -4569,8 +4625,11 @@ registerParallelWindowCompletionChecker((scanId: string) => {
   const snapWins = (mgr as unknown as { windows: ParallelWindowState[]; active: boolean; starting: boolean }).windows
   const isActive = (mgr as unknown as { active: boolean }).active
   const isStarting = (mgr as unknown as { starting: boolean }).starting
+  if (isActive || isStarting) {
+    return { done: false }
+  }
   if (!Array.isArray(snapWins) || snapWins.length === 0) {
-    return isActive || isStarting ? { done: false } : null
+    return null
   }
   const allTerminal = snapWins.every(
     (w) =>
@@ -4582,7 +4641,7 @@ registerParallelWindowCompletionChecker((scanId: string) => {
   )
   return {
     done: allTerminal,
-    reason: allTerminal ? 'All parallel windows reached terminal state' : undefined,
+    reason: allTerminal ? 'All parallel windows and YT cleanup reached terminal state' : undefined,
   }
 })
 

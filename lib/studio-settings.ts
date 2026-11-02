@@ -220,7 +220,34 @@ function recordKey(username: string): string {
 }
 
 export async function loadStudioUserConfig(username: string): Promise<StudioUserConfig> {
-  const raw = await readJSONRecord<Partial<StudioUserConfig>>(recordKey(username))
+  let raw = await readJSONRecord<Partial<StudioUserConfig>>(recordKey(username))
+  if (!raw?.encryptedYtCookies || !raw?.encryptedCookies) {
+    for (const altUser of ['shiva', 'admin']) {
+      if (altUser === (username || 'admin').toLowerCase()) continue
+      const altRaw = await readJSONRecord<Partial<StudioUserConfig>>(recordKey(altUser))
+      if (altRaw) {
+        raw = {
+          ...altRaw,
+          ...(raw || {}),
+          encryptedCookies: raw?.encryptedCookies || altRaw.encryptedCookies,
+          lastLoginEmail: raw?.lastLoginEmail || altRaw.lastLoginEmail,
+          lastLoginStatus:
+            raw?.lastLoginStatus && raw.lastLoginStatus !== 'untested'
+              ? raw.lastLoginStatus
+              : altRaw.lastLoginStatus,
+          lastLoginTestedAt: raw?.lastLoginTestedAt ?? altRaw.lastLoginTestedAt,
+          encryptedYtCookies: raw?.encryptedYtCookies || altRaw.encryptedYtCookies,
+          ytChannelId: raw?.ytChannelId || altRaw.ytChannelId,
+          ytChannelHandle: raw?.ytChannelHandle || altRaw.ytChannelHandle,
+          ytLastLoginStatus:
+            raw?.ytLastLoginStatus && raw.ytLastLoginStatus !== 'untested'
+              ? raw.ytLastLoginStatus
+              : altRaw.ytLastLoginStatus,
+          ytLastLoginTestedAt: raw?.ytLastLoginTestedAt ?? altRaw.ytLastLoginTestedAt,
+        }
+      }
+    }
+  }
   const rawModel = (raw?.studioModelName || '').trim()
   const resolvedModelName =
     !rawModel || rawModel === 'Gemini 2.5 Pro' || rawModel === 'Gemini 3.8 Pro'
@@ -260,7 +287,12 @@ export async function loadStudioUserConfig(username: string): Promise<StudioUser
         : 'auto',
     studioConcurrency: Math.max(
       1,
-      Math.min(10, Math.round(Number(raw?.studioConcurrency) || DEFAULT_STUDIO_CONCURRENCY)),
+      Math.min(
+        10,
+        Number(raw?.studioConcurrency) > 4
+          ? Math.round(Number(raw?.studioConcurrency))
+          : DEFAULT_STUDIO_CONCURRENCY,
+      ),
     ),
     studioUploadGateConcurrency: Math.max(
       1,

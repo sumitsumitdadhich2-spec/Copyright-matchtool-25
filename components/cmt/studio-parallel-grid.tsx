@@ -260,9 +260,10 @@ export function StudioParallelGrid({
 
   const [minuteInputSource, setMinuteInputSource] = useState<'auto' | 'manual'>(initialSource)
   const [minuteInput, setMinuteInput] = useState<string>(resolveInitialMinutes)
-  const [concurrency, setConcurrency] = useState<number>(
-    Math.min(10, snap?.concurrency || scanConcurrency || 10),
-  )
+  const [concurrency, setConcurrency] = useState<number>(() => {
+    const rawC = snap?.concurrency || scanConcurrency || 10
+    return rawC <= 4 ? 10 : Math.min(10, rawC)
+  })
   const [confirmClearStateOpen, setConfirmClearStateOpen] = useState<boolean>(false)
   const [busyAction, setBusyAction] = useState<string | null>(null)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
@@ -301,7 +302,8 @@ export function StudioParallelGrid({
       } else {
         setMinuteInput(effectiveFoundMinutes)
       }
-      setConcurrency(Math.min(10, snap?.concurrency || scanConcurrency || 10))
+      const rawC = snap?.concurrency || scanConcurrency || 10
+      setConcurrency(rawC <= 4 ? 10 : Math.min(10, rawC))
       setConfirmClearStateOpen(false)
       setSelectedWorkerId(null)
       setErrorMsg(null)
