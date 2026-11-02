@@ -1757,6 +1757,123 @@ export class YtStudioBrowserController {
       // Re-verify locked channel on Content page
       await this.verifyOrLockChannel(page, username);
 
+      const clickVisibleBySelectorsOrText = async (
+        stepName: string,
+        selectors: string[],
+        exactTexts: string[],
+        partialTexts: string[] = []
+      ): Promise<boolean> => {
+        // 1. Try visible Playwright locators with valid bounding box
+        for (const sel of selectors) {
+          try {
+            const loc = page.locator(sel);
+            const count = await loc.count().catch(() => 0);
+            for (let i = 0; i < count; i++) {
+              const item = loc.nth(i);
+              if (await item.isVisible().catch(() => false)) {
+                const box = await item.boundingBox().catch(() => null);
+                if (box && box.width > 2 && box.height > 2) {
+                  await item.click({ timeout: 5000 }).catch(async () => {
+                    await page.mouse.click(
+                      Math.round(box.x + box.width / 2),
+                      Math.round(box.y + box.height / 2)
+                    );
+                  });
+                  this.log('cleanup', `[${stepName}] Clicked via selector "${sel}" (#${i})`, 'info');
+                  return true;
+                }
+              }
+            }
+          } catch {
+            // continue to next selector
+          }
+        }
+
+        // 2. Fallback: find visible element in DOM by text or aria-label and click its center coordinates
+        const pt = await page
+          .evaluate(
+            ({ exactList, partialList }) => {
+              const isVis = (el: Element): { ok: boolean; rect: DOMRect } => {
+                const r = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                if (
+                  style.display === 'none' ||
+                  style.visibility === 'hidden' ||
+                  parseFloat(style.opacity || '1') === 0 ||
+                  r.width < 4 ||
+                  r.height < 4
+                ) {
+                  return { ok: false, rect: r };
+                }
+                return { ok: true, rect: r };
+              };
+
+              const candidates = Array.from(
+                document.querySelectorAll(
+                  'ytcp-select, ytcp-text-dropdown-trigger, ytcp-dropdown-trigger, ytcp-button, tp-yt-paper-item, ytcp-text-menu-item, ytcp-ve, button, [role="button"], [role="menuitem"], [role="option"], [role="checkbox"], ytcp-checkbox-lit, span, div, a'
+                )
+              );
+
+              // First pass: exact text match (prefer smallest visible bounding box so we hit the actual control, not a full-page wrapper)
+              let best: { x: number; y: number; area: number; label: string } | null = null;
+              for (const el of candidates) {
+                const { ok, rect } = isVis(el);
+                if (!ok) continue;
+                const txt = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const aria = (el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                for (const target of exactList) {
+                  const t = target.toLowerCase();
+                  if (txt === t || aria === t) {
+                    const area = rect.width * rect.height;
+                    if (area < 150000 && (!best || area < best.area)) {
+                      best = {
+                        x: Math.round(rect.left + rect.width / 2),
+                        y: Math.round(rect.top + rect.height / 2),
+                        area,
+                        label: txt || aria,
+                      };
+                    }
+                  }
+                }
+              }
+              if (best) return best;
+
+              // Second pass: partial text match
+              for (const el of candidates) {
+                const { ok, rect } = isVis(el);
+                if (!ok) continue;
+                const txt = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const aria = (el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                for (const target of partialList) {
+                  const t = target.toLowerCase();
+                  if ((txt && txt.includes(t)) || (aria && aria.includes(t))) {
+                    const area = rect.width * rect.height;
+                    if (area < 120000 && (!best || area < best.area)) {
+                      best = {
+                        x: Math.round(rect.left + rect.width / 2),
+                        y: Math.round(rect.top + rect.height / 2),
+                        area,
+                        label: txt.slice(0, 40) || aria.slice(0, 40),
+                      };
+                    }
+                  }
+                }
+              }
+              return best;
+            },
+            { exactList: exactTexts, partialList: partialTexts }
+          )
+          .catch(() => null);
+
+        if (pt) {
+          await page.mouse.click(pt.x, pt.y);
+          this.log('cleanup', `[${stepName}] Clicked via coordinates (${pt.x}, ${pt.y}) "${pt.label}"`, 'info');
+          return true;
+        }
+
+        return false;
+      };
+
       let deletedBatches = 0;
       for (let round = 1; round <= 20; round++) {
         const rowCount = await page.locator('ytcp-video-row').count().catch(() => 0);
@@ -1767,41 +1884,118 @@ export class YtStudioBrowserController {
 
         this.log('cleanup', `Deleting batch #${round} (${rowCount} visible video rows)...`, 'info');
         await this.dismissAllUploadDialogs(page).catch(() => {});
+        await page.waitForTimeout(2000);
 
-        const selectAllCheckbox = page.locator(
-          '#selection-checkbox, ytcp-checkbox-lit#selection-checkbox, ytcp-video-section-content #selection-checkbox'
-        ).first();
+        // 1. Click Select-All checkbox in the table header
+        const selectedAll = await clickVisibleBySelectorsOrText(
+          'Select All',
+          [
+            'ytcp-table-header #selection-checkbox',
+            '#selection-checkbox',
+            'ytcp-checkbox-lit#selection-checkbox',
+            'ytcp-video-section-content #selection-checkbox',
+          ],
+          ['Select all'],
+          ['Select all']
+        );
 
-        if (!(await selectAllCheckbox.isVisible().catch(() => false))) {
+        if (!selectedAll) {
           await this.dumpFailureScreenshot(page, `delete-no-selectall-r${round}`);
           throw new Error('Select-all checkbox not found on YT Studio Content table.');
         }
-
-        await selectAllCheckbox.click({ timeout: 6000 });
         await page.waitForTimeout(2000);
 
-        const moreActionsBtn = page.locator(
-          'ytcp-button:has-text("More actions"), #additional-action-options-button, button[aria-label="More actions"]'
-        ).first();
-        await moreActionsBtn.click({ timeout: 6000 });
+        // 2. Click "More actions" dropdown in the black bulk-actions bar
+        const openedMoreActions = await clickVisibleBySelectorsOrText(
+          'More actions',
+          [
+            'ytcp-bulk-actions ytcp-select:has-text("More actions")',
+            'ytcp-bulk-actions ytcp-text-dropdown-trigger:has-text("More actions")',
+            'ytcp-bulk-actions ytcp-dropdown-trigger:has-text("More actions")',
+            'ytcp-bulk-actions :text-is("More actions")',
+            'ytcp-select:has-text("More actions")',
+            'ytcp-text-dropdown-trigger:has-text("More actions")',
+            'ytcp-dropdown-trigger:has-text("More actions")',
+            '#additional-action-options',
+            '#additional-action-options-button',
+            'ytcp-button:has-text("More actions")',
+          ],
+          ['More actions'],
+          ['More actions']
+        );
+
+        if (!openedMoreActions) {
+          await this.dumpFailureScreenshot(page, `delete-no-moreactions-r${round}`);
+          throw new Error('More actions dropdown not found in YT Studio bulk action bar.');
+        }
         await page.waitForTimeout(2000);
 
-        const deleteForeverItem = page.locator(
-          'tp-yt-paper-item:has-text("Delete forever"), ytcp-ve:has-text("Delete forever")'
-        ).first();
-        await deleteForeverItem.click({ timeout: 6000 });
+        // 3. Click "Delete forever" item in the dropdown menu
+        const clickedDeleteForeverMenu = await clickVisibleBySelectorsOrText(
+          'Delete forever (menu)',
+          [
+            'tp-yt-paper-listbox tp-yt-paper-item:has-text("Delete forever")',
+            'tp-yt-paper-item:has-text("Delete forever")',
+            'ytcp-text-menu-item:has-text("Delete forever")',
+            'ytcp-ve:has-text("Delete forever")',
+            '[role="option"]:has-text("Delete forever")',
+            '[role="menuitem"]:has-text("Delete forever")',
+          ],
+          ['Delete forever'],
+          ['Delete forever']
+        );
+
+        if (!clickedDeleteForeverMenu) {
+          await this.dumpFailureScreenshot(page, `delete-no-menuitem-r${round}`);
+          throw new Error('Delete forever menu option not found after opening More actions.');
+        }
         await page.waitForTimeout(2000);
 
-        const confirmCheckbox = page.locator(
-          'ytcp-confirmation-dialog ytcp-checkbox-lit, ytcp-dialog #confirm-checkbox, ytcp-checkbox-lit: near(:text("permanently deleted"))'
-        ).first();
-        await confirmCheckbox.click({ timeout: 6000 });
+        // 4. Click "I understand that deleting is permanent and can't be undone" checkbox in the confirmation dialog
+        const clickedConfirmCheckbox = await clickVisibleBySelectorsOrText(
+          'Confirm permanent delete checkbox',
+          [
+            'ytcp-confirmation-dialog #confirm-checkbox',
+            'ytcp-confirmation-dialog ytcp-checkbox-lit',
+            'ytcp-confirmation-dialog [role="checkbox"]',
+            'tp-yt-paper-dialog #confirm-checkbox',
+            'tp-yt-paper-dialog ytcp-checkbox-lit',
+            'tp-yt-paper-dialog [role="checkbox"]',
+            '#confirm-checkbox',
+          ],
+          [
+            "I understand that deleting is permanent and can't be undone",
+            'I understand that deleting is permanent and cannot be undone',
+          ],
+          ['I understand that deleting', 'permanently deleted']
+        );
+
+        if (!clickedConfirmCheckbox) {
+          await this.dumpFailureScreenshot(page, `delete-no-confirmcheckbox-r${round}`);
+          throw new Error('Confirmation checkbox not found in YT Studio Delete forever dialog.');
+        }
         await page.waitForTimeout(2000);
 
-        const confirmDeleteBtn = page.locator(
-          'ytcp-confirmation-dialog #confirm-button, ytcp-dialog ytcp-button:has-text("Delete forever"), button:has-text("Delete forever")'
-        ).first();
-        await confirmDeleteBtn.click({ timeout: 8000 });
+        // 5. Click final "Delete forever" button inside the confirmation dialog
+        const clickedConfirmButton = await clickVisibleBySelectorsOrText(
+          'Confirm Delete forever button',
+          [
+            'ytcp-confirmation-dialog #confirm-button',
+            'tp-yt-paper-dialog #confirm-button',
+            'ytcp-dialog #confirm-button',
+            'ytcp-confirmation-dialog ytcp-button:has-text("Delete forever")',
+            'tp-yt-paper-dialog ytcp-button:has-text("Delete forever")',
+            '#confirm-button:has-text("Delete forever")',
+            'ytcp-button#confirm-button',
+          ],
+          ['Delete forever', 'Delete'],
+          ['Delete forever']
+        );
+
+        if (!clickedConfirmButton) {
+          await this.dumpFailureScreenshot(page, `delete-no-confirmbtn-r${round}`);
+          throw new Error('Confirm Delete forever button not found in YT Studio dialog.');
+        }
         await page.waitForTimeout(2000);
 
         deletedBatches++;
@@ -1811,7 +2005,11 @@ export class YtStudioBrowserController {
         const waitDeadline = Date.now() + 90_000;
         while (Date.now() < waitDeadline) {
           await page.waitForTimeout(2500);
-          const dialogVisible = await page.locator('ytcp-confirmation-dialog').isVisible().catch(() => false);
+          const dialogVisible = await page
+            .locator('ytcp-confirmation-dialog, tp-yt-paper-dialog:has-text("permanently deleted"), tp-yt-paper-dialog:has-text("Delete forever")')
+            .first()
+            .isVisible()
+            .catch(() => false);
           if (!dialogVisible) break;
         }
         await page.waitForTimeout(2000);
