@@ -1875,14 +1875,11 @@ export class YtStudioBrowserController {
       };
 
       let deletedBatches = 0;
-      for (let round = 1; round <= 20; round++) {
-        const rowCount = await page.locator('ytcp-video-row').count().catch(() => 0);
-        if (rowCount === 0) {
-          this.log('cleanup', 'No videos remaining on locked YT Studio channel', 'ok');
-          break;
-        }
-
-        this.log('cleanup', `Deleting batch #${round} (${rowCount} visible video rows)...`, 'info');
+      const rowCount = await page.locator('ytcp-video-row').count().catch(() => 0);
+      if (rowCount === 0) {
+        this.log('cleanup', 'No videos remaining on locked YT Studio channel', 'ok');
+      } else {
+        this.log('cleanup', `Deleting ${rowCount} visible video row(s) on channel...`, 'info');
         await this.dismissAllUploadDialogs(page).catch(() => {});
         await page.waitForTimeout(2000);
 
@@ -1900,7 +1897,7 @@ export class YtStudioBrowserController {
         );
 
         if (!selectedAll) {
-          await this.dumpFailureScreenshot(page, `delete-no-selectall-r${round}`);
+          await this.dumpFailureScreenshot(page, 'delete-no-selectall');
           throw new Error('Select-all checkbox not found on YT Studio Content table.');
         }
         await page.waitForTimeout(2000);
@@ -1925,7 +1922,7 @@ export class YtStudioBrowserController {
         );
 
         if (!openedMoreActions) {
-          await this.dumpFailureScreenshot(page, `delete-no-moreactions-r${round}`);
+          await this.dumpFailureScreenshot(page, 'delete-no-moreactions');
           throw new Error('More actions dropdown not found in YT Studio bulk action bar.');
         }
         await page.waitForTimeout(2000);
@@ -1946,7 +1943,7 @@ export class YtStudioBrowserController {
         );
 
         if (!clickedDeleteForeverMenu) {
-          await this.dumpFailureScreenshot(page, `delete-no-menuitem-r${round}`);
+          await this.dumpFailureScreenshot(page, 'delete-no-menuitem');
           throw new Error('Delete forever menu option not found after opening More actions.');
         }
         await page.waitForTimeout(2000);
@@ -1971,7 +1968,7 @@ export class YtStudioBrowserController {
         );
 
         if (!clickedConfirmCheckbox) {
-          await this.dumpFailureScreenshot(page, `delete-no-confirmcheckbox-r${round}`);
+          await this.dumpFailureScreenshot(page, 'delete-no-confirmcheckbox');
           throw new Error('Confirmation checkbox not found in YT Studio Delete forever dialog.');
         }
         await page.waitForTimeout(2000);
@@ -1993,31 +1990,23 @@ export class YtStudioBrowserController {
         );
 
         if (!clickedConfirmButton) {
-          await this.dumpFailureScreenshot(page, `delete-no-confirmbtn-r${round}`);
+          await this.dumpFailureScreenshot(page, 'delete-no-confirmbtn');
           throw new Error('Confirm Delete forever button not found in YT Studio dialog.');
         }
-        await page.waitForTimeout(2000);
 
-        deletedBatches++;
-        this.log('cleanup', `Batch #${round} deletion submitted — waiting for YouTube Studio to finish...`, 'info');
-
-        // Wait until rows clear or dialog closes
-        const waitDeadline = Date.now() + 90_000;
-        while (Date.now() < waitDeadline) {
-          await page.waitForTimeout(2500);
-          const dialogVisible = await page
-            .locator('ytcp-confirmation-dialog, tp-yt-paper-dialog:has-text("permanently deleted"), tp-yt-paper-dialog:has-text("Delete forever")')
-            .first()
-            .isVisible()
-            .catch(() => false);
-          if (!dialogVisible) break;
-        }
+        // Wait 2s for the click request to dispatch; YouTube Studio processes deletion automatically in background
         await page.waitForTimeout(2000);
+        deletedBatches = 1;
+        this.log(
+          'cleanup',
+          `Delete forever submitted (${rowCount} video(s)) — YouTube Studio is deleting in background, continuing immediately.`,
+          'ok'
+        );
       }
 
       this.status = 'ready';
       const msg = deletedBatches > 0
-        ? `Deleted ${deletedBatches} batch(es) of videos from locked channel ${ch.channelHandle || ch.channelId || ''}`
+        ? `Delete forever triggered for locked channel ${ch.channelHandle || ch.channelId || ''} (${rowCount} video(s))`
         : 'Channel is already clean (0 videos found)';
       this.log('cleanup done', msg, 'ok');
       return { deletedBatches, message: msg };
