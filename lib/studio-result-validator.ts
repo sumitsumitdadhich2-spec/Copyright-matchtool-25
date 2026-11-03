@@ -204,12 +204,16 @@ function stripNotFoundNotesFromHissa2(normalizedHissa2: string): string {
       /(\bNOT[\s_]*FOUND\b)(?:(?!\s+Short[:\s]+(?:\d+:)?\d{1,2}:)[\s\S])*/gi,
       '$1',
     )
+    .replace(
+      /((?:-->|->|—>|=>|→|=)\s*(?:Movie[:\s]+)?(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?(?:\s*\([^)]*\))?)(?:\s*(?:-|–|—|:|\bNote\b|\()(?:(?!\s+Short[:\s]+(?:\d+:)?\d{1,2}:)[\s\S])*)/gi,
+      '$1',
+    )
     .trim()
 }
 
 /**
  * FIX 2: Check whether the tail of HISSA 2 looks cut off / truncated mid-stream.
- * - First strips free-text notes after `NOT FOUND` so lowercase "short" or punctuation inside notes is ignored.
+ * - First strips free-text notes after `NOT FOUND` and after `Movie <start> - <end>` so lowercase "short" or punctuation inside notes is ignored.
  * - Uses case-sensitive real entry pattern `/(?:^|\s)Short[:\s]+(?:\d+:)?\d{1,2}:\d{0,2}/g` (and checks for bare trailing `Short...`).
  * - Applies dangling connector and incomplete timestamp checks strictly to the last real entry.
  */
@@ -237,8 +241,20 @@ function isTailTruncated(normalizedHissa2: string): boolean {
   }
 
   const lastEntryRaw = strippedNotes.slice(lastShortIndex).trim()
-  // Strip optional trailing frame range "(1814-1827 frames)" or window tag "[W08]" from the end of a Movie match entry before checking tail connectors
+  // Strip optional trailing frame range "(1814-1827 frames)", window tag "[W08]", or trailing note from the end of a Movie match entry before checking tail connectors
   const lastEntryCore = lastEntryRaw
+    .replace(/\s*(?:-|–|—|:|\bNote\b)[\s\S]*$/i, (match, offset, full) => {
+      // Only strip if it appears after the Movie start-end range
+      const prefix = full.slice(0, offset)
+      if (
+        /(?:-->|->|—>|=>|→|=)\s*(?:Movie[:\s]+)?(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?/i.test(
+          prefix,
+        )
+      ) {
+        return ''
+      }
+      return match
+    })
     .replace(/\s*(?:\([^)]*\)|\[[^\]]*\])\s*$/i, '')
     .trim()
 
@@ -352,6 +368,28 @@ export function stitchContinuedStudioAnswer(
   const prevCleaned = cleanStudioAnswerText(previousPartialText)
   if (!prevCleaned) return cleanStudioAnswerText(continuationTurnText)
 
+  // Clean continuation text without stripping before HISSA 1 (since continuation usually only has remaining lines)
+  let cont = (continuationTurnText || '').replace(/\r\n/g, '\n').trim()
+  cont = cont.replace(/^[ \t]*(?:edit|more_vert|content_copy|flag|auto_awesome)[ \t]*$/gim, '')
+  cont = cont.replace(/^(?:\s*(?:edit|more_vert|content_copy|flag|auto_awesome)\b\s*)+/i, '').trim()
+  cont = cont.replace(
+    /(?:\n|\s)*(?:Sources\s+help\b|Google\s+Search\s+Suggestions\b|Display\s+of\s+Search\s+Suggestions\s+is\s+required\b)[\s\S]*$/i,
+    '',
+  )
+  cont = cont.replace(
+    /(?:[\s\n]+(?:thumb_upthumb_down|thumb_up|thumb_down|more_vert|edit|content_copy|flag|\d+m\s*\d+(?:\.\d+)?s|\d+(?:\.\d+)?s))+\s*$/gi,
+    '',
+  ).trim()
+
+  // If the continuation turn is just a conversational remark that all segments are already covered
+  // (contains no HISSA header and no timestamp ranges like mm:ss - mm:ss), return prevCleaned untouched!
+  const hasTimestampRangeInCont =
+    /\b(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}/i.test(cont)
+  const hasHissaInCont = /\bHISSA\s*[12]\b/i.test(cont)
+  if (!hasTimestampRangeInCont && !hasHissaInCont) {
+    return prevCleaned
+  }
+
   // Drop the last line of prevCleaned if it is incomplete / truncated
   const prevLines = prevCleaned.split('\n')
   while (prevLines.length > 0) {
@@ -385,19 +423,6 @@ export function stitchContinuedStudioAnswer(
     }
     break
   }
-
-  // Clean continuation text without stripping before HISSA 1 (since continuation usually only has remaining lines)
-  let cont = (continuationTurnText || '').replace(/\r\n/g, '\n').trim()
-  cont = cont.replace(/^[ \t]*(?:edit|more_vert|content_copy|flag|auto_awesome)[ \t]*$/gim, '')
-  cont = cont.replace(/^(?:\s*(?:edit|more_vert|content_copy|flag|auto_awesome)\b\s*)+/i, '').trim()
-  cont = cont.replace(
-    /(?:\n|\s)*(?:Sources\s+help\b|Google\s+Search\s+Suggestions\b|Display\s+of\s+Search\s+Suggestions\s+is\s+required\b)[\s\S]*$/i,
-    '',
-  )
-  cont = cont.replace(
-    /(?:[\s\n]+(?:thumb_upthumb_down|thumb_up|thumb_down|more_vert|edit|content_copy|flag|\d+m\s*\d+(?:\.\d+)?s|\d+(?:\.\d+)?s))+\s*$/gi,
-    '',
-  ).trim()
 
   const stitched = `${prevLines.join('\n').trim()}\n${cont}`
   return cleanStudioAnswerText(stitched)

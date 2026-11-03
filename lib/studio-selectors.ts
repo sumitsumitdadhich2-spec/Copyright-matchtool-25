@@ -151,9 +151,12 @@ export const STUDIO_SELECTORS = {
 
   /** Advanced settings accordion inside Run Settings */
   advancedSettingsToggle: [
-    'button:has-text("Advanced settings")',
+    '[data-cmt-adv-settings-toggle="true"]',
     'mat-expansion-panel-header:has-text("Advanced settings")',
+    'button:has-text("Advanced settings")',
+    '[role="button"]:has-text("Advanced settings")',
     '[aria-label*="Advanced settings" i]',
+    'div.settings-group-header:has-text("Advanced settings")',
   ],
 
   /** Safety settings button that opens the safety modal */
@@ -185,11 +188,14 @@ export const STUDIO_SELECTORS = {
 
   /** Max output tokens input in Advanced Settings */
   maxOutputTokensInput: [
+    'input[data-cmt-output-length-input="true"]',
     'input[aria-label*="Output length" i]',
     'input[aria-label*="Output token" i]',
     'input[aria-label*="Max output" i]',
     '[data-test-id*="output-length" i] input',
+    'ms-slider[label*="Output length" i] input',
     'div:has(> label:has-text("Output length")) input',
+    'div:has-text("Output length") input[type="number"]',
   ],
 
   /** Media resolution dropdown in Run Settings (Low = ~65 tokens/frame) */

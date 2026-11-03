@@ -2634,6 +2634,10 @@ export class StudioParallelManager {
         scan.pipelineStage = 'stopped'
         scan.waitingForTicket = null
         scan.waitingForScanTitle = null
+      } else if (failedWins > 0) {
+        scan.chunkWindowsDone = false
+        scan.status = 'stopped'
+        scan.pipelineStage = 'chunk_scanning'
       } else {
         scan.chunkWindowsDone = true
         scan.status = 'done'
@@ -2648,7 +2652,7 @@ export class StudioParallelManager {
         chunksScanned: doneWins,
         chunksFailed: failedWins,
         chunksPending: 0,
-        partial: this.stoppingAll ? true : undefined,
+        partial: this.stoppingAll || failedWins > 0 ? true : undefined,
         modelsUsed,
         matches: scan.matches,
         groupsTotal: 0,
@@ -2664,12 +2668,16 @@ export class StudioParallelManager {
 
       addLog(
         scan,
-        this.stoppingAll ? 'warn' : 'success',
+        this.stoppingAll || failedWins > 0 ? 'warn' : 'success',
         this.stoppingAll
           ? `Studio parallel chunk scan stopped (${doneWins}/${this.windows.length} windows done, ${scan.matches.length} matches ready).`
-          : `Studio parallel chunk scan complete (${doneWins}/${this.windows.length} windows done): ${scan.matches.length} final match(es) — Normal Verifier OFF (chunk result final). Report & Export ready!`,
+          : failedWins > 0
+            ? `Studio parallel chunk scan paused with ${failedWins} failed window(s) (${doneWins}/${this.windows.length} DONE, ${scan.matches.length} matches ready). Retry failed window(s) to complete scan & auto-delete YT clips.`
+            : `Studio parallel chunk scan complete (${doneWins}/${this.windows.length} windows done): ${scan.matches.length} final match(es) — Normal Verifier OFF (chunk result final). Report & Export ready!`,
       )
-      releaseScanKeyPair(this.scanId)
+      if (!this.stoppingAll && failedWins === 0) {
+        releaseScanKeyPair(this.scanId)
+      }
       saveScan(scan, { immediate: true })
     } catch (err) {
       console.error('[StudioParallelManager] finalizeScanRecordOnCompletion error:', err)
@@ -2977,20 +2985,27 @@ export class StudioParallelManager {
         }
       }
 
+      const doneCount = this.windows.filter((w) => w.status === 'DONE').length
+      const prohibitedCount = this.windows.filter((w) => w.status === 'PROHIBITED').length
+      const failedCount = this.windows.filter((w) => w.status === 'FAILED').length
+      const allWindowsCompleted =
+        !this.stoppingAll && this.windows.length > 0 && failedCount === 0
+
       // End-of-scan YouTube Studio auto-delete cleanup FIRST (Select All -> More actions -> Delete forever)
-      // BEFORE marking scan done or releasing the chunk scan lock, so the next scan starts on a clean YT channel!
+      // Whenever all windows are done (e.g. 13/13 DONE), automatically run Delete forever before moving to the next global scan!
+      // If any window is still FAILED, keep the videos on YT Studio so retrying the failed window does not need to re-upload.
       try {
         const cleanupCfg = await loadStudioUserConfig(this.username || 'admin')
         if (
           cleanupCfg.encryptedYtCookies &&
-          (cleanupCfg.ytAutoDeleteAtEnd ?? true) &&
+          allWindowsCompleted &&
           !isAnyOtherParallelScanActive(this.scanId)
         ) {
           this.appendCombinedLog({
             workerId: 'SYS',
             level: 'INFO',
             step: 'YT cleanup start',
-            message: 'Running end-of-scan YouTube Studio channel cleanup (Select All -> Delete forever)...',
+            message: `All ${doneCount}/${this.windows.length} parallel windows completed — running automatic YouTube Studio Delete forever...`,
           })
           const delRes = await globalYtStudioController.deleteAllChannelVideos(
             this.username || 'admin',
@@ -3029,9 +3044,6 @@ export class StudioParallelManager {
       this.recordResourceSnapshotIfNeeded(true, 'Parallel scan finished')
       this.persistStateToDisk()
 
-      const doneCount = this.windows.filter((w) => w.status === 'DONE').length
-      const prohibitedCount = this.windows.filter((w) => w.status === 'PROHIBITED').length
-      const failedCount = this.windows.filter((w) => w.status === 'FAILED').length
       const finalChromeStats = readChromeProcsPerWorker(this.concurrency)
       this.appendCombinedLog({
         workerId: 'SYS',
@@ -3043,7 +3055,7 @@ export class StudioParallelManager {
       // Finalize scan record (status='done', report built, verifier OFF, key pair released)
       this.finalizeScanRecordOnCompletion()
 
-      // Immediately release chunk scan lock so the next ticket in queue starts with zero delay!
+      // Immediately release chunk scan lock when all windows are completed so the next ticket in queue starts with zero delay!
       if (releaseChunkLock) {
         try {
           releaseChunkLock()
@@ -3054,7 +3066,7 @@ export class StudioParallelManager {
       if (this.scanId && this.scanId !== 'default') {
         if (this.stoppingAll) {
           skipScanTicket(this.scanId, 'Parallel scan stopped by user')
-        } else {
+        } else if (allWindowsCompleted) {
           globalChunkScanCoordinator.releaseChunkScanLock(
             this.scanId,
             true,
@@ -3063,13 +3075,10 @@ export class StudioParallelManager {
         }
       }
 
-      // Auto-trigger next ready scan on disk if its Minute Finder + Backup Finder already finished
-      // and no waiter in waitQueue claimed the lock within 1.5s
-      if (!this.stoppingAll) {
+      // Auto-trigger next ready global scan on disk as soon as all windows of this scan complete (e.g. 13/13 DONE)
+      if (allWindowsCompleted) {
         setTimeout(() => {
           try {
-            const coordStatus = globalChunkScanCoordinator.getStatus()
-            if (coordStatus.activeScanId || coordStatus.queueLength > 0) return
             if (isAnyOtherParallelScanActive(this.scanId)) return
 
             const candidates: Scan[] = []
@@ -3077,7 +3086,7 @@ export class StudioParallelManager {
               if (sum.id === this.scanId) continue
               const s = getScan(sum.id)
               if (!s || s.chunkWindowsDone) continue
-              if (s.status === 'done' || s.status === 'stopped' || s.status === 'error') continue
+              if (s.status === 'done' || s.pipelineStage === 'stopped') continue
               const prescanDone =
                 s.geminiPrescan?.status === 'done' || s.geminiPrescan?.status === 'starting_scan'
               const foundMins =
@@ -3098,7 +3107,7 @@ export class StudioParallelManager {
             addLog(
               nextScan,
               'success',
-              `[Auto Ticket Handoff] Previous scan completed — automatically starting YouTube upload & 10-window Parallel Scan for Ticket #${nextScan.chunkTicket || 1} (${nextScan.shortName || nextScan.id})!`,
+              `[Auto Ticket Handoff] Previous scan (${this.scanName}) completed (${doneCount}/${this.windows.length} DONE) & YT Delete forever finished — automatically starting YouTube upload & 10-window Parallel Scan for Ticket #${nextScan.chunkTicket || 1} (${nextScan.shortName || nextScan.id})!`,
             )
             saveScan(nextScan)
             void nextMgr.startParallelScan({

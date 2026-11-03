@@ -3496,108 +3496,229 @@ export class StudioBrowserController {
   ): Promise<void> {
     const desiredMaxOut = String(desiredTokens)
     try {
-      await this.ensureRunSettingsPanelOpen(page)
+      await this.waitForRunSettingsPanelElements(page, 3000)
 
-      // 1. Expand Advanced settings if Output length is not visible yet
-      const outputLengthVisible = await page
-        .evaluate(() => /output\s+length/i.test(document.body.innerText || ''))
-        .catch(() => false)
-
-      if (!outputLengthVisible) {
-        const advBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.advancedSettingsToggle, 1200)
-        if (advBtn) {
-          const expanded = await advBtn.getAttribute('aria-expanded')
-          if (expanded !== 'true') {
-            await advBtn.click().catch(() => {})
-            await new Promise((r) => setTimeout(r, 350))
-          }
-        } else {
-          // DOM fallback: click any collapsible button/header mentioning "Advanced settings"
-          await page
-            .evaluate(() => {
-              const all = Array.from(document.querySelectorAll('button, mat-expansion-panel-header, [role="button"]'))
-              for (const el of all) {
+      // Helper to scroll the right-hand Run Settings panel and locate/tag the Output length <input>
+      const tagVisibleOutputLengthInput = async (scrollDownPx: number = 0): Promise<boolean> => {
+        return await page
+          .evaluate(
+            ({ sels, scrollPx }) => {
+              const isVis = (el: Element | null): el is HTMLElement => {
+                if (!el) return false
                 const h = el as HTMLElement
-                const txt = (h.innerText || h.textContent || '').trim()
-                if (/^advanced\s+settings$/i.test(txt) || /advanced\s+settings/i.test(h.getAttribute('aria-label') || '')) {
-                  if (h.getAttribute('aria-expanded') !== 'true') {
-                    h.click()
-                    return true
+                const r = h.getBoundingClientRect()
+                const style = window.getComputedStyle(h)
+                return (
+                  r.width > 0 &&
+                  r.height > 0 &&
+                  style.visibility !== 'hidden' &&
+                  style.display !== 'none' &&
+                  Number(style.opacity || '1') > 0
+                )
+              }
+
+              // Scroll right-side Run Settings container if requested
+              if (scrollPx > 0) {
+                const rightPanelCandidates = Array.from(
+                  document.querySelectorAll(
+                    'ms-run-settings, .run-settings-panel, [class*="run-settings" i], aside, mat-sidenav, mat-drawer, div',
+                  ),
+                )
+                for (const c of rightPanelCandidates) {
+                  const h = c as HTMLElement
+                  const r = h.getBoundingClientRect()
+                  if (
+                    r.left >= window.innerWidth * 0.55 &&
+                    r.height > 180 &&
+                    h.scrollHeight > h.clientHeight + 10
+                  ) {
+                    h.scrollTop += scrollPx
+                  }
+                }
+              }
+
+              for (const prev of Array.from(
+                document.querySelectorAll('[data-cmt-output-length-input]'),
+              )) {
+                prev.removeAttribute('data-cmt-output-length-input')
+              }
+
+              for (const sel of sels) {
+                try {
+                  const found = Array.from(document.querySelectorAll(sel))
+                  for (const node of found) {
+                    if (isVis(node) && node.tagName.toLowerCase() === 'input') {
+                      ;(node as HTMLElement).scrollIntoView({ block: 'center', inline: 'nearest' })
+                      node.setAttribute('data-cmt-output-length-input', 'true')
+                      return true
+                    }
+                  }
+                } catch {
+                  /* ignore */
+                }
+              }
+
+              // Row-scoped lookup for "Output length" label in the right-side Run Settings panel
+              const all = Array.from(document.body.querySelectorAll('*'))
+              for (const el of all) {
+                if (!isVis(el)) continue
+                const rect = el.getBoundingClientRect()
+                if (rect.left < window.innerWidth * 0.5) continue
+                const t = ((el as HTMLElement).innerText || el.textContent || '').trim()
+                if (
+                  /^output\s+length$/i.test(t) ||
+                  /^max\s+output\s+tokens$/i.test(t) ||
+                  (/^output\s+length\b/i.test(t) && t.length < 40)
+                ) {
+                  let row: Element | null = el.parentElement
+                  for (let depth = 0; depth < 6 && row; depth++) {
+                    const inp = row.querySelector(
+                      'input[type="number"], input:not([type="checkbox"]):not([type="radio"]):not([type="range"])',
+                    ) as HTMLInputElement | null
+                    if (inp && isVis(inp)) {
+                      inp.scrollIntoView({ block: 'center', inline: 'nearest' })
+                      inp.setAttribute('data-cmt-output-length-input', 'true')
+                      return true
+                    }
+                    row = row.parentElement
                   }
                 }
               }
               return false
+            },
+            { sels: [...STUDIO_SELECTORS.maxOutputTokensInput], scrollPx: scrollDownPx },
+          )
+          .catch(() => false)
+      }
+
+      // 1. Check if Output length <input> is already visible; if not, click "Advanced settings" arrow/header & scroll down
+      let inputFound = await tagVisibleOutputLengthInput(0)
+      if (!inputFound) {
+        // Scroll the right panel down so "Advanced settings" row is clearly in view, and tag its header/arrow
+        const advBox = await page
+          .evaluate(() => {
+            const isVis = (el: Element | null): el is HTMLElement => {
+              if (!el) return false
+              const h = el as HTMLElement
+              const r = h.getBoundingClientRect()
+              const style = window.getComputedStyle(h)
+              return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'
+            }
+
+            // Scroll right-side Run Settings panel down toward Advanced settings
+            const scrollContainers = Array.from(
+              document.querySelectorAll(
+                'ms-run-settings, .run-settings-panel, [class*="run-settings" i], aside, mat-sidenav, mat-drawer, div',
+              ),
+            )
+            for (const c of scrollContainers) {
+              const h = c as HTMLElement
+              const r = h.getBoundingClientRect()
+              if (
+                r.left >= window.innerWidth * 0.55 &&
+                r.height > 180 &&
+                h.scrollHeight > h.clientHeight + 10
+              ) {
+                h.scrollTop += 300
+              }
+            }
+
+            for (const prev of Array.from(
+              document.querySelectorAll('[data-cmt-adv-settings-toggle]'),
+            )) {
+              prev.removeAttribute('data-cmt-adv-settings-toggle')
+            }
+
+            const candidates = Array.from(
+              document.querySelectorAll(
+                'mat-expansion-panel-header, button, [role="button"], .settings-group-header, div, span, h3, h4',
+              ),
+            )
+            for (const el of candidates) {
+              if (!isVis(el)) continue
+              const h = el as HTMLElement
+              const r = h.getBoundingClientRect()
+              if (r.left < window.innerWidth * 0.55) continue
+              if (r.height > 90 || r.width < 60) continue
+              const txt = (h.innerText || h.textContent || '').replace(/\s+/g, ' ').trim()
+              const aria = (h.getAttribute('aria-label') || '').trim()
+              if (
+                /^advanced\s+settings\b/i.test(txt) ||
+                /advanced\s+settings/i.test(aria)
+              ) {
+                const clickable =
+                  (h.closest(
+                    'mat-expansion-panel-header, button, [role="button"]',
+                  ) as HTMLElement | null) || h
+                if (clickable.getAttribute('aria-expanded') === 'true') {
+                  return null
+                }
+                clickable.scrollIntoView({ block: 'center', inline: 'nearest' })
+                clickable.setAttribute('data-cmt-adv-settings-toggle', 'true')
+                const cr = clickable.getBoundingClientRect()
+                return {
+                  x: Math.round(cr.left + cr.width / 2),
+                  arrowX: Math.round(cr.right - Math.min(20, cr.width * 0.12)),
+                  y: Math.round(cr.top + cr.height / 2),
+                }
+              }
+            }
+            return null
+          })
+          .catch(() => null)
+
+        const advBtn = await findFirstVisibleLocator(
+          page,
+          STUDIO_SELECTORS.advancedSettingsToggle,
+          1500,
+        )
+        if (advBtn) {
+          const expanded = await advBtn.getAttribute('aria-expanded').catch(() => null)
+          if (expanded !== 'true') {
+            await advBtn.scrollIntoViewIfNeeded().catch(() => {})
+            await advBtn.click({ timeout: 2500 }).catch(async () => {
+              if (advBox) {
+                await page.mouse.click(advBox.arrowX, advBox.y).catch(() => {})
+              }
             })
-            .catch(() => false)
-          await new Promise((r) => setTimeout(r, 350))
+            await new Promise((r) => setTimeout(r, 500))
+          }
+        } else if (advBox) {
+          // Click directly on the Advanced settings dropdown arrow / row
+          await page.mouse.click(advBox.arrowX, advBox.y).catch(() => {})
+          await new Promise((r) => setTimeout(r, 500))
+        }
+
+        // Scroll down inside the right-side Run Settings panel so the newly expanded Output length section is visible
+        inputFound = await tagVisibleOutputLengthInput(450)
+
+        // If still not visible, try clicking the arrow coordinates once more (in case the first click only focused the panel)
+        if (!inputFound && advBox) {
+          await page.mouse.click(advBox.arrowX, advBox.y).catch(() => {})
+          await new Promise((r) => setTimeout(r, 500))
+          inputFound = await tagVisibleOutputLengthInput(500)
         }
       }
 
-      // 2. Scroll the Run Settings panel and tag the Output length <input>
-      await page
-        .evaluate((sels) => {
-          const isVis = (el: Element | null): el is HTMLElement => {
-            if (!el) return false
-            const h = el as HTMLElement
-            const r = h.getBoundingClientRect()
-            return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
-          }
-
-          for (const prev of Array.from(document.querySelectorAll('[data-cmt-output-length-input]'))) {
-            prev.removeAttribute('data-cmt-output-length-input')
-          }
-
-          for (const sel of sels) {
-            try {
-              const found = Array.from(document.querySelectorAll(sel))
-              for (const node of found) {
-                if (isVis(node) && node.tagName.toLowerCase() === 'input') {
-                  ;(node as HTMLElement).scrollIntoView({ block: 'center', inline: 'nearest' })
-                  node.setAttribute('data-cmt-output-length-input', 'true')
-                  return
-                }
-              }
-            } catch {
-              /* ignore */
-            }
-          }
-
-          // Row-scoped lookup for "Output length" label
-          const all = Array.from(document.body.querySelectorAll('*'))
-          for (const el of all) {
-            if (!isVis(el)) continue
-            const t = ((el as HTMLElement).innerText || el.textContent || '').trim()
-            if (/^output\s+length$/i.test(t) || /^max\s+output\s+tokens$/i.test(t)) {
-              let row: Element | null = el.parentElement
-              for (let depth = 0; depth < 6 && row; depth++) {
-                const inp = row.querySelector('input[type="number"], input:not([type="checkbox"]):not([type="radio"])') as HTMLInputElement | null
-                if (inp && isVis(inp)) {
-                  inp.scrollIntoView({ block: 'center', inline: 'nearest' })
-                  inp.setAttribute('data-cmt-output-length-input', 'true')
-                  return
-                }
-                row = row.parentElement
-              }
-            }
-          }
-        }, [...STUDIO_SELECTORS.maxOutputTokensInput])
-        .catch(() => {})
-
-      await new Promise((r) => setTimeout(r, 150))
+      await new Promise((r) => setTimeout(r, 200))
 
       const maxOutInput = await findFirstVisibleLocator(
         page,
-        ['input[data-cmt-output-length-input="true"]', ...STUDIO_SELECTORS.maxOutputTokensInput],
-        1500,
+        STUDIO_SELECTORS.maxOutputTokensInput,
+        2000,
       )
 
       if (maxOutInput) {
-        const currentMaxOut = (await maxOutInput.inputValue().catch(() => '')).replace(/,/g, '').trim()
+        await maxOutInput.scrollIntoViewIfNeeded().catch(() => {})
+        const currentMaxOut = (await maxOutInput.inputValue().catch(() => ''))
+          .replace(/,/g, '')
+          .trim()
         if (currentMaxOut !== desiredMaxOut) {
           await maxOutInput.click({ clickCount: 3 }).catch(() => {})
+          await page.keyboard.press('Control+A').catch(() => {})
           await page.keyboard.press('Backspace').catch(() => {})
           await maxOutInput.fill(desiredMaxOut).catch(async () => {
-            await page.keyboard.type(desiredMaxOut, { delay: 15 })
+            await page.keyboard.type(desiredMaxOut, { delay: 20 })
           })
           await maxOutInput
             .evaluate((el, val) => {
@@ -3617,18 +3738,27 @@ export class StudioBrowserController {
             }, desiredMaxOut)
             .catch(() => {})
           await maxOutInput.press('Enter').catch(() => {})
-          await new Promise((r) => setTimeout(r, 200))
+          await new Promise((r) => setTimeout(r, 250))
         }
 
-        const verifiedMaxOut = (await maxOutInput.inputValue().catch(() => '')).replace(/,/g, '').trim()
+        const verifiedMaxOut = (await maxOutInput.inputValue().catch(() => ''))
+          .replace(/,/g, '')
+          .trim()
         this.logStep(
           'output tokens set',
           `Output length=${verifiedMaxOut || desiredMaxOut} (target=${desiredMaxOut}, model=${modelLabel || 'default'})`,
           'info',
         )
+      } else {
+        this.logStep(
+          'output tokens warn',
+          `Output length input not found after expanding Advanced settings (target=${desiredMaxOut}, model=${modelLabel || 'default'})`,
+          'warn',
+        )
       }
-    } catch {
-      /* ignore non-fatal output length input error */
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      this.logStep('output tokens warn', `Could not set Output length=${desiredMaxOut}: ${msg}`, 'warn')
     }
   }
 

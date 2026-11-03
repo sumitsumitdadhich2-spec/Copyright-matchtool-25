@@ -805,7 +805,7 @@ export function extractHissa1And2EntriesFromResponse(rawText: string): {
     if (!line || /HISSA\s*2/i.test(line)) continue
 
     const foundMatch = line.match(
-      /^(?:\d+[.)]\s*)?(?:Short[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*\([^)]*\))?\s*(?:=|-->|->|—>|=>|→)\s*(?:Movie[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*(?:\([^)]*\)|\[[^\]]*\]))*\s*$/i,
+      /^(?:\d+[.)]\s*)?(?:Short[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*\([^)]*\))?\s*(?:=|-->|->|—>|=>|→)\s*(?:Movie[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)/i,
     )
     if (foundMatch) {
       const sStart = parseParallelTimecodeToSeconds(foundMatch[1])
