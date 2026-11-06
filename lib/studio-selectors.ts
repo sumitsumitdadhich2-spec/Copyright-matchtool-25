@@ -195,7 +195,6 @@ export const STUDIO_SELECTORS = {
     '[data-test-id*="output-length" i] input',
     'ms-slider[label*="Output length" i] input',
     'div:has(> label:has-text("Output length")) input',
-    'div:has-text("Output length") input[type="number"]',
   ],
 
   /** Media resolution dropdown in Run Settings (Low = ~65 tokens/frame) */

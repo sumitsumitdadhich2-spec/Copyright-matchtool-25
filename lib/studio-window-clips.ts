@@ -265,9 +265,30 @@ export async function ensureWindowClip(
         }
       }
 
-      // Invalid/stale clip or sidecar -> delete and re-extract
-      safeRemoveClipFiles(clipPath, sidecarPath)
-    } else if (fs.existsSync(sidecarPath) || fs.existsSync(altSidecarPath)) {
+      // Preserve any existing valid YouTube upload metadata before re-extracting
+    }
+
+    let preservedYt: Partial<Pick<WindowClipSidecar, 'ytUrl' | 'ytVideoId' | 'ytUploadedAt' | 'ytDeleted'>> = {}
+    for (const scCandidate of [sidecarPath, altSidecarPath]) {
+      try {
+        if (fs.existsSync(scCandidate)) {
+          const prevRaw = JSON.parse(fs.readFileSync(scCandidate, 'utf8')) as Partial<WindowClipSidecar>
+          if (prevRaw && prevRaw.ytUrl && !prevRaw.ytDeleted) {
+            preservedYt = {
+              ytUrl: prevRaw.ytUrl,
+              ytVideoId: prevRaw.ytVideoId,
+              ytUploadedAt: prevRaw.ytUploadedAt,
+              ytDeleted: false,
+            }
+            break
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    if (fs.existsSync(clipPath) || fs.existsSync(sidecarPath) || fs.existsSync(altSidecarPath)) {
       safeRemoveClipFiles(clipPath, sidecarPath)
     }
 
@@ -293,6 +314,7 @@ export async function ensureWindowClip(
       size: movieSize,
       mtime: movieMtimeMs,
       createdAt: Date.now(),
+      ...preservedYt,
     }
     const tmpSidecar = `${sidecarPath}.tmp`
     fs.writeFileSync(tmpSidecar, JSON.stringify(sidecarData, null, 2), 'utf8')
@@ -352,14 +374,6 @@ export function readClipYtSidecar(
   try {
     const raw = JSON.parse(fs.readFileSync(sidecarPath, 'utf8')) as Partial<WindowClipSidecar>
     if (raw && raw.ytUrl && !raw.ytDeleted) {
-      // If called with a direct clip file path that exists on disk, verify size/mtime if recorded
-      if (typeof windowNumber !== 'number' && fs.existsSync(clipPathOrScanId)) {
-        const st = fs.statSync(clipPathOrScanId)
-        const recordedSize = raw.size ?? raw.movieSize
-        if (typeof recordedSize === 'number' && recordedSize > 0 && st.size !== recordedSize) {
-          return null
-        }
-      }
       return {
         ytUrl: raw.ytUrl,
         ytVideoId: raw.ytVideoId,

@@ -3117,11 +3117,6 @@ export class StudioBrowserController {
         updateExclusiveStudioModelLease(this.profileDirName, selectedCanon)
         this.logStep('model selected', `Active model in Run Settings: ${res.cardText || candidateModel}`, 'info')
         await this.closeModelSelectionPanelIfOpen(page)
-        await this.setOutputLengthInRunSettings(
-          page,
-          resolveEffectiveMaxOutputTokensForModel(selectedCanon),
-          selectedCanon,
-        )
         return {
           selectedModelName: selectedCanon,
           visibleCardText: res.cardText || candidateModel,
@@ -3144,11 +3139,6 @@ export class StudioBrowserController {
       ? canonicalizeStudioModelName(fallbackCard)
       : canonicalizeStudioModelName(targetModelName)
     updateExclusiveStudioModelLease(this.profileDirName, actualSelectedCanonical)
-    await this.setOutputLengthInRunSettings(
-      page,
-      resolveEffectiveMaxOutputTokensForModel(actualSelectedCanonical),
-      actualSelectedCanonical,
-    )
     return {
       selectedModelName: actualSelectedCanonical,
       visibleCardText: fallbackCard || targetModelName,
@@ -3415,17 +3405,7 @@ export class StudioBrowserController {
       }
     }
 
-    // 3 & 4. Set Output length (maxOutputTokens): 1,000,000 when Argon is active, 65,536 for Flash models
-    const activeCanonicalModel = canonicalizeStudioModelName(
-      modelSelection.selectedModelName || config.modelName || DEFAULT_STUDIO_MODEL_NAME,
-    )
-    const effectiveMaxOutTokens = resolveEffectiveMaxOutputTokensForModel(
-      activeCanonicalModel,
-      config.maxOutputTokens,
-    )
-    await this.setOutputLengthInRunSettings(page, effectiveMaxOutTokens, activeCanonicalModel)
-
-    // 5. Optional: Turn OFF "Grounding with Google Search" in Run Settings if it is currently ON
+    // 3. Optional: Turn OFF "Grounding with Google Search" in Run Settings if it is currently ON
     try {
       const turnedOffGrounding = await page
         .evaluate(() => {
@@ -3463,7 +3443,7 @@ export class StudioBrowserController {
       /* ignore */
     }
 
-    // Final read-back verification (keep Run Settings panel open — do NOT click Toggle run settings panel)
+    // 4. Final read-back verification of Thinking level before scrolling down to Advanced settings
     const finalThinkingReadBack = (await this.readVisibleThinkingLevelText(page)) || verifiedThinkingText
     if (!desiredThinkingRegex.test(finalThinkingReadBack)) {
       const pState = await this.getRunSettingsPanelState(page)
@@ -3477,29 +3457,49 @@ export class StudioBrowserController {
       )
     }
 
+    // 5. ONLY when Argon is the active model: expand "Advanced settings", scroll down, and set Output length = 1,000,000.
+    // For non-Argon models (Gemini 3.8 Flash, Gemini 3.6 Flash, etc.), do NOT touch Output length.
+    const activeCanonicalModel = canonicalizeStudioModelName(
+      modelSelection.selectedModelName || config.modelName || DEFAULT_STUDIO_MODEL_NAME,
+    )
+    const isArgonModel = /\bargon\b/i.test(activeCanonicalModel) || /\bargon\b/i.test(activeModelText || '')
+    const effectiveMaxOutTokens = resolveEffectiveMaxOutputTokensForModel(
+      activeCanonicalModel,
+      config.maxOutputTokens,
+    )
+    if (isArgonModel) {
+      await this.setOutputLengthInRunSettings(page, effectiveMaxOutTokens, activeCanonicalModel)
+    }
+
     this.logStep(
       'model set',
-      `thinking=${desiredThinkingLabel} · outputTokens=${effectiveMaxOutTokens} · model=${activeModelText || modelSelection.selectedModelName || config.modelName || 'default'}`,
+      `thinking=${desiredThinkingLabel}${isArgonModel ? ` · outputTokens=${effectiveMaxOutTokens}` : ''} · model=${activeModelText || modelSelection.selectedModelName || config.modelName || 'default'}`,
       'success',
     )
     return modelSelection
   }
 
   /**
-   * Reliably set "Output length" (maxOutputTokens) in AI Studio's Run Settings panel.
-   * For Argon this sets 1000000 (1,000,000); for Gemini 3.8 / 3.6 Flash this sets 65536.
+   * Reliably set "Output length" (maxOutputTokens = 1,000,000) in AI Studio's Run Settings panel
+   * ONLY when the active model is Argon.
+   * For all non-Argon models, this method immediately returns without touching Advanced settings.
    */
   private async setOutputLengthInRunSettings(
     page: Page,
     desiredTokens: number,
     modelLabel?: string,
   ): Promise<void> {
-    const desiredMaxOut = String(desiredTokens)
+    if (!/\bargon\b/i.test(modelLabel || '')) {
+      return
+    }
+    const desiredMaxOut = String(desiredTokens || 1000000)
     try {
+      await this.closeModelSelectionPanelIfOpen(page)
       await this.waitForRunSettingsPanelElements(page, 3000)
 
-      // Helper to scroll the right-hand Run Settings panel and locate/tag the Output length <input>
-      const tagVisibleOutputLengthInput = async (scrollDownPx: number = 0): Promise<boolean> => {
+      // Helper: scroll the right-hand Run Settings panel (and any scrollable ancestor of Run Settings items)
+      // and locate/tag the genuine Output length <input> inside the "Output length" compact row.
+      const findAndTagOutputLengthInput = async (scrollDownPx: number = 0): Promise<boolean> => {
         return await page
           .evaluate(
             ({ sels, scrollPx }) => {
@@ -3517,25 +3517,44 @@ export class StudioBrowserController {
                 )
               }
 
-              // Scroll right-side Run Settings container if requested
-              if (scrollPx > 0) {
+              const scrollAncestorsAndRightPanel = (deltaPx: number) => {
+                if (deltaPx <= 0) return
                 const rightPanelCandidates = Array.from(
                   document.querySelectorAll(
-                    'ms-run-settings, .run-settings-panel, [class*="run-settings" i], aside, mat-sidenav, mat-drawer, div',
+                    'ms-run-settings, .run-settings-panel, [class*="run-settings" i], [class*="runsettings" i], aside, mat-sidenav, mat-drawer, div',
                   ),
                 )
                 for (const c of rightPanelCandidates) {
                   const h = c as HTMLElement
                   const r = h.getBoundingClientRect()
                   if (
-                    r.left >= window.innerWidth * 0.55 &&
-                    r.height > 180 &&
-                    h.scrollHeight > h.clientHeight + 10
+                    r.left >= window.innerWidth * 0.45 &&
+                    r.height > 140 &&
+                    h.scrollHeight > h.clientHeight + 5
                   ) {
-                    h.scrollTop += scrollPx
+                    h.scrollTop = deltaPx >= 9000 ? h.scrollHeight : h.scrollTop + deltaPx
+                  }
+                }
+                // Also walk up from any right-panel label ("Advanced settings", "Tools", "Thinking level", "Output length")
+                const allNodes = Array.from(document.body.querySelectorAll('*'))
+                for (const node of allNodes) {
+                  if (!isVis(node) || node.children.length > 3) continue
+                  const nr = node.getBoundingClientRect()
+                  if (nr.left < window.innerWidth * 0.45) continue
+                  const nt = ((node as HTMLElement).innerText || node.textContent || '').trim()
+                  if (/^(advanced\s+settings|output\s+length|tools|thinking\s+level)$/i.test(nt)) {
+                    let anc: HTMLElement | null = node.parentElement
+                    while (anc && anc !== document.body) {
+                      if (anc.scrollHeight > anc.clientHeight + 5) {
+                        anc.scrollTop = deltaPx >= 9000 ? anc.scrollHeight : anc.scrollTop + deltaPx
+                      }
+                      anc = anc.parentElement
+                    }
                   }
                 }
               }
+
+              scrollAncestorsAndRightPanel(scrollPx)
 
               for (const prev of Array.from(
                 document.querySelectorAll('[data-cmt-output-length-input]'),
@@ -3543,11 +3562,15 @@ export class StudioBrowserController {
                 prev.removeAttribute('data-cmt-output-length-input')
               }
 
+              // 1. Check explicit CSS selectors (skipping Playwright-only :has-text selectors)
               for (const sel of sels) {
+                if (sel.includes(':has-text(') || sel.includes('data-cmt-output-length-input')) continue
                 try {
                   const found = Array.from(document.querySelectorAll(sel))
                   for (const node of found) {
                     if (isVis(node) && node.tagName.toLowerCase() === 'input') {
+                      const nr = node.getBoundingClientRect()
+                      if (nr.left < window.innerWidth * 0.45) continue
                       ;(node as HTMLElement).scrollIntoView({ block: 'center', inline: 'nearest' })
                       node.setAttribute('data-cmt-output-length-input', 'true')
                       return true
@@ -3558,20 +3581,27 @@ export class StudioBrowserController {
                 }
               }
 
-              // Row-scoped lookup for "Output length" label in the right-side Run Settings panel
+              // 2. Leaf-label row lookup for "Output length" / "Max output tokens" in the right-side Run Settings panel
               const all = Array.from(document.body.querySelectorAll('*'))
-              for (const el of all) {
-                if (!isVis(el)) continue
+              const labelLeaves = all.filter((el) => {
+                if (!isVis(el)) return false
+                if (el.children.length > 2) return false
                 const rect = el.getBoundingClientRect()
-                if (rect.left < window.innerWidth * 0.5) continue
-                const t = ((el as HTMLElement).innerText || el.textContent || '').trim()
-                if (
+                if (rect.left < window.innerWidth * 0.45) return false
+                const t = ((el as HTMLElement).innerText || el.textContent || '').replace(/\s+/g, ' ').trim()
+                return (
                   /^output\s+length$/i.test(t) ||
                   /^max\s+output\s+tokens$/i.test(t) ||
-                  (/^output\s+length\b/i.test(t) && t.length < 40)
-                ) {
-                  let row: Element | null = el.parentElement
-                  for (let depth = 0; depth < 6 && row; depth++) {
+                  /^output\s+token\s+limit$/i.test(t)
+                )
+              })
+
+              for (const leaf of labelLeaves) {
+                leaf.scrollIntoView({ block: 'center', inline: 'nearest' })
+                let row: Element | null = leaf.parentElement
+                for (let depth = 0; depth < 6 && row; depth++) {
+                  const rowRect = row.getBoundingClientRect()
+                  if (rowRect.height >= 16 && rowRect.height <= 140 && rowRect.width <= 550) {
                     const inp = row.querySelector(
                       'input[type="number"], input:not([type="checkbox"]):not([type="radio"]):not([type="range"])',
                     ) as HTMLInputElement | null
@@ -3580,8 +3610,8 @@ export class StudioBrowserController {
                       inp.setAttribute('data-cmt-output-length-input', 'true')
                       return true
                     }
-                    row = row.parentElement
                   }
+                  row = row.parentElement
                 }
               }
               return false
@@ -3591,128 +3621,148 @@ export class StudioBrowserController {
           .catch(() => false)
       }
 
-      // 1. Check if Output length <input> is already visible; if not, click "Advanced settings" arrow/header & scroll down
-      let inputFound = await tagVisibleOutputLengthInput(0)
-      if (!inputFound) {
-        // Scroll the right panel down so "Advanced settings" row is clearly in view, and tag its header/arrow
-        const advBox = await page
-          .evaluate(() => {
-            const isVis = (el: Element | null): el is HTMLElement => {
-              if (!el) return false
-              const h = el as HTMLElement
-              const r = h.getBoundingClientRect()
-              const style = window.getComputedStyle(h)
-              return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'
-            }
+      // Try up to 3 attempts to ensure Advanced settings is expanded, scrolled down, and Output length is set to 1,000,000
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        // First scroll down the right panel in case Advanced settings is already expanded and Output length is just below the fold
+        let inputFound = await findAndTagOutputLengthInput(attempt === 1 ? 600 : 9999)
 
-            // Scroll right-side Run Settings panel down toward Advanced settings
-            const scrollContainers = Array.from(
-              document.querySelectorAll(
-                'ms-run-settings, .run-settings-panel, [class*="run-settings" i], aside, mat-sidenav, mat-drawer, div',
-              ),
-            )
-            for (const c of scrollContainers) {
-              const h = c as HTMLElement
-              const r = h.getBoundingClientRect()
-              if (
-                r.left >= window.innerWidth * 0.55 &&
-                r.height > 180 &&
-                h.scrollHeight > h.clientHeight + 10
-              ) {
-                h.scrollTop += 300
+        if (!inputFound) {
+          // Output length <input> is not visible -> locate the "Advanced settings" header & arrow in the right panel and click ONCE to expand it
+          const advTarget = await page
+            .evaluate(() => {
+              const isVis = (el: Element | null): el is HTMLElement => {
+                if (!el) return false
+                const h = el as HTMLElement
+                const r = h.getBoundingClientRect()
+                const style = window.getComputedStyle(h)
+                return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'
               }
-            }
 
-            for (const prev of Array.from(
-              document.querySelectorAll('[data-cmt-adv-settings-toggle]'),
-            )) {
-              prev.removeAttribute('data-cmt-adv-settings-toggle')
-            }
+              for (const prev of Array.from(
+                document.querySelectorAll('[data-cmt-adv-settings-toggle]'),
+              )) {
+                prev.removeAttribute('data-cmt-adv-settings-toggle')
+              }
 
-            const candidates = Array.from(
-              document.querySelectorAll(
-                'mat-expansion-panel-header, button, [role="button"], .settings-group-header, div, span, h3, h4',
-              ),
-            )
-            for (const el of candidates) {
-              if (!isVis(el)) continue
-              const h = el as HTMLElement
-              const r = h.getBoundingClientRect()
-              if (r.left < window.innerWidth * 0.55) continue
-              if (r.height > 90 || r.width < 60) continue
-              const txt = (h.innerText || h.textContent || '').replace(/\s+/g, ' ').trim()
-              const aria = (h.getAttribute('aria-label') || '').trim()
-              if (
-                /^advanced\s+settings\b/i.test(txt) ||
-                /advanced\s+settings/i.test(aria)
-              ) {
-                const clickable =
-                  (h.closest(
-                    'mat-expansion-panel-header, button, [role="button"]',
-                  ) as HTMLElement | null) || h
-                if (clickable.getAttribute('aria-expanded') === 'true') {
-                  return null
-                }
-                clickable.scrollIntoView({ block: 'center', inline: 'nearest' })
-                clickable.setAttribute('data-cmt-adv-settings-toggle', 'true')
-                const cr = clickable.getBoundingClientRect()
-                return {
-                  x: Math.round(cr.left + cr.width / 2),
-                  arrowX: Math.round(cr.right - Math.min(20, cr.width * 0.12)),
-                  y: Math.round(cr.top + cr.height / 2),
+              // Scroll right-side Run Settings panel down so "Advanced settings" header is visible
+              const allNodes = Array.from(document.body.querySelectorAll('*'))
+              for (const node of allNodes) {
+                if (!isVis(node) || node.children.length > 3) continue
+                const nr = node.getBoundingClientRect()
+                if (nr.left < window.innerWidth * 0.45) continue
+                const nt = ((node as HTMLElement).innerText || node.textContent || '').replace(/\s+/g, ' ').trim()
+                if (/^(advanced\s+settings|tools|thinking\s+level)$/i.test(nt)) {
+                  let anc: HTMLElement | null = node.parentElement
+                  while (anc && anc !== document.body) {
+                    if (anc.scrollHeight > anc.clientHeight + 5) {
+                      anc.scrollTop = anc.scrollHeight
+                    }
+                    anc = anc.parentElement
+                  }
                 }
               }
-            }
-            return null
-          })
-          .catch(() => null)
 
-        const advBtn = await findFirstVisibleLocator(
-          page,
-          STUDIO_SELECTORS.advancedSettingsToggle,
-          1500,
-        )
-        if (advBtn) {
-          const expanded = await advBtn.getAttribute('aria-expanded').catch(() => null)
-          if (expanded !== 'true') {
-            await advBtn.scrollIntoViewIfNeeded().catch(() => {})
-            await advBtn.click({ timeout: 2500 }).catch(async () => {
-              if (advBox) {
-                await page.mouse.click(advBox.arrowX, advBox.y).catch(() => {})
+              // Find leaf or compact header matching "Advanced settings"
+              const candidates = Array.from(
+                document.querySelectorAll(
+                  'mat-expansion-panel-header, button, [role="button"], .settings-group-header, div, span, h3, h4',
+                ),
+              )
+              for (const el of candidates) {
+                if (!isVis(el)) continue
+                const h = el as HTMLElement
+                const r = h.getBoundingClientRect()
+                if (r.left < window.innerWidth * 0.45) continue
+                if (r.height > 85 || r.width < 40) continue
+                const txt = (h.innerText || h.textContent || '').replace(/\s+/g, ' ').trim()
+                const aria = (h.getAttribute('aria-label') || '').trim()
+                if (
+                  /^advanced\s+settings(?:\s*(?:expand_more|expand_less|keyboard_arrow_down|keyboard_arrow_up|chevron_right))?$/i.test(
+                    txt,
+                  ) ||
+                  /^advanced\s+settings$/i.test(aria)
+                ) {
+                  const clickable =
+                    (h.closest(
+                      'mat-expansion-panel-header, button, [role="button"], .settings-group-header',
+                    ) as HTMLElement | null) ||
+                    (h.parentElement &&
+                    h.parentElement.getBoundingClientRect().height <= 85 &&
+                    h.parentElement.getBoundingClientRect().width >= 120
+                      ? h.parentElement
+                      : h)
+
+                  clickable.scrollIntoView({ block: 'center', inline: 'nearest' })
+                  clickable.setAttribute('data-cmt-adv-settings-toggle', 'true')
+
+                  // Find the arrow icon inside the header row if present
+                  const arrowIcon = clickable.querySelector(
+                    'mat-icon, .google-symbols, .material-symbols-outlined, svg, .mat-expansion-indicator',
+                  ) as HTMLElement | null
+                  const cr = clickable.getBoundingClientRect()
+                  const ar = arrowIcon && isVis(arrowIcon) ? arrowIcon.getBoundingClientRect() : null
+                  return {
+                    x: Math.round(cr.left + cr.width / 2),
+                    arrowX: ar
+                      ? Math.round(ar.left + ar.width / 2)
+                      : Math.round(cr.right - Math.min(22, cr.width * 0.12)),
+                    y: ar
+                      ? Math.round(ar.top + ar.height / 2)
+                      : Math.round(cr.top + cr.height / 2),
+                  }
+                }
+              }
+              return null
+            })
+            .catch(() => null)
+
+          const taggedAdvLoc = page.locator('[data-cmt-adv-settings-toggle="true"]').first()
+          if ((await taggedAdvLoc.count().catch(() => 0)) > 0) {
+            await taggedAdvLoc.scrollIntoViewIfNeeded().catch(() => {})
+            await taggedAdvLoc.click({ timeout: 2500 }).catch(async () => {
+              if (advTarget) {
+                await page.mouse.click(advTarget.arrowX, advTarget.y).catch(() => {})
               }
             })
-            await new Promise((r) => setTimeout(r, 500))
+          } else if (advTarget) {
+            await page.mouse.click(advTarget.arrowX, advTarget.y).catch(() => {})
+          } else {
+            const fallbackAdv = await findFirstVisibleLocator(
+              page,
+              STUDIO_SELECTORS.advancedSettingsToggle,
+              1500,
+            )
+            if (fallbackAdv) {
+              await fallbackAdv.scrollIntoViewIfNeeded().catch(() => {})
+              await fallbackAdv.click({ timeout: 2500 }).catch(() => {})
+            }
           }
-        } else if (advBox) {
-          // Click directly on the Advanced settings dropdown arrow / row
-          await page.mouse.click(advBox.arrowX, advBox.y).catch(() => {})
-          await new Promise((r) => setTimeout(r, 500))
+
+          // Wait for Advanced settings accordion animation to expand, then scroll all the way down to Output length
+          await new Promise((r) => setTimeout(r, 650))
+          inputFound = await findAndTagOutputLengthInput(9999)
+          if (!inputFound) {
+            await new Promise((r) => setTimeout(r, 350))
+            inputFound = await findAndTagOutputLengthInput(9999)
+          }
         }
 
-        // Scroll down inside the right-side Run Settings panel so the newly expanded Output length section is visible
-        inputFound = await tagVisibleOutputLengthInput(450)
-
-        // If still not visible, try clicking the arrow coordinates once more (in case the first click only focused the panel)
-        if (!inputFound && advBox) {
-          await page.mouse.click(advBox.arrowX, advBox.y).catch(() => {})
-          await new Promise((r) => setTimeout(r, 500))
-          inputFound = await tagVisibleOutputLengthInput(500)
+        if (!inputFound) {
+          continue
         }
-      }
 
-      await new Promise((r) => setTimeout(r, 200))
+        const maxOutInput = page.locator('input[data-cmt-output-length-input="true"]').first()
+        if ((await maxOutInput.count().catch(() => 0)) === 0) {
+          continue
+        }
 
-      const maxOutInput = await findFirstVisibleLocator(
-        page,
-        STUDIO_SELECTORS.maxOutputTokensInput,
-        2000,
-      )
-
-      if (maxOutInput) {
         await maxOutInput.scrollIntoViewIfNeeded().catch(() => {})
+        await new Promise((r) => setTimeout(r, 150))
+
         const currentMaxOut = (await maxOutInput.inputValue().catch(() => ''))
           .replace(/,/g, '')
           .trim()
+
         if (currentMaxOut !== desiredMaxOut) {
           await maxOutInput.click({ clickCount: 3 }).catch(() => {})
           await page.keyboard.press('Control+A').catch(() => {})
@@ -3737,25 +3787,29 @@ export class StudioBrowserController {
               input.dispatchEvent(new Event('blur', { bubbles: true }))
             }, desiredMaxOut)
             .catch(() => {})
-          await maxOutInput.press('Enter').catch(() => {})
+          await maxOutInput.press('Tab').catch(() => {})
           await new Promise((r) => setTimeout(r, 250))
         }
 
         const verifiedMaxOut = (await maxOutInput.inputValue().catch(() => ''))
           .replace(/,/g, '')
           .trim()
-        this.logStep(
-          'output tokens set',
-          `Output length=${verifiedMaxOut || desiredMaxOut} (target=${desiredMaxOut}, model=${modelLabel || 'default'})`,
-          'info',
-        )
-      } else {
-        this.logStep(
-          'output tokens warn',
-          `Output length input not found after expanding Advanced settings (target=${desiredMaxOut}, model=${modelLabel || 'default'})`,
-          'warn',
-        )
+
+        if (verifiedMaxOut === desiredMaxOut) {
+          this.logStep(
+            'output tokens set',
+            `Output length=${verifiedMaxOut} (target=${desiredMaxOut}, model=${modelLabel || 'Argon'}, attempt=${attempt})`,
+            'info',
+          )
+          return
+        }
       }
+
+      this.logStep(
+        'output tokens warn',
+        `Output length input could not be verified at ${desiredMaxOut} after 3 attempts (model=${modelLabel || 'Argon'})`,
+        'warn',
+      )
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err)
       this.logStep('output tokens warn', `Could not set Output length=${desiredMaxOut}: ${msg}`, 'warn')
@@ -6883,6 +6937,14 @@ export class StudioBrowserController {
                 )
                 activeModelName = secondSwitchRes.selectedModelName || nextAvailableModel
                 this.activeModelName = activeModelName
+              }
+
+              if (/\bargon\b/i.test(activeModelName)) {
+                await this.setOutputLengthInRunSettings(
+                  page,
+                  resolveEffectiveMaxOutputTokensForModel(activeModelName),
+                  activeModelName,
+                )
               }
 
               await this.markPageErrorBannersHandled(page)

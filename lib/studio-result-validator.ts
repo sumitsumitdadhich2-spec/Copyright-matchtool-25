@@ -131,9 +131,10 @@ export function cleanStudioAnswerText(text: string): string {
     ).trim()
   }
 
-  // Ensure line breaks around HISSA 1 / HISSA 2 headings and entries when text was flattened
-  // 1) Newline before HISSA 2 section (and its optional === border)
+  // Ensure line breaks around HISSA 1 / HISSA 2 headings and entries when text was flattened or wrapped mid-entry
+  // 1) Newline before HISSA 2 section (and between === border and HISSA 1 / HISSA 2)
   s = s.replace(/([^\n])\s*(={3,}\s*HISSA\s*2\b)/gi, '$1\n$2')
+  s = s.replace(/(={3,})[ \t]*(HISSA\s*[12]\b)/gi, '$1\n$2')
   s = s.replace(/([^\n=])\s*(HISSA\s*2\b)/gi, '$1\n$2')
 
   // 2) Newline right after HISSA 1 heading (e.g. "HISSA 1 — SHORT VIDEO TIME MAP ===" followed by timestamp)
@@ -154,8 +155,24 @@ export function cleanStudioAnswerText(text: string): string {
     '$1\n$2',
   )
 
-  // 5) Newline before each HISSA 2 case-sensitive "Short <ts>" entry (including truncated "Short 02:" at the end of a line)
-  s = s.replace(/([^\n])\s+(Short[:\s]+(?:\d+:)?\d{1,2}:\d{0,2})/g, '$1\n$2')
+  // 5) Normalize HISSA 2 body so wrapped lines inside a "Short ... -> Movie ... — Note: ..." entry are rejoined
+  // and every case-sensitive "Short <ts>" entry starts on its own clean line
+  const h2HeaderRe =
+    /(HISSA\s*2\b(?:(?!\bShort\b|\b(?:\d+:)?\d{1,2}:\d{2})[^\r\n])*(?:\r?\n[ \t]*={3,}[ \t]*)?\r?\n?)/i
+  const h2HeaderMatch = h2HeaderRe.exec(s)
+  if (h2HeaderMatch && h2HeaderMatch.index !== undefined) {
+    const h2BodyStart = h2HeaderMatch.index + h2HeaderMatch[0].length
+    const beforeH2Body = s.slice(0, h2BodyStart).trimEnd()
+    let h2Body = s.slice(h2BodyStart).trim()
+    if (h2Body) {
+      // Collapse any mid-line DOM line breaks inside HISSA 2 into single spaces, then split cleanly before each "Short <ts>" entry
+      h2Body = h2Body.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim()
+      h2Body = h2Body.replace(/([^\n])[ \t]*(?=\bShort[:\s]+(?:\d+:)?\d{1,2}:\d{0,2})/g, '$1\n')
+      s = `${beforeH2Body}\n${h2Body}`
+    }
+  } else {
+    s = s.replace(/([^\n])[ \t]*(Short[:\s]+(?:\d+:)?\d{1,2}:\d{0,2})/g, '$1\n$2')
+  }
 
   // Collapse 3+ consecutive newlines to 2
   s = s.replace(/\n{3,}/g, '\n\n').trim()

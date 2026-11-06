@@ -57,6 +57,7 @@ import {
 import {
   ensureScanChunkTicket,
   globalChunkScanCoordinator,
+  reactivateScanTicket,
   registerParallelWindowCompletionChecker,
   releaseScanKeyPair,
   skipScanTicket,
@@ -1279,7 +1280,8 @@ export class StudioParallelManager {
         this.hasStartedRun =
           typeof raw.hasStartedRun === 'boolean' ? raw.hasStartedRun : anyWindowRan
 
-        // Any window that was in-flight when container restarted goes back to QUEUED; DONE stays DONE
+        // Any window that was in-flight or previously marked SKIPPED goes back to QUEUED; DONE stays DONE
+        let healedSkipped = false
         this.windows = raw.windows.map((w) => {
           if (
             w.status === 'ASSIGNED' ||
@@ -1290,13 +1292,20 @@ export class StudioParallelManager {
             w.status === '403_WAIT' ||
             w.status === 'WAITING_FOR_WORKER' ||
             w.status === 'WAITING_FOR_UPLOAD_GATE' ||
-            w.status === 'WAITING_FOR_RAM'
+            w.status === 'WAITING_FOR_RAM' ||
+            w.status === 'SKIPPED' ||
+            w.error === 'YT_DAILY_UPLOAD_LIMIT_REACHED'
           ) {
+            if (w.status === 'SKIPPED' || w.error === 'YT_DAILY_UPLOAD_LIMIT_REACHED') {
+              healedSkipped = true
+            }
             return {
               ...w,
               status: 'QUEUED',
               workerId: null,
               stage: 'queued (resumed)',
+              error: null,
+              summaryText: 'Queued',
             }
           }
           return {
@@ -1304,6 +1313,9 @@ export class StudioParallelManager {
             workerId: null,
           }
         })
+        if (healedSkipped) {
+          this.persistStateToDisk()
+        }
 
         if (migratedFromLegacyGlobal) {
           this.persistStateToDisk()
@@ -2003,11 +2015,12 @@ export class StudioParallelManager {
         this.finishedAt = null
       } else {
         for (const w of this.windows) {
-          if (w.status !== 'DONE' && w.status !== 'PROHIBITED' && w.status !== 'SKIPPED') {
+          if (w.status !== 'DONE' && w.status !== 'PROHIBITED') {
             w.status = 'QUEUED'
             w.workerId = null
             w.stage = 'queued'
             w.error = null
+            w.summaryText = 'Queued'
           }
         }
         this.startedAt = Date.now()
@@ -2030,10 +2043,19 @@ export class StudioParallelManager {
       if (!this.scanId || this.scanId === 'default') {
         throw new Error('Cannot start Parallel Scan without a valid scanId')
       }
+      reactivateScanTicket(this.scanId)
+      ensureScanChunkTicket(this.scanId)
       const scanRecord = getScan(this.scanId)
       if (!scanRecord) {
         throw new Error(`Scan ${this.scanId} not found in store`)
       }
+      scanRecord.status = 'scanning'
+      scanRecord.chunkWindowsDone = false
+      scanRecord.pipelineStage = 'chunk_scanning'
+      scanRecord.waitingForTicket = null
+      scanRecord.waitingForScanTitle = null
+      scanRecord.finishedAt = undefined
+      saveScan(scanRecord, { immediate: true })
 
       const shortReady = await ensureStudioShortReady(this.scanId)
       if (!this.isPathStrictlyInsideThisScanMediaDir(shortReady.localPath)) {
@@ -2205,8 +2227,7 @@ export class StudioParallelManager {
             .filter(
               (w) =>
                 w.status !== 'DONE' &&
-                w.status !== 'PROHIBITED' &&
-                w.status !== 'SKIPPED',
+                w.status !== 'PROHIBITED',
             )
             .sort((a, b) => a.priorityRank - b.priorityRank || a.windowNumber - b.windowNumber)
           this.clipsReady = 0
@@ -2214,9 +2235,14 @@ export class StudioParallelManager {
           this.clipsExtracting = orderedWindows.length > 0
           if (orderedWindows.length > 0) {
             const sClipStart = getScan(this.scanId)
-            if (sClipStart && sClipStart.status !== 'done') {
+            if (sClipStart) {
+              sClipStart.status = 'scanning'
+              sClipStart.chunkWindowsDone = false
               sClipStart.pipelineStage = 'clips_extract'
-              saveScan(sClipStart)
+              sClipStart.waitingForTicket = null
+              sClipStart.waitingForScanTitle = null
+              sClipStart.finishedAt = undefined
+              saveScan(sClipStart, { immediate: true })
             }
           }
           for (const w of orderedWindows) {
@@ -2623,7 +2649,12 @@ export class StudioParallelManager {
 
       const now = Date.now()
       const doneWins = this.windows.filter((w) => w.status === 'DONE').length
-      const failedWins = this.windows.filter((w) => w.status === 'FAILED').length
+      const failedWins = this.windows.filter(
+        (w) =>
+          w.status === 'FAILED' ||
+          w.status === 'NEEDS_ATTENTION' ||
+          (!this.stoppingAll && w.status === 'QUEUED'),
+      ).length
       const modelsUsed = Array.from(
         new Set(this.windows.map((w) => w.modelName).filter(Boolean)),
       )
@@ -2733,21 +2764,34 @@ export class StudioParallelManager {
       if (this.stoppingAll) return
       this.waitingForWorkerSlots = false
 
+      // Restore window stage labels if they were showing "Chunk windows ke liye wait..." while in the ticket queue
+      for (const w of this.windows) {
+        if (
+          w.status === 'QUEUED' &&
+          (w.stage?.startsWith('Chunk windows ke liye wait') ||
+            w.summaryText?.startsWith('Waiting in Chunk Queue'))
+        ) {
+          w.stage = this.usingOriginalMovieClips ? 'Clip ready' : 'queued'
+          w.summaryText = this.usingOriginalMovieClips ? 'Clip ready — preparing YT upload...' : 'Queued'
+        }
+      }
+      this.persistStateToDisk()
+
       if (this.scanId && this.scanId !== 'default') {
         const s = getScan(this.scanId)
         if (s) {
           s.status = 'scanning'
+          s.chunkWindowsDone = false
           s.pipelineStage = 'chunk_scanning'
           s.waitingForTicket = null
           s.waitingForScanTitle = null
           if (!s.startedAt) s.startedAt = Date.now()
-          saveScan(s)
+          saveScan(s, { immediate: true })
         }
       }
 
-      // 3. When using YouTube Studio window clips: upload clips sequentially with 2s step waits,
-      // stop gracefully if YouTube daily upload limit (10 videos/day) is reached, verify uploaded clips
-      // on the Content page, and immediately start AI Studio workers on all uploaded clips!
+      // 3. When using YouTube Studio window clips: upload all clips sequentially with 2s step waits,
+      // verify uploaded clips on the Content page, and immediately start AI Studio workers on all clips!
       if (this.usingOriginalMovieClips && !this.stoppingAll) {
         globalYtStudioController.resetDailyUploadLimitFlag()
         const pendingWins = this.windows
@@ -2759,7 +2803,7 @@ export class StudioParallelManager {
             workerId: 'SYS',
             level: 'INFO',
             step: 'YT batch upload phase',
-            message: `Uploading ${pendingWins.length} window clip(s) to YouTube Studio (2s step delay, stops gracefully on daily upload limit, Content check at the end)...`,
+            message: `Uploading ${pendingWins.length} window clip(s) to YouTube Studio (2s step delay, Content check at the end)...`,
           })
 
           const cfg = loadStudioUserConfig(this.username || 'admin')
@@ -2767,9 +2811,8 @@ export class StudioParallelManager {
             windowNumber: number
             clipPath?: string
             title: string
+            videoId?: string
           }> = []
-          let uploadedCount = 0
-          let limitStopped = false
 
           for (const w of pendingWins) {
             if (this.stoppingAll || this.stoppedWindowIds.has(w.id)) break
@@ -2780,36 +2823,19 @@ export class StudioParallelManager {
             const clipRes = clipTask ? await clipTask.catch(() => null) : null
             if (!clipRes?.clipPath) continue
 
-            const existingYt = readClipYtSidecar(clipRes.clipPath)
+            const existingYt =
+              readClipYtSidecar(clipRes.clipPath) ||
+              readClipYtSidecar(this.scanId, w.windowNumber)
             if (existingYt?.ytUrl && existingYt.ytVideoId && !existingYt.ytDeleted) {
               w.stage = 'link ready'
               w.summaryText = `YT link ready (${existingYt.ytUrl})`
               this.persistStateToDisk()
-              uploadedCount++
               expectedForContent.push({
                 windowNumber: w.windowNumber,
                 clipPath: clipRes.clipPath,
                 title: `cmt-${this.scanId.slice(0, 8)}-w${w.windowNumber}`,
+                videoId: existingYt.ytVideoId,
               })
-              continue
-            }
-
-            if (limitStopped || globalYtStudioController.isDailyUploadLimitReached()) {
-              limitStopped = true
-              w.status = 'SKIPPED'
-              w.stage = 'skipped (YT upload limit)'
-              w.error = 'YT_DAILY_UPLOAD_LIMIT_REACHED'
-              w.summaryText = 'Skipped — YouTube daily upload limit reached (processing uploaded clips)'
-              this.appendCombinedLog({
-                workerId: 'SYS',
-                windowId: w.id,
-                windowNumber: w.windowNumber,
-                windowRange: winRange,
-                level: 'RETRY',
-                step: 'YT upload limit skip',
-                message: `Window #${w.windowNumber} (${winRange}) skipped — YouTube daily upload limit reached; proceeding with ${uploadedCount} already-uploaded clip(s)`,
-              })
-              this.persistStateToDisk()
               continue
             }
 
@@ -2836,11 +2862,11 @@ export class StudioParallelManager {
 
               w.stage = 'link ready'
               w.summaryText = `YT link ready (${ytRes.ytUrl})`
-              uploadedCount++
               expectedForContent.push({
                 windowNumber: w.windowNumber,
                 clipPath: clipRes.clipPath,
                 title: `cmt-${this.scanId.slice(0, 8)}-w${w.windowNumber}`,
+                videoId: ytRes.ytVideoId,
               })
               this.appendCombinedLog({
                 workerId: 'SYS',
@@ -2854,38 +2880,15 @@ export class StudioParallelManager {
               this.persistStateToDisk()
             } catch (ytErr: unknown) {
               const ytMsg = ytErr instanceof Error ? ytErr.message : String(ytErr)
-              if (
-                ytMsg.includes('YT_DAILY_UPLOAD_LIMIT_REACHED') ||
-                globalYtStudioController.isDailyUploadLimitReached() ||
-                uploadedCount > 0
-              ) {
-                limitStopped = true
-                globalYtStudioController.markDailyUploadLimitReached(ytMsg)
-                w.status = 'SKIPPED'
-                w.stage = 'skipped (YT upload limit)'
-                w.error = 'YT_DAILY_UPLOAD_LIMIT_REACHED'
-                w.summaryText = 'Skipped — YouTube upload limit reached (processing uploaded clips)'
-                this.appendCombinedLog({
-                  workerId: 'SYS',
-                  windowId: w.id,
-                  windowNumber: w.windowNumber,
-                  windowRange: winRange,
-                  level: 'RETRY',
-                  step: 'YT upload limit reached',
-                  message: `YouTube upload stopped at Window #${w.windowNumber} (${winRange}): ${ytMsg.slice(0, 140)} — stopping further uploads and starting AI Studio workers on ${uploadedCount} uploaded clip(s)!`,
-                })
-                this.persistStateToDisk()
-              } else {
-                this.appendCombinedLog({
-                  workerId: 'SYS',
-                  windowId: w.id,
-                  windowNumber: w.windowNumber,
-                  windowRange: winRange,
-                  level: 'RETRY',
-                  step: 'YT pre-upload warning',
-                  message: `Window #${w.windowNumber} (${winRange}) YT upload warning: ${ytMsg}`,
-                })
-              }
+              this.appendCombinedLog({
+                workerId: 'SYS',
+                windowId: w.id,
+                windowNumber: w.windowNumber,
+                windowRange: winRange,
+                level: 'RETRY',
+                step: 'YT pre-upload warning',
+                message: `Window #${w.windowNumber} (${winRange}) YT upload warning (will retry on worker slot): ${ytMsg}`,
+              })
             } finally {
               releaseYt()
             }
@@ -2957,7 +2960,7 @@ export class StudioParallelManager {
       await Promise.allSettled(workerPromises)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      if (!this.stoppingAll && !/stopped/i.test(msg)) {
+      if (!this.stoppingAll) {
         this.appendCombinedLog({
           workerId: 'SYS',
           level: 'ERROR',
@@ -2987,9 +2990,17 @@ export class StudioParallelManager {
 
       const doneCount = this.windows.filter((w) => w.status === 'DONE').length
       const prohibitedCount = this.windows.filter((w) => w.status === 'PROHIBITED').length
-      const failedCount = this.windows.filter((w) => w.status === 'FAILED').length
+      const failedCount = this.windows.filter(
+        (w) =>
+          w.status === 'FAILED' ||
+          w.status === 'NEEDS_ATTENTION' ||
+          (!this.stoppingAll && w.status === 'QUEUED'),
+      ).length
       const allWindowsCompleted =
-        !this.stoppingAll && this.windows.length > 0 && failedCount === 0
+        !this.stoppingAll &&
+        this.windows.length > 0 &&
+        failedCount === 0 &&
+        (doneCount > 0 || prohibitedCount > 0)
 
       // End-of-scan YouTube Studio auto-delete cleanup FIRST (Select All -> More actions -> Delete forever)
       // Whenever all windows are done (e.g. 13/13 DONE), automatically run Delete forever before moving to the next global scan!
@@ -2997,7 +3008,7 @@ export class StudioParallelManager {
       try {
         const cleanupCfg = await loadStudioUserConfig(this.username || 'admin')
         if (
-          cleanupCfg.encryptedYtCookies &&
+          (this.usingOriginalMovieClips || Boolean(cleanupCfg.encryptedYtCookies)) &&
           allWindowsCompleted &&
           !isAnyOtherParallelScanActive(this.scanId)
         ) {
@@ -3488,7 +3499,7 @@ export class StudioParallelManager {
       const shortYoutubeUrl = latestScanRecord?.shortYoutubeUrl || null
       let movieYoutubeUrl: string | null = latestScanRecord?.movieYoutubeUrl || null
 
-      if (windowClip && cfg.encryptedYtCookies) {
+      if (windowClip && (this.usingOriginalMovieClips || Boolean(cfg.encryptedYtCookies))) {
         // If a background YT upload promise is already running for this window, await it first
         const existingUploadPromise = this.windowYtUploadPromises?.get(win.id)
         if (existingUploadPromise) {
@@ -3498,20 +3509,14 @@ export class StudioParallelManager {
           await existingUploadPromise.catch(() => null)
         }
 
-        const cachedSidecar = readClipYtSidecar(windowClip.clipPath)
+        const cachedSidecar =
+          readClipYtSidecar(windowClip.clipPath) ||
+          readClipYtSidecar(this.scanId, win.windowNumber)
         if (cachedSidecar?.ytUrl && !cachedSidecar.ytDeleted) {
           movieYoutubeUrl = cachedSidecar.ytUrl
           win.stage = 'link ready'
           win.summaryText = `YT link ready (${movieYoutubeUrl})`
           this.persistStateToDisk()
-        } else if (globalYtStudioController.isDailyUploadLimitReached()) {
-          win.status = 'SKIPPED'
-          win.workerId = null
-          win.stage = 'skipped (YT upload limit)'
-          win.error = 'YT_DAILY_UPLOAD_LIMIT_REACHED'
-          win.summaryText = 'Skipped — YouTube daily upload limit reached'
-          this.persistStateToDisk()
-          return
         } else {
           win.stage = 'uploading to YT'
           win.summaryText = `Uploading clip to YouTube Studio on ${workerId}...`
@@ -3533,21 +3538,6 @@ export class StudioParallelManager {
             win.stage = 'link ready'
             win.summaryText = `YT link ready (${movieYoutubeUrl})`
             this.persistStateToDisk()
-          } catch (upErr: unknown) {
-            const upMsg = upErr instanceof Error ? upErr.message : String(upErr)
-            if (
-              upMsg.includes('YT_DAILY_UPLOAD_LIMIT_REACHED') ||
-              globalYtStudioController.isDailyUploadLimitReached()
-            ) {
-              win.status = 'SKIPPED'
-              win.workerId = null
-              win.stage = 'skipped (YT upload limit)'
-              win.error = 'YT_DAILY_UPLOAD_LIMIT_REACHED'
-              win.summaryText = 'Skipped — YouTube daily upload limit reached'
-              this.persistStateToDisk()
-              return
-            }
-            throw upErr
           } finally {
             releaseYt()
           }
@@ -3758,11 +3748,7 @@ export class StudioParallelManager {
       }
       this.persistStateToDisk()
     } finally {
-      if (
-        win.status === 'DONE' ||
-        win.status === 'PROHIBITED' ||
-        win.status === 'FAILED'
-      ) {
+      if (win.status === 'DONE' || win.status === 'PROHIBITED') {
         if (windowClip?.clipPath) {
           try {
             if (fs.existsSync(windowClip.clipPath)) {
@@ -4242,6 +4228,20 @@ export class StudioParallelManager {
 
   public async getLiveSnapshot(captureThumbnails = true): Promise<ParallelScanLiveSnapshot> {
     this.refreshScanMetadataFromStore()
+    let clearedSkipped = false
+    for (const w of this.windows) {
+      if (w.status === 'SKIPPED' || w.error === 'YT_DAILY_UPLOAD_LIMIT_REACHED') {
+        w.status = 'QUEUED'
+        w.workerId = null
+        w.stage = 'queued'
+        w.error = null
+        w.summaryText = 'Queued'
+        clearedSkipped = true
+      }
+    }
+    if (clearedSkipped) {
+      this.persistStateToDisk()
+    }
     const slotPool = globalProfileSlotPool.getSummary(this.maxTotalPoolSlots)
     const leasedByThisScan = globalProfileSlotPool.getLeasedSlotsForScan(this.scanId)
 
@@ -4640,14 +4640,19 @@ registerParallelWindowCompletionChecker((scanId: string) => {
   if (!Array.isArray(snapWins) || snapWins.length === 0) {
     return null
   }
-  const allTerminal = snapWins.every(
-    (w) =>
-      w.status === 'DONE' ||
-      w.status === 'FAILED' ||
-      w.status === 'PROHIBITED' ||
-      w.status === 'SKIPPED' ||
-      w.status === 'STOPPED',
+  const hasAnyCompletedOrFailed = snapWins.some(
+    (w) => w.status === 'DONE' || w.status === 'PROHIBITED' || w.status === 'FAILED',
   )
+  const allTerminal =
+    hasAnyCompletedOrFailed &&
+    snapWins.every(
+      (w) =>
+        w.status === 'DONE' ||
+        w.status === 'FAILED' ||
+        w.status === 'PROHIBITED' ||
+        w.status === 'SKIPPED' ||
+        w.status === 'STOPPED',
+    )
   return {
     done: allTerminal,
     reason: allTerminal ? 'All parallel windows and YT cleanup reached terminal state' : undefined,

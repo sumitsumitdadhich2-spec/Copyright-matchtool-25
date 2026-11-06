@@ -83,10 +83,33 @@ export function registerSchedulerChunkChecker(
 
 function isScanTerminalOnDisk(scan: Scan | null | undefined): boolean {
   if (!scan) return true
+  if (gState.externalWindowCompletionChecker) {
+    const ext = gState.externalWindowCompletionChecker(scan.id)
+    if (ext && ext.done === false) {
+      return false
+    }
+  }
+  const hasPrescanActive = Boolean(
+    scan.geminiPrescan &&
+      (scan.geminiPrescan.status === 'preparing' ||
+        scan.geminiPrescan.status === 'uploading' ||
+        scan.geminiPrescan.status === 'scanning' ||
+        scan.geminiPrescan.status === 'backup' ||
+        scan.geminiPrescan.status === 'starting_scan'),
+  )
+  if (hasPrescanActive) return false
+  if (scan.status === 'scanning' || scan.status === 'chunking' || scan.status === 'verifying') {
+    return false
+  }
   if (scan.status === 'done' || scan.status === 'stopped' || scan.status === 'error') {
     return true
   }
-  if (scan.chunkWindowsDone || scan.pipelineStage === 'done' || scan.pipelineStage === 'stopped' || scan.pipelineStage === 'error') {
+  if (
+    scan.chunkWindowsDone ||
+    scan.pipelineStage === 'done' ||
+    scan.pipelineStage === 'stopped' ||
+    scan.pipelineStage === 'error'
+  ) {
     return true
   }
   if (
@@ -102,6 +125,10 @@ function isScanTerminalOnDisk(scan: Scan | null | undefined): boolean {
 function isScanActivelyInPipeline(scan: Scan | null | undefined): boolean {
   if (!scan) return false
   if (gState.skippedOrCompletedTickets.has(scan.id)) return false
+  if (gState.externalWindowCompletionChecker) {
+    const ext = gState.externalWindowCompletionChecker(scan.id)
+    if (ext && ext.done === false) return true
+  }
   if (isScanTerminalOnDisk(scan)) return false
   const hasAssignedTicket = Boolean(
     (scan.chunkTicket && scan.chunkTicket > 0) || gState.ticketsByScanId.has(scan.id),
@@ -127,11 +154,20 @@ function isScanActivelyInPipeline(scan: Scan | null | undefined): boolean {
 }
 
 /**
+ * Clear any stale skipped/completed flag for a scan when it is started or resumed.
+ */
+export function reactivateScanTicket(scanId: string): void {
+  if (!scanId) return
+  gState.skippedOrCompletedTickets.delete(scanId)
+}
+
+/**
  * Assign a persistent ticket number `scan.chunkTicket = 1, 2, 3...` to a scan.
  * If no other scans are currently active in the pipeline when a new batch begins,
  * the ticket sequence starts cleanly at Ticket #1.
  */
 export function ensureScanChunkTicket(scanId: string): number {
+  gState.skippedOrCompletedTickets.delete(scanId)
   const existingMem = gState.ticketsByScanId.get(scanId)
   const scan = getScan(scanId)
   if (scan?.chunkTicket && scan.chunkTicket > 0) {
@@ -637,8 +673,21 @@ class ChunkScanCoordinator {
         for (const w of this.waitQueue) {
           const s = getScan(w.scanId)
           const stoppedByCallback = w.isStopping?.() === true
-          const stoppedInStore = !s || s.status === 'stopped' || s.status === 'error' || s.status === 'done'
-          if (stoppedByCallback || stoppedInStore || gState.skippedOrCompletedTickets.has(w.scanId)) {
+          const extActive =
+            gState.externalWindowCompletionChecker?.(w.scanId)?.done === false
+          const prescanStarting = s?.geminiPrescan?.status === 'starting_scan'
+          const stoppedInStore =
+            !s ||
+            (!extActive &&
+              !prescanStarting &&
+              s.pipelineStage !== 'waiting_chunk_ticket' &&
+              s.pipelineStage !== 'clips_extract' &&
+              s.pipelineStage !== 'chunk_scanning' &&
+              (s.status === 'stopped' || s.status === 'error' || s.status === 'done'))
+          if (
+            stoppedByCallback ||
+            (!extActive && (stoppedInStore || gState.skippedOrCompletedTickets.has(w.scanId)))
+          ) {
             this.clearScanQueueBadge(w.scanId)
             w.reject(new Error('Scan stopped while waiting in chunk scan queue'))
           } else {
@@ -666,21 +715,32 @@ class ChunkScanCoordinator {
     if (!scan) {
       return { shouldRelease: true, reason: 'Scan deleted from store' }
     }
+
+    // If StudioParallelManager is actively running or starting for this scan, NEVER release prematurely!
+    if (gState.externalWindowCompletionChecker) {
+      const ext = gState.externalWindowCompletionChecker(scanId)
+      if (ext) {
+        if (ext.done === false) {
+          return { shouldRelease: false, reason: 'Studio parallel windows actively running' }
+        }
+        if (ext.done === true) {
+          return {
+            shouldRelease: true,
+            reason: ext.reason || 'All Studio parallel chunk windows reached terminal status',
+          }
+        }
+      }
+    }
+
+    if (scan.geminiPrescan?.status === 'starting_scan') {
+      return { shouldRelease: false, reason: 'Minute finder handing off to chunk scan' }
+    }
+
     if (scan.status === 'done' || scan.status === 'stopped' || scan.status === 'error') {
       return { shouldRelease: true, reason: `Scan status is '${scan.status}'` }
     }
     if (scan.chunkWindowsDone) {
       return { shouldRelease: true, reason: 'All chunk windows reached terminal status' }
-    }
-
-    if (gState.externalWindowCompletionChecker) {
-      const ext = gState.externalWindowCompletionChecker(scanId)
-      if (ext?.done) {
-        return {
-          shouldRelease: true,
-          reason: ext.reason || 'All Studio parallel chunk windows reached terminal status',
-        }
-      }
     }
 
     return { shouldRelease: false, reason: 'Chunks still in progress' }
@@ -788,11 +848,19 @@ class ChunkScanCoordinator {
     isStopping?: () => boolean
   }): Promise<() => void> {
     const { scanId, scanTitle = scanId, onWait, isStopping } = params
+    gState.skippedOrCompletedTickets.delete(scanId)
     const ticket = ensureScanChunkTicket(scanId)
 
     // Re-entrant if this scan already holds the lock
     if (this.activeScanId === scanId) {
       return () => this.releaseChunkScanLock(scanId)
+    }
+
+    // If this scan was already queued in waitQueue (e.g. by Minute Finder handoff), remove & chain its waiter first
+    let chainedWaiter: ChunkScanWaiter | null = null
+    const existingIdx = this.waitQueue.findIndex((w) => w.scanId === scanId)
+    if (existingIdx >= 0) {
+      chainedWaiter = this.waitQueue.splice(existingIdx, 1)[0] || null
     }
 
     // Check if any active scan holds the lock right now, and whether it already finished
@@ -803,15 +871,23 @@ class ChunkScanCoordinator {
       }
     }
 
-    // Strict ticket order check: can only acquire immediately if no active scan holds the lock,
-    // waitQueue has no lower ticket, AND no lower-ticket scan is still active in minute/backup finder!
+    // Re-check if forceReleaseLock -> grantNextInQueue already granted the lock to scanId
+    if (this.activeScanId === scanId) {
+      const rel = () => this.releaseChunkScanLock(scanId)
+      if (chainedWaiter) chainedWaiter.resolve(rel)
+      return rel
+    }
+
+    // Strict ticket order check: acquire immediately if no active scan holds the lock
+    // AND no lower-ticket scan (`otherTicket < ticket`) is blocking in waitQueue or in Minute/Backup Finder!
     const blocking = this.findBlockingLowerTicketScan(scanId, ticket)
-    if (!this.activeScanId && !blocking && this.waitQueue.length === 0) {
+    if (!this.activeScanId && !blocking) {
       this.activeScanId = scanId
       this.activeScanTitle = scanTitle
       this.activeScanTicket = ticket
       this.activeSince = Date.now()
       this.clearScanQueueBadge(scanId)
+      this.syncQueueBadgesOnDisk()
       const s = getScan(scanId)
       if (s) {
         s.chunkTicket = ticket
@@ -825,13 +901,9 @@ class ChunkScanCoordinator {
         )
         saveScan(s)
       }
-      return () => this.releaseChunkScanLock(scanId)
-    }
-
-    // Check if already queued in waitQueue
-    const existingIdx = this.waitQueue.findIndex((w) => w.scanId === scanId)
-    if (existingIdx >= 0) {
-      this.waitQueue.splice(existingIdx, 1)
+      const rel = () => this.releaseChunkScanLock(scanId)
+      if (chainedWaiter) chainedWaiter.resolve(rel)
+      return rel
     }
 
     return new Promise<() => void>((resolve, reject) => {
@@ -839,11 +911,29 @@ class ChunkScanCoordinator {
         scanId,
         scanTitle,
         ticket,
-        enqueuedAt: Date.now(),
-        resolve,
-        reject,
-        onWait,
-        isStopping,
+        enqueuedAt: chainedWaiter?.enqueuedAt ?? Date.now(),
+        resolve: (relFn) => {
+          if (chainedWaiter) {
+            try {
+              chainedWaiter.resolve(relFn)
+            } catch {
+              /* ignore */
+            }
+          }
+          resolve(relFn)
+        },
+        reject: (err) => {
+          if (chainedWaiter) {
+            try {
+              chainedWaiter.reject(err)
+            } catch {
+              /* ignore */
+            }
+          }
+          reject(err)
+        },
+        onWait: onWait || chainedWaiter?.onWait,
+        isStopping: isStopping || chainedWaiter?.isStopping,
       }
       this.waitQueue.push(waiter)
       this.sortQueueByTicket()
@@ -854,7 +944,7 @@ class ChunkScanCoordinator {
       const waitTitle =
         currentBlocking?.scanTitle ||
         this.activeScanTitle ||
-        (currentBlocking ? `#${currentBlocking.ticket}` : '#1')
+        (currentBlocking ? `#${currentBlocking.ticket}` : `#${this.activeScanTicket ?? 1}`)
       const s = getScan(scanId)
       if (s) {
         s.chunkTicket = ticket

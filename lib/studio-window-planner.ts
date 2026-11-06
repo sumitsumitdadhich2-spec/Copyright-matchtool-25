@@ -761,15 +761,34 @@ export function extractHissa1And2EntriesFromResponse(rawText: string): {
   }>
 } {
   const normalized = (rawText || '').replace(/\r\n/g, '\n')
-  const hissa2Match = normalized.match(/(?:^|\n)\s*(?:#+\s*|\*\*\s*)?HISSA\s*2\b/i)
+  const hissa2Match =
+    normalized.match(/(?:^|\n)\s*(?:={2,}\s*|#+\s*|\*\*\s*)?HISSA\s*2\b/i) ||
+    /HISSA\s*2\b/i.exec(normalized)
   const hissa1Block =
     hissa2Match && hissa2Match.index !== undefined
       ? normalized.slice(0, hissa2Match.index)
       : normalized
-  const hissa2Block =
+  const rawHissa2Section =
     hissa2Match && hissa2Match.index !== undefined
       ? normalized.slice(hissa2Match.index)
       : normalized
+
+  // Strip the HISSA 2 header line (and optional === border) before normalizing HISSA 2 entries
+  const h2HeaderEnd =
+    /HISSA\s*2\b(?:(?!\bShort\b|\b(?:\d+:)?\d{1,2}:\d{2})[^\r\n])*(?:\r?\n[ \t]*={3,}[ \t]*)?\r?\n?/i.exec(
+      rawHissa2Section,
+    )
+  const hissa2BodyRaw = h2HeaderEnd
+    ? rawHissa2Section.slice(h2HeaderEnd.index + h2HeaderEnd[0].length)
+    : rawHissa2Section
+
+  // Normalize HISSA 2 body so wrapped lines inside an entry are rejoined and each "Short <ts>" starts on a new line
+  const hissa2NormalizedLines = hissa2BodyRaw
+    .replace(/\*\*/g, '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/([^\n])[ \t]*(?=\bShort[:\s]+(?:\d+:)?\d{1,2}:\d{2})/gi, '$1\n')
 
   const hissa1Entries: Array<{ shortStartSec: number; shortEndSec: number; description: string }> = []
   for (const rawLine of hissa1Block.split('\n')) {
@@ -800,12 +819,12 @@ export function extractHissa1And2EntriesFromResponse(rawText: string): {
     movieEndSec: number | null
   }> = []
 
-  for (const rawLine of hissa2Block.split('\n')) {
+  for (const rawLine of hissa2NormalizedLines.split('\n')) {
     const line = rawLine.trim().replace(/^[-*•]+\s*/, '').replace(/\*\*/g, '')
     if (!line || /HISSA\s*2/i.test(line)) continue
 
     const foundMatch = line.match(
-      /^(?:\d+[.)]\s*)?(?:Short[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*\([^)]*\))?\s*(?:=|-->|->|—>|=>|→)\s*(?:Movie[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)/i,
+      /^(?:\d+[.)]\s*)?(?:Short[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*\([^)]*\))?\s*(?:=|-->|->|—>|–>|=>|→|➔|➜|⟶)\s*(?:Movie[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)/i,
     )
     if (foundMatch) {
       const sStart = parseParallelTimecodeToSeconds(foundMatch[1])
@@ -835,7 +854,7 @@ export function extractHissa1And2EntriesFromResponse(rawText: string): {
     }
 
     const nfMatch = line.match(
-      /^(?:\d+[.)]\s*)?(?:Short[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*\([^)]*\))?\s*(?:=|-->|->|—>|=>|→|:|-|–|—)?\s*(?:NOT[_\s-]*FOUND|NONE|N\/A|NULL|NO[_\s-]*MATCH|NAHI[_\s-]*MILA)\b/i,
+      /^(?:\d+[.)]\s*)?(?:Short[:\s]+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\s*\([^)]*\))?\s*(?:=|-->|->|—>|–>|=>|→|➔|➜|⟶|:|-|–|—)?\s*(?:NOT[_\s-]*FOUND|NONE|N\/A|NULL|NO[_\s-]*MATCH|NAHI[_\s-]*MILA)\b/i,
     )
     if (nfMatch) {
       const sStart = parseParallelTimecodeToSeconds(nfMatch[1])

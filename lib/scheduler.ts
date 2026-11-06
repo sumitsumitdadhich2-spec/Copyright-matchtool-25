@@ -67,6 +67,7 @@ import { computeShortCoverage, coverageLine } from './short-coverage'
 import { globalGeminiCoordinator, CandidateLane } from './global-gemini-coordinator'
 import {
   globalChunkScanCoordinator,
+  reactivateScanTicket,
   registerSchedulerChunkChecker,
   releaseScanKeyPair,
   skipScanTicket,
@@ -409,7 +410,13 @@ class Scheduler {
     }
 
     if (!Array.isArray(scan.matches)) scan.matches = []
+    reactivateScanTicket(scanId)
     scan.status = pendingChunks === 0 ? 'verifying' : 'scanning'
+    scan.chunkWindowsDone = false
+    scan.pipelineStage = 'chunk_scanning'
+    scan.waitingForTicket = null
+    scan.waitingForScanTitle = null
+    scan.finishedAt = undefined
     scan.error = null
     if (!scan.startedAt) scan.startedAt = Date.now()
 

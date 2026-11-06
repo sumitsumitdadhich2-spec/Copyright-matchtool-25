@@ -35,6 +35,7 @@ import { globalGeminiCoordinator } from './global-gemini-coordinator'
 import {
   globalChunkScanCoordinator,
   ensureScanTicketAndKeyPair,
+  reactivateScanTicket,
   selectScanKeyPairWithFallback,
   claimReplacementKeyForScan,
   skipScanTicket,
@@ -229,7 +230,15 @@ export function startGeminiMinuteFinder(
     return { ok: false, error: 'Gemini API key nahi hai — Settings me apni key add karo.' }
   }
 
+  reactivateScanTicket(scanId)
   const alloc = ensureScanTicketAndKeyPair(scanId)
+  scan.chunkWindowsDone = false
+  if (scan.status === 'stopped' || scan.status === 'error' || scan.status === 'done') {
+    scan.status = 'created'
+  }
+  scan.pipelineStage = 'minute_finder'
+  scan.finishedAt = undefined
+  saveScan(scan)
 
   const isNewDay = checkDailyReset()
   if (isNewDay) {
@@ -746,6 +755,13 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
     if (!applied.ok) throw new Error(applied.error)
     ctrl.state.appliedMinutes = approved
     scan.geminiPrescan = ctrl.state
+    scan.chunkWindowsDone = false
+    if (scan.status === 'stopped' || scan.status === 'error' || scan.status === 'done') {
+      scan.status = 'created'
+    }
+    scan.pipelineStage = 'waiting_chunk_ticket'
+    scan.finishedAt = undefined
+    reactivateScanTicket(id)
     addLog(scan, 'success', `Minute list applied: movie minute(s) ${minuteList} — Gemini chunk scan start ho raha hai`)
     if (applied.rangeNotes.length > 0) addLog(scan, 'info', `Per-minute movie ranges (Gemini Minute Finder se): ${applied.rangeNotes.join('; ')}`)
     saveScan(scan, { immediate: true })

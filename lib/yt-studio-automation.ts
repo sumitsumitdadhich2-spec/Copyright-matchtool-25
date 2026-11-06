@@ -213,7 +213,7 @@ export class YtStudioBrowserController {
 
   public isDailyUploadLimitReached(): boolean {
     this.ensureInternalCollections();
-    return Boolean(this.dailyUploadLimitReached);
+    return false;
   }
 
   public resetDailyUploadLimitFlag(): void {
@@ -221,16 +221,9 @@ export class YtStudioBrowserController {
     this.dailyUploadLimitReached = false;
   }
 
-  public markDailyUploadLimitReached(reason?: string): void {
+  public markDailyUploadLimitReached(_reason?: string): void {
     this.ensureInternalCollections();
-    if (!this.dailyUploadLimitReached) {
-      this.dailyUploadLimitReached = true;
-      this.log(
-        'upload limit',
-        reason || 'YouTube daily upload limit reached — stopping remaining uploads and starting scan on uploaded clips',
-        'warn'
-      );
-    }
+    this.dailyUploadLimitReached = false;
   }
 
   private log(step: string, detail: string, status: YtStepLog['status'] = 'info'): void {
@@ -738,7 +731,7 @@ export class YtStudioBrowserController {
 
               const closeCandidates = Array.from(
                 dlg.querySelectorAll(
-                  '#close-button, ytcp-button#close-button, button[aria-label="Close"], ytcp-icon-button[aria-label="Close"], ytcp-button, button'
+                  '#close-button, ytcp-button#close-button, #close-icon-button, ytcp-icon-button#close-icon-button, button[aria-label="Close"], ytcp-icon-button[aria-label="Close"], ytcp-button, button'
                 )
               );
               for (const btn of closeCandidates) {
@@ -748,12 +741,13 @@ export class YtStudioBrowserController {
                 const id = (btn.getAttribute('id') || '').toLowerCase();
                 if (
                   id === 'close-button' ||
+                  id === 'close-icon-button' ||
                   bTxt === 'close' ||
                   aria === 'close' ||
                   (isPostUploadModal && bTxt.includes('close'))
                 ) {
                   btn.click();
-                  const innerBtn = btn.querySelector('button');
+                  const innerBtn = btn.querySelector('button, tp-yt-iron-icon');
                   if (innerBtn instanceof HTMLElement) innerBtn.click();
                   return true;
                 }
@@ -779,6 +773,7 @@ export class YtStudioBrowserController {
         'tp-yt-paper-dialog:has-text("Claimed content") ytcp-button:has-text("Close")',
         'ytcp-video-share-dialog #close-button',
         'ytcp-video-share-dialog ytcp-button:has-text("Close")',
+        'ytcp-uploads-dialog #close-icon-button',
         'ytcp-uploads-dialog #close-button',
         'ytcp-uploads-mini-indicator #close-button',
         'tp-yt-paper-dialog ytcp-button:has-text("Close")',
@@ -802,7 +797,7 @@ export class YtStudioBrowserController {
       // Check if any dialog or iron-overlay-backdrop is still open
       const stillOpen = await page
         .locator(
-          'ytcp-uploads-still-processing-dialog, tp-yt-paper-dialog:has-text("Video processing"), ytcp-video-share-dialog, ytcp-uploads-dialog, tp-yt-iron-overlay-backdrop.opened'
+          'ytcp-uploads-still-processing-dialog, tp-yt-paper-dialog:has-text("Video processing"), ytcp-video-share-dialog, ytcp-uploads-dialog[opened], tp-yt-iron-overlay-backdrop.opened'
         )
         .first()
         .isVisible()
@@ -818,8 +813,32 @@ export class YtStudioBrowserController {
     }
 
     // Ensure no orphaned <tp-yt-iron-overlay-backdrop class="opened"> remains to intercept pointer events on Create
+    // IMPORTANT: Never set display:none on ytcp-uploads-dialog itself because YouTube Studio reuses that singleton element for the next upload!
     await page
       .evaluate(() => {
+        const uploadDlg = document.querySelector('ytcp-uploads-dialog');
+        if (uploadDlg instanceof HTMLElement) {
+          uploadDlg.style.removeProperty('display');
+          uploadDlg.style.removeProperty('pointer-events');
+        }
+        const postDialogs = Array.from(
+          document.querySelectorAll(
+            'ytcp-uploads-still-processing-dialog, ytcp-video-share-dialog'
+          )
+        );
+        for (const dlg of postDialogs) {
+          const closeBtn = dlg.querySelector(
+            'ytcp-button#close-button button, #close-button button, #close-button, button[aria-label="Close"], ytcp-icon-button[aria-label="Close"]'
+          ) as HTMLElement | null;
+          if (closeBtn) {
+            try {
+              closeBtn.click();
+            } catch {
+              // ignore
+            }
+          }
+          dlg.removeAttribute('opened');
+        }
         const openModal = document.querySelector(
           'ytcp-uploads-dialog[opened], ytcp-uploads-still-processing-dialog[opened], tp-yt-paper-dialog[aria-modal="true"][opened]'
         );
@@ -1019,10 +1038,6 @@ export class YtStudioBrowserController {
       }
     }
 
-    if (this.dailyUploadLimitReached) {
-      throw new Error('YT_DAILY_UPLOAD_LIMIT_REACHED: YouTube daily upload limit reached');
-    }
-
     // Deduplicate concurrent upload requests for the exact same clipPath
     const inFlight = this.inFlightClipUploads.get(clipPath);
     if (inFlight && !forceUpload) {
@@ -1032,10 +1047,6 @@ export class YtStudioBrowserController {
     const runUploadPromise = this.withLock(async (): Promise<{ ytUrl: string; ytVideoId: string; reused: boolean }> => {
       if (!fs.existsSync(clipPath)) {
         throw new Error(`Clip file not found at ${clipPath}`);
-      }
-
-      if (this.dailyUploadLimitReached) {
-        throw new Error('YT_DAILY_UPLOAD_LIMIT_REACHED: YouTube daily upload limit reached');
       }
 
       const title = `cmt-${scanId.slice(0, 8)}-w${windowNumber}`;
@@ -1049,7 +1060,7 @@ export class YtStudioBrowserController {
 
           // Navigate to channel videos page (without ?d=ud so YouTube doesn't auto-open an unwanted backdrop)
           const targetStudioUrl = this.channelId
-            ? `https://studio.youtube.com/channel/${this.channelId}/videos`
+            ? `https://studio.youtube.com/channel/${this.channelId}/videos/upload?filter=%5B%5D`
             : 'https://studio.youtube.com';
 
           if (!uploadPage.url().startsWith('https://studio.youtube.com')) {
@@ -1068,9 +1079,39 @@ export class YtStudioBrowserController {
 
           await this.verifyOrLockChannel(uploadPage, username);
 
+          // If a previous upload's Visibility/Save modal is still sitting open on screen, click Save on it first, then dismiss all dialogs
+          const strayDoneBtn = uploadPage
+            .locator('ytcp-uploads-dialog #done-button, #done-button')
+            .first();
+          if (await strayDoneBtn.isVisible().catch(() => false)) {
+            await uploadPage
+              .evaluate(() => {
+                const dBtn = document.querySelector(
+                  'ytcp-uploads-dialog #done-button button, ytcp-uploads-dialog #done-button, #done-button button, #done-button'
+                ) as HTMLElement | null;
+                if (dBtn) dBtn.click();
+              })
+              .catch(() => {});
+            await uploadPage.waitForTimeout(2000);
+          }
+
           // Dismiss any leftover "Video processing" or upload dialog and clear any backdrop before starting, then wait 2s
           await this.dismissAllUploadDialogs(uploadPage);
           await uploadPage.waitForTimeout(2000);
+
+          // If ytcp-uploads-dialog is STILL stuck open on a previous video's metadata/visibility step, reload clean Content page
+          const stuckMetadataModal = await uploadPage
+            .locator('ytcp-uploads-dialog #title-textarea, ytcp-uploads-dialog #done-button')
+            .first()
+            .isVisible()
+            .catch(() => false);
+          if (stuckMetadataModal) {
+            const cleanUrl = this.channelId
+              ? `https://studio.youtube.com/channel/${this.channelId}/videos/upload?filter=%5B%5D`
+              : 'https://studio.youtube.com';
+            await uploadPage.goto(cleanUrl, { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
+            await uploadPage.waitForTimeout(2500);
+          }
 
           // Record any stale video IDs currently in the modal or already uploaded in this session so we never reuse an old URL
           const ignoreVideoIds = new Set<string>(this.uploadedVideoIdsInSession);
@@ -1103,7 +1144,7 @@ export class YtStudioBrowserController {
             for (const sel of createSelectors) {
               const loc = uploadPage.locator(sel).first();
               if (await loc.isVisible().catch(() => false)) {
-                await loc.click({ timeout: 8000 });
+                await loc.click({ timeout: 8000 }).catch(() => {});
                 clickedCreate = true;
                 break;
               }
@@ -1116,7 +1157,7 @@ export class YtStudioBrowserController {
                 .locator('#upload-icon, ytcp-button#upload-icon, button[aria-label="Upload videos"]')
                 .first();
               if (await directUploadBtn.isVisible().catch(() => false)) {
-                await directUploadBtn.click({ timeout: 8000 });
+                await directUploadBtn.click({ timeout: 8000 }).catch(() => {});
                 await uploadPage.waitForTimeout(2000);
               }
             } else {
@@ -1129,7 +1170,7 @@ export class YtStudioBrowserController {
               for (const sel of uploadMenuSelectors) {
                 const item = uploadPage.locator(sel).first();
                 if (await item.isVisible().catch(() => false)) {
-                  await item.click({ timeout: 8000 });
+                  await item.click({ timeout: 8000 }).catch(() => {});
                   break;
                 }
               }
@@ -1141,28 +1182,31 @@ export class YtStudioBrowserController {
               .first();
           }
 
-          const limitBeforeAttach = await this.detectDailyUploadLimitOnPage(uploadPage);
-          if (limitBeforeAttach) {
-            this.markDailyUploadLimitReached(`YouTube daily upload limit reached (${limitBeforeAttach})`);
-            await this.dismissAllUploadDialogs(uploadPage).catch(() => {});
-            throw new Error(`YT_DAILY_UPLOAD_LIMIT_REACHED: ${limitBeforeAttach}`);
+          // Fallback: if fileInput is still not attached after clicking Create -> Upload videos, navigate directly to ?d=ud upload URL
+          const attachedFast = await fileInput
+            .waitFor({ state: 'attached', timeout: 8000 })
+            .then(() => true)
+            .catch(() => false);
+          if (!attachedFast && this.channelId) {
+            const directUploadUrl = `https://studio.youtube.com/channel/${this.channelId}/videos/upload?d=ud`;
+            this.log('upload reopen', `Re-opening direct upload dialog (${directUploadUrl})...`, 'info');
+            await uploadPage
+              .goto(directUploadUrl, { waitUntil: 'domcontentloaded', timeout: 35000 })
+              .catch(() => {});
+            await uploadPage.waitForTimeout(2500);
+            fileInput = uploadPage
+              .locator('input[type="file"][name="Filedata"], ytcp-uploads-file-picker input[type="file"], input[type="file"]')
+              .first();
           }
 
           await fileInput.waitFor({ state: 'attached', timeout: 15000 });
           await fileInput.setInputFiles(clipPath);
           this.log('upload file', `Attached ${path.basename(clipPath)} to YT Studio file picker`, 'info');
 
-          // Wait 2 seconds after attaching file so upload dialog & limit check can load
+          // Wait 2 seconds after attaching file so upload dialog & details form can load
           await uploadPage.waitForTimeout(2000);
 
-          const limitAfterAttach = await this.detectDailyUploadLimitOnPage(uploadPage);
-          if (limitAfterAttach) {
-            this.markDailyUploadLimitReached(`YouTube daily upload limit reached (${limitAfterAttach})`);
-            await this.dismissAllUploadDialogs(uploadPage).catch(() => {});
-            throw new Error(`YT_DAILY_UPLOAD_LIMIT_REACHED: ${limitAfterAttach}`);
-          }
-
-          // Wait for the upload details modal (#title-textarea #textbox) while polling for daily upload limit banner
+          // Wait for the upload details modal (#title-textarea #textbox)
           const titleBoxSelectors = [
             'ytcp-social-suggestions-textbox#title-textarea #textbox',
             '#title-textarea #textbox',
@@ -1173,12 +1217,6 @@ export class YtStudioBrowserController {
           let titleVisible = false;
           const titleWaitDeadline = Date.now() + 30_000;
           while (Date.now() < titleWaitDeadline) {
-            const limitDuringWait = await this.detectDailyUploadLimitOnPage(uploadPage);
-            if (limitDuringWait) {
-              this.markDailyUploadLimitReached(`YouTube daily upload limit reached (${limitDuringWait})`);
-              await this.dismissAllUploadDialogs(uploadPage).catch(() => {});
-              throw new Error(`YT_DAILY_UPLOAD_LIMIT_REACHED: ${limitDuringWait}`);
-            }
             if (await titleBox.isVisible().catch(() => false)) {
               titleVisible = true;
               break;
@@ -1187,12 +1225,6 @@ export class YtStudioBrowserController {
           }
 
           if (!titleVisible) {
-            const limitFinalCheck = await this.detectDailyUploadLimitOnPage(uploadPage);
-            if (limitFinalCheck) {
-              this.markDailyUploadLimitReached(`YouTube daily upload limit reached (${limitFinalCheck})`);
-              await this.dismissAllUploadDialogs(uploadPage).catch(() => {});
-              throw new Error(`YT_DAILY_UPLOAD_LIMIT_REACHED: ${limitFinalCheck}`);
-            }
             throw new Error('Timed out waiting for YouTube Studio title textbox (#title-textarea #textbox)');
           }
 
@@ -1230,21 +1262,40 @@ export class YtStudioBrowserController {
 
           let shareUrl = await this.extractShareUrlFromUploadModal(uploadPage, ignoreVideoIds);
 
-          // Step 4: Click Next 3 times (Video elements -> Checks -> Visibility) with 2s wait after each click!
-          const nextBtn = uploadPage.locator('#next-button, ytcp-button#next-button, button:has-text("Next")').first();
-          for (let stepIdx = 0; stepIdx < 3; stepIdx++) {
+          // Step 4: Click Next until the Visibility radio buttons appear (usually 3 clicks: Video elements -> Checks -> Visibility) with 2s wait after each click!
+          const targetRadioName = visibility === 'private' ? 'PRIVATE' : 'UNLISTED';
+          const visRadioLocator = uploadPage
+            .locator(
+              `tp-yt-paper-radio-button[name="${targetRadioName}"], #privacy-radios tp-yt-paper-radio-button[name="${targetRadioName}"]`
+            )
+            .first();
+          const nextBtn = uploadPage
+            .locator('ytcp-uploads-dialog #next-button, #next-button, ytcp-button#next-button, button:has-text("Next")')
+            .first();
+
+          for (let stepIdx = 0; stepIdx < 5; stepIdx++) {
             if (!shareUrl) {
               shareUrl = await this.extractShareUrlFromUploadModal(uploadPage, ignoreVideoIds);
             }
+            if (await visRadioLocator.isVisible().catch(() => false)) {
+              break;
+            }
             if (await nextBtn.isVisible().catch(() => false)) {
               await nextBtn.click({ timeout: 8000 }).catch(() => {});
+              await uploadPage
+                .evaluate(() => {
+                  const nBtn = document.querySelector(
+                    'ytcp-uploads-dialog #next-button button, #next-button button'
+                  ) as HTMLElement | null;
+                  if (nBtn) nBtn.click();
+                })
+                .catch(() => {});
             }
             // Wait 2 seconds after each Next click so the next tab step loads completely
             await uploadPage.waitForTimeout(2000);
           }
 
-          // Step 5: Select Unlisted (or Private) radio button
-          const targetRadioName = visibility === 'private' ? 'PRIVATE' : 'UNLISTED';
+          // Step 5: Select Unlisted (or Private) radio button and verify it is checked
           const visSelectors = [
             `tp-yt-paper-radio-button[name="${targetRadioName}"]`,
             `#privacy-radios tp-yt-paper-radio-button[name="${targetRadioName}"]`,
@@ -1258,26 +1309,54 @@ export class YtStudioBrowserController {
               break;
             }
           }
+          await uploadPage
+            .evaluate((rName: string) => {
+              const radio = document.querySelector(
+                `tp-yt-paper-radio-button[name="${rName}"], #privacy-radios tp-yt-paper-radio-button[name="${rName}"]`
+              ) as HTMLElement | null;
+              if (radio && radio.getAttribute('aria-checked') !== 'true') {
+                radio.click();
+                const inner = radio.querySelector('#radioContainer, #offRadio') as HTMLElement | null;
+                if (inner) inner.click();
+              }
+            }, targetRadioName)
+            .catch(() => {});
           // Wait 2 seconds after selecting Unlisted / Private
           await uploadPage.waitForTimeout(2000);
 
-          // Wait ONLY until file byte upload finishes (Uploading X% done & Save button enabled).
-          // Do NOT wait for SD processing or Copyright Checks here!
+          // Step 6: Wait until file byte upload finishes (Uploading X% done & Save button enabled),
+          // then click Save (#done-button) and VERIFY the Visibility step actually closes!
           const deadline = Date.now() + 150_000;
           while (Date.now() < deadline) {
             if (!shareUrl) {
               shareUrl = await this.extractShareUrlFromUploadModal(uploadPage, ignoreVideoIds);
             }
-            const doneBtn = uploadPage.locator('#done-button, ytcp-button#done-button').first();
-            const isDisabled = await doneBtn.getAttribute('disabled').catch(() => null);
-            const progressText = await uploadPage
-              .locator('ytcp-video-upload-progress, .progress-label')
-              .first()
-              .innerText()
-              .catch(() => '');
+            const readyToSave = await uploadPage
+              .evaluate(() => {
+                const host = document.querySelector(
+                  'ytcp-uploads-dialog #done-button, ytcp-button#done-button, #done-button'
+                ) as HTMLElement | null;
+                const innerBtn = host?.querySelector('button') as HTMLButtonElement | null;
+                const progEl = document.querySelector(
+                  'ytcp-uploads-dialog ytcp-video-upload-progress, ytcp-video-upload-progress, .progress-label'
+                ) as HTMLElement | null;
+                const progTxt = (progEl?.innerText || progEl?.textContent || '').trim();
+                const stillUploading = /uploading\s+\d*%/i.test(progTxt);
+                const hostDisabled =
+                  !host ||
+                  host.hasAttribute('disabled') ||
+                  host.getAttribute('aria-disabled') === 'true';
+                const innerDisabled = Boolean(
+                  innerBtn &&
+                    (innerBtn.disabled ||
+                      innerBtn.hasAttribute('disabled') ||
+                      innerBtn.getAttribute('aria-disabled') === 'true')
+                );
+                return !stillUploading && !hostDisabled && !innerDisabled;
+              })
+              .catch(() => false);
 
-            const stillUploading = /uploading\s+\d+%/i.test(progressText);
-            if (!stillUploading && isDisabled === null) {
+            if (readyToSave) {
               break;
             }
             await uploadPage.waitForTimeout(1000);
@@ -1287,10 +1366,50 @@ export class YtStudioBrowserController {
             shareUrl = await this.extractShareUrlFromUploadModal(uploadPage, ignoreVideoIds);
           }
 
-          // Click Save / Done button and wait 2 seconds
-          const doneBtn = uploadPage.locator('#done-button, ytcp-button#done-button, button:has-text("Save")').first();
-          await doneBtn.click({ timeout: 15000 });
-          await uploadPage.waitForTimeout(2000);
+          // Click Save / Done button and verify the Visibility dialog closes (retry up to 6 times if Save didn't register)
+          for (let saveTry = 1; saveTry <= 6; saveTry++) {
+            const doneBtn = uploadPage
+              .locator(
+                'ytcp-uploads-dialog #done-button button, ytcp-uploads-dialog #done-button, #done-button button, ytcp-button#done-button, button:has-text("Save")'
+              )
+              .first();
+            if (await doneBtn.isVisible().catch(() => false)) {
+              await doneBtn.scrollIntoViewIfNeeded().catch(() => {});
+              await doneBtn.click({ timeout: 8000, force: true }).catch(() => {});
+            }
+            await uploadPage
+              .evaluate(() => {
+                const host = document.querySelector(
+                  'ytcp-uploads-dialog #done-button, ytcp-button#done-button, #done-button'
+                ) as HTMLElement | null;
+                const innerBtn = host?.querySelector('button') as HTMLElement | null;
+                if (innerBtn) innerBtn.click();
+                else if (host) host.click();
+              })
+              .catch(() => {});
+
+            // Wait 2.5 seconds after clicking Save
+            await uploadPage.waitForTimeout(2500);
+
+            if (!shareUrl) {
+              shareUrl = await this.extractShareUrlFromUploadModal(uploadPage, ignoreVideoIds);
+            }
+
+            // Check if the Visibility step (#done-button) has closed or transitioned to post-upload dialog
+            const doneStillVisible = await uploadPage
+              .locator('ytcp-uploads-dialog #done-button')
+              .first()
+              .isVisible()
+              .catch(() => false);
+            const postSavePopupVisible = await uploadPage
+              .locator('ytcp-uploads-still-processing-dialog, ytcp-video-share-dialog')
+              .first()
+              .isVisible()
+              .catch(() => false);
+            if (!doneStillVisible || postSavePopupVisible) {
+              break;
+            }
+          }
 
           if (!shareUrl) {
             shareUrl = await this.extractShareUrlFromUploadModal(uploadPage, ignoreVideoIds);
@@ -1357,15 +1476,6 @@ export class YtStudioBrowserController {
           const msg = err instanceof Error ? err.message : String(err);
           lastErr = err instanceof Error ? err : new Error(msg);
 
-          const limitOnError = await this.detectDailyUploadLimitOnPage(uploadPage).catch(() => null);
-          if (limitOnError || msg.startsWith('YT_DAILY_UPLOAD_LIMIT_REACHED')) {
-            const limitReason = limitOnError || msg.replace(/^YT_DAILY_UPLOAD_LIMIT_REACHED:\s*/, '');
-            this.markDailyUploadLimitReached(`YouTube daily upload limit reached (${limitReason})`);
-            await this.dismissAllUploadDialogs(uploadPage).catch(() => {});
-            await uploadPage.waitForTimeout(2000).catch(() => {});
-            throw new Error(`YT_DAILY_UPLOAD_LIMIT_REACHED: ${limitReason}`);
-          }
-
           this.log(
             'upload error',
             `[W${String(windowNumber).padStart(2, '0')}] Attempt ${attempt}/2 failed: ${msg}`,
@@ -1401,7 +1511,7 @@ export class YtStudioBrowserController {
    */
   async checkAndVerifyContentPage(opts?: {
     scanId?: string;
-    expectedWindows?: Array<{ windowNumber: number; clipPath?: string; title?: string }>;
+    expectedWindows?: Array<{ windowNumber: number; clipPath?: string; title?: string; videoId?: string }>;
     waitForSdReady?: boolean;
     maxWaitMs?: number;
     username?: string;
@@ -1428,17 +1538,19 @@ export class YtStudioBrowserController {
       await this.dismissAllUploadDialogs(page).catch(() => {});
     }
 
-    // 2. Navigate to Channel Content page (`https://studio.youtube.com/channel/<id>/videos/upload`)
+    // 2. Navigate to clean Channel Content page (`https://studio.youtube.com/channel/<id>/videos/upload?filter=%5B%5D`)
+    // IMPORTANT: Never leave `?d=ud` in the URL, otherwise `page.reload()` re-opens the Upload Video modal!
     const ch = await this.verifyOrLockChannel(page, username).catch(() => ({
       channelId: this.channelId,
       channelHandle: this.channelHandle,
     }));
     const targetChannelId = ch.channelId || this.channelId;
     const contentUrl = targetChannelId
-      ? `https://studio.youtube.com/channel/${targetChannelId}/videos/upload`
+      ? `https://studio.youtube.com/channel/${targetChannelId}/videos/upload?filter=%5B%5D`
       : 'https://studio.youtube.com';
 
-    if (!page.url().includes('/videos/upload')) {
+    const curUrl = page.url();
+    if (!curUrl.includes('/videos/upload') || curUrl.includes('d=ud')) {
       this.log('content check', `Opening YouTube Studio Content page (${contentUrl})...`, 'info');
       await page
         .goto(contentUrl, {
@@ -1446,7 +1558,12 @@ export class YtStudioBrowserController {
           timeout: 45000,
         })
         .catch(() => {});
-      await page.waitForTimeout(2800);
+      await page
+        .locator('ytcp-video-row')
+        .first()
+        .waitFor({ state: 'visible', timeout: 15000 })
+        .catch(() => {});
+      await page.waitForTimeout(2000);
 
       if (!page.url().includes('/videos')) {
         const contentNav = page
@@ -1456,17 +1573,26 @@ export class YtStudioBrowserController {
           .first();
         if (await contentNav.isVisible().catch(() => false)) {
           await contentNav.click({ timeout: 6000 }).catch(() => {});
-          await page.waitForTimeout(2500);
+          await page
+            .locator('ytcp-video-row')
+            .first()
+            .waitFor({ state: 'visible', timeout: 15000 })
+            .catch(() => {});
+          await page.waitForTimeout(2000);
         }
       }
     } else {
       await this.dismissAllUploadDialogs(page).catch(() => {});
+      await page
+        .locator('ytcp-video-row')
+        .first()
+        .waitFor({ state: 'visible', timeout: 10000 })
+        .catch(() => {});
     }
 
     const scanPrefix = scanId && scanId !== 'test' && scanId !== 'default' ? scanId.slice(0, 8) : null;
     const startTime = Date.now();
-    let lastReloadAt = Date.now();
-    let lastLoggedSignature = '';
+    let refreshCycle = 0;
 
     const readRowsFromDom = async (): Promise<YtContentVideoItem[]> => {
       return page
@@ -1486,8 +1612,8 @@ export class YtStudioBrowserController {
           }> = [];
 
           for (const row of rows) {
-            const titleEl = row.querySelector('#video-title, a#video-title');
-            const title = (titleEl?.textContent || '').trim();
+            const titleEl = row.querySelector('#video-title, a#video-title') as HTMLElement | null;
+            const title = (titleEl?.innerText || titleEl?.textContent || '').replace(/\s+/g, ' ').trim();
 
             let videoId = '';
             const anchors = Array.from(row.querySelectorAll('a[href]'));
@@ -1514,51 +1640,87 @@ export class YtStudioBrowserController {
 
             const ytUrl = `https://youtu.be/${videoId}`;
             const mTitle = title.match(/^cmt-([a-zA-Z0-9_-]+)-w(\d+)\b/i);
+            const mWinFile = !mTitle ? title.match(/\bwin-(\d+)-f\d+/i) : null;
             const rowScanPrefix = mTitle ? mTitle[1] : null;
-            const windowNumber = mTitle ? Number(mTitle[2]) : null;
+            const windowNumber = mTitle
+              ? Number(mTitle[2])
+              : mWinFile
+                ? Number(mWinFile[1])
+                : null;
 
+            const visLabelEl = row.querySelector(
+              '#visibility-label, ytcp-video-list-cell-visibility #visibility-label, .tablecell-visibility #visibility-label'
+            ) as HTMLElement | null;
             const visCell = row.querySelector(
               '.tablecell-visibility, ytcp-video-list-cell-visibility, #visibility-label'
-            );
+            ) as HTMLElement | null;
             const restCell = row.querySelector(
               '.tablecell-restrictions, ytcp-video-list-cell-restrictions'
-            );
-            const rowText = (row.textContent || '').replace(/\s+/g, ' ').trim();
-            const rawVisText = (visCell?.textContent || '').replace(/\s+/g, ' ').trim();
-            const restrictions = (restCell?.textContent || '').replace(/\s+/g, ' ').trim() ||
+            ) as HTMLElement | null;
+            const dateCell = row.querySelector(
+              '.tablecell-date, ytcp-video-list-cell-date'
+            ) as HTMLElement | null;
+
+            const rowText = ((row as HTMLElement).innerText || row.textContent || '')
+              .replace(/\s+/g, ' ')
+              .trim();
+            const rawVisText = (
+              visLabelEl?.innerText ||
+              visCell?.innerText ||
+              visLabelEl?.textContent ||
+              visCell?.textContent ||
+              ''
+            )
+              .replace(/\s+/g, ' ')
+              .trim();
+            const dateText = (dateCell?.innerText || dateCell?.textContent || '')
+              .replace(/\s+/g, ' ')
+              .trim();
+            const restrictions =
+              (restCell?.innerText || restCell?.textContent || '').replace(/\s+/g, ' ').trim() ||
               (/copyright|claimed/i.test(rowText) ? 'Copyright' : 'None');
 
-            const isBlocked = /\bblocked\b/i.test(
-              `${rawVisText} ${restrictions} ${rowText}`
-            );
+            // User rule: Blocked video works identically to Unlisted — treat Blocked as SD-processed & ready!
+            const isBlocked = /\bblocked\b/i.test(`${rawVisText} ${restrictions} ${rowText}`);
 
+            // Detect if video is still uploading or processing SD:
+            // On YT Studio Content page, while SD is processing, Visibility shows "Pending" / "Processing" / "Uploading"
+            // or Date/status cell shows "Uploading X%" / "Processing will begin shortly" / "Processing up to SD" / "Processing..."
+            const hasExplicitReadyVisibility = /\b(unlisted|private|public)\b/i.test(rawVisText);
             const isUploadingOrSdPending =
               !isBlocked &&
-              (/\b(uploading|processing\s+up\s+to\s+sd|processing\s+will\s+begin|pending|draft|checking)\b/i.test(
-                rawVisText
+              (/\b(uploading|processing\s+up\s+to\s+sd|processing\s+sd|processing\s+will\s+begin|pending|draft|checking)\b/i.test(
+                `${rawVisText} ${dateText}`
               ) ||
-                /\buploading\s+\d+%/i.test(rowText) ||
-                /\bprocessing\s+up\s+to\s+sd\b/i.test(rowText));
+                /\buploading\s+\d*%/i.test(rowText) ||
+                /\bprocessing\s+(up\s+to\s+sd|sd|will\s+begin)\b/i.test(rowText) ||
+                (!hasExplicitReadyVisibility &&
+                  /\b(pending|processing|uploading|draft)\b/i.test(`${rawVisText} ${dateText} ${rowText}`)));
 
             const visibility = isBlocked
               ? 'Unlisted (Blocked)'
-              : rawVisText ||
-                (/unlisted/i.test(rowText)
-                  ? 'Unlisted'
-                  : /private/i.test(rowText)
-                    ? 'Private'
-                    : /public/i.test(rowText)
-                      ? 'Public'
-                      : /pending|processing/i.test(rowText)
-                        ? 'Processing SD'
-                        : 'Unlisted');
+              : isUploadingOrSdPending
+                ? 'Processing SD'
+                : hasExplicitReadyVisibility
+                  ? /unlisted/i.test(rawVisText)
+                    ? 'Unlisted'
+                    : /private/i.test(rawVisText)
+                      ? 'Private'
+                      : 'Public'
+                  : /unlisted/i.test(rowText)
+                    ? 'Unlisted'
+                    : /private/i.test(rowText)
+                      ? 'Private'
+                      : /public/i.test(rowText)
+                        ? 'Public'
+                        : 'Processing SD';
 
             const isUnlistedOrPrivateReady =
-              !isUploadingOrSdPending &&
-              (isBlocked || /\b(unlisted|private|public|blocked)\b/i.test(visibility));
+              isBlocked ||
+              (!isUploadingOrSdPending && /\b(unlisted|private|public|blocked)\b/i.test(visibility));
 
             const hasClaim =
-              isBlocked || /\b(copyright|claimed|blocked)\b/i.test(restrictions + ' ' + rowText);
+              isBlocked || /\b(copyright|claimed|blocked)\b/i.test(`${restrictions} ${rowText}`);
 
             extracted.push({
               title: title || videoId,
@@ -1579,16 +1741,27 @@ export class YtStudioBrowserController {
         .catch(() => []);
     };
 
+    const matchesExpectedWindow = (
+      exp: { windowNumber: number; clipPath?: string; title?: string; videoId?: string },
+      item: YtContentVideoItem
+    ): boolean => {
+      if (exp.videoId && item.videoId && exp.videoId === item.videoId) return true;
+      if (exp.title && item.title && exp.title.toLowerCase() === item.title.toLowerCase()) return true;
+      if (
+        exp.windowNumber === item.windowNumber &&
+        (!scanPrefix || !item.scanPrefix || item.scanPrefix === scanPrefix)
+      ) {
+        return true;
+      }
+      return false;
+    };
+
     const syncSidecarsForItems = (items: YtContentVideoItem[]) => {
       for (const item of items) {
         if (!item.videoId || !item.ytUrl) continue;
         // 1. Check explicit expectedWindows list
         for (const exp of expectedWindows) {
-          if (
-            (exp.title && exp.title === item.title) ||
-            (exp.windowNumber === item.windowNumber &&
-              (!scanPrefix || !item.scanPrefix || item.scanPrefix === scanPrefix))
-          ) {
+          if (matchesExpectedWindow(exp, item)) {
             if (exp.clipPath && fs.existsSync(exp.clipPath)) {
               saveClipYtSidecar(exp.clipPath, {
                 scanId: scanId || item.scanPrefix || 'scan',
@@ -1602,12 +1775,16 @@ export class YtStudioBrowserController {
           }
         }
         // 2. Also auto-match any clip file in data/media/<scanId>/clips/win-<windowNumber>-*.mp4
-        if (item.windowNumber !== null && item.scanPrefix) {
+        if (item.windowNumber !== null && (item.scanPrefix || scanId)) {
           try {
             if (fs.existsSync(MEDIA_DIR)) {
               const scanDirs = fs
                 .readdirSync(MEDIA_DIR)
-                .filter((d) => d === scanId || d.startsWith(item.scanPrefix!));
+                .filter(
+                  (d) =>
+                    d === scanId ||
+                    (item.scanPrefix ? d.startsWith(item.scanPrefix) : false)
+                );
               for (const sDir of scanDirs) {
                 const clipsFolder = path.join(MEDIA_DIR, sDir, 'clips');
                 if (!fs.existsSync(clipsFolder)) continue;
@@ -1641,14 +1818,7 @@ export class YtStudioBrowserController {
       // Filter relevant items for this scan (or all cmt-* items if no expectedWindows specified)
       const relevantItems =
         expectedWindows.length > 0
-          ? allItems.filter((it) =>
-              expectedWindows.some(
-                (exp) =>
-                  (exp.title && exp.title === it.title) ||
-                  (exp.windowNumber === it.windowNumber &&
-                    (!scanPrefix || !it.scanPrefix || it.scanPrefix === scanPrefix))
-              )
-            )
+          ? allItems.filter((it) => expectedWindows.some((exp) => matchesExpectedWindow(exp, it)))
           : scanPrefix
             ? allItems.filter((it) => !it.scanPrefix || it.scanPrefix === scanPrefix)
             : allItems;
@@ -1661,7 +1831,7 @@ export class YtStudioBrowserController {
       const claimedCount = relevantItems.filter((it) => it.hasClaim).length;
       const allReady =
         expectedCount > 0
-          ? uploadedCount >= expectedCount && readyCount >= expectedCount
+          ? uploadedCount >= expectedCount && readyCount >= expectedCount && processingCount === 0
           : uploadedCount > 0 && processingCount === 0;
 
       const summary: YtContentProgressSummary = {
@@ -1679,19 +1849,16 @@ export class YtStudioBrowserController {
       this.contentProgress = summary;
       onProgress?.(summary);
 
-      const sig = `${uploadedCount}/${expectedCount}|${readyCount}|${processingCount}|${claimedCount}`;
-      if (sig !== lastLoggedSignature) {
-        lastLoggedSignature = sig;
-        const linksPreview = summary.items
-          .slice(0, 3)
-          .map((i) => `${i.title}->${i.ytUrl}`)
-          .join(', ');
-        this.log(
-          'content progress',
-          `Content: ${uploadedCount}/${expectedCount || uploadedCount} uploaded · ${readyCount}/${expectedCount || uploadedCount} SD ready (Unlisted)${processingCount > 0 ? ` · ${processingCount} processing SD` : ''}${claimedCount > 0 ? ` · ${claimedCount} claimed (link OK)` : ''}${linksPreview ? ` [${linksPreview}]` : ''}`,
-          allReady ? 'ok' : 'info'
-        );
-      }
+      // Always log progress on initial check and on every 15-second refresh cycle so user sees live 15s updates
+      const linksPreview = summary.items
+        .slice(0, 3)
+        .map((i) => `${i.title}->${i.ytUrl}`)
+        .join(', ');
+      this.log(
+        'content progress',
+        `Content${refreshCycle > 0 ? ` (check #${refreshCycle + 1})` : ''}: ${uploadedCount}/${expectedCount || uploadedCount} uploaded · ${readyCount}/${expectedCount || uploadedCount} SD ready (Unlisted)${processingCount > 0 ? ` · ${processingCount} processing SD` : ''}${claimedCount > 0 ? ` · ${claimedCount} claimed/blocked (treated as Unlisted)` : ''}${linksPreview ? ` [${linksPreview}]` : ''}`,
+        allReady ? 'ok' : 'info'
+      );
 
       if (
         this.stopRequested ||
@@ -1709,14 +1876,23 @@ export class YtStudioBrowserController {
       }
       if (this.stopRequested) break;
 
-      lastReloadAt = Date.now();
+      refreshCycle++;
       this.log(
         'content refresh',
-        `Refreshing YouTube Studio Content page (15s interval) — ${readyCount}/${expectedCount || uploadedCount} ready, ${processingCount} still processing SD...`,
+        `Refreshing YouTube Studio Content page (15s check #${refreshCycle}) — ${readyCount}/${expectedCount || uploadedCount} SD ready, ${processingCount} still processing SD...`,
         'info'
       );
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-      await page.waitForTimeout(2500);
+      if (page.url().includes('d=ud') || !page.url().includes('/videos/upload')) {
+        await page.goto(contentUrl, { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
+      } else {
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
+      }
+      await page
+        .locator('ytcp-video-row')
+        .first()
+        .waitFor({ state: 'visible', timeout: 15000 })
+        .catch(() => {});
+      await page.waitForTimeout(2000);
       await this.dismissAllUploadDialogs(page).catch(() => {});
     }
 
