@@ -606,6 +606,7 @@ export function Dashboard() {
             <YtStudioPanel
               studio={settings?.studio}
               scanId={scan?.id || scanId}
+              scan={scan}
               onRefresh={() => void mutateSettings()}
             />
             <ModelBoard scan={scan} usage={data?.usage || null} />

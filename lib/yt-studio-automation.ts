@@ -1231,29 +1231,62 @@ export class YtStudioBrowserController {
           // Wait 2 seconds after details modal opens
           await uploadPage.waitForTimeout(2000);
 
-          // Step 2: Set title
-          await titleBox.click({ timeout: 5000 });
-          await uploadPage.waitForTimeout(500);
+          // Step 2: Set title reliably via Playwright + DOM execCommand so it never stays as default filename
+          await titleBox.click({ timeout: 5000 }).catch(() => {});
+          await uploadPage.waitForTimeout(400);
           await uploadPage.keyboard.press('Control+A').catch(() => {});
           await uploadPage.keyboard.press('Backspace').catch(() => {});
           await titleBox.fill(title).catch(async () => {
             await uploadPage.keyboard.type(title, { delay: 15 });
           });
+          await uploadPage
+            .evaluate((newTitle: string) => {
+              const tb = document.querySelector(
+                'ytcp-social-suggestions-textbox#title-textarea #textbox, #title-textarea #textbox, div#textbox[aria-label*="Add a title"]'
+              ) as HTMLElement | null;
+              if (tb && (tb.textContent || '').trim() !== newTitle) {
+                tb.focus();
+                document.execCommand('selectAll', false, undefined);
+                document.execCommand('insertText', false, newTitle);
+                if ((tb.textContent || '').trim() !== newTitle) {
+                  tb.textContent = newTitle;
+                }
+                tb.dispatchEvent(new Event('input', { bubbles: true }));
+                tb.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+            }, title)
+            .catch(() => {});
           // Wait 2 seconds after setting title
           await uploadPage.waitForTimeout(2000);
 
-          // Step 3: Select "No, it's not made for kids"
+          // Step 3: Select "No, it's not made for kids" (scroll inside modal & verify aria-checked="true" so Next is never blocked!)
           const notMfkSelectors = [
             'tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]',
             '#audience tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]',
             'tp-yt-paper-radio-button:has-text("No, it\'s not made for kids")',
             'tp-yt-paper-radio-button:has-text("not made for kids")',
           ];
+          await uploadPage
+            .evaluate(() => {
+              const mfk = document.querySelector(
+                'tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"], #audience tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]'
+              ) as HTMLElement | null;
+              if (mfk) {
+                mfk.scrollIntoView({ block: 'center' });
+                mfk.click();
+                const inner = mfk.querySelector('#radioContainer, #offRadio') as HTMLElement | null;
+                if (inner) inner.click();
+              }
+            })
+            .catch(() => {});
           for (const sel of notMfkSelectors) {
             const radio = uploadPage.locator(sel).first();
             if (await radio.isVisible().catch(() => false)) {
               await radio.scrollIntoViewIfNeeded().catch(() => {});
-              await radio.click({ timeout: 5000 }).catch(() => {});
+              const isChecked = await radio.getAttribute('aria-checked').catch(() => null);
+              if (isChecked !== 'true') {
+                await radio.click({ timeout: 5000 }).catch(() => {});
+              }
               break;
             }
           }
@@ -1262,7 +1295,7 @@ export class YtStudioBrowserController {
 
           let shareUrl = await this.extractShareUrlFromUploadModal(uploadPage, ignoreVideoIds);
 
-          // Step 4: Click Next until the Visibility radio buttons appear (usually 3 clicks: Video elements -> Checks -> Visibility) with 2s wait after each click!
+          // Step 4: Advance to Visibility step (click Visibility step badge or Next button once per 2s step)
           const targetRadioName = visibility === 'private' ? 'PRIVATE' : 'UNLISTED';
           const visRadioLocator = uploadPage
             .locator(
@@ -1281,15 +1314,16 @@ export class YtStudioBrowserController {
               break;
             }
             if (await nextBtn.isVisible().catch(() => false)) {
-              await nextBtn.click({ timeout: 8000 }).catch(() => {});
-              await uploadPage
-                .evaluate(() => {
-                  const nBtn = document.querySelector(
-                    'ytcp-uploads-dialog #next-button button, #next-button button'
-                  ) as HTMLElement | null;
-                  if (nBtn) nBtn.click();
-                })
-                .catch(() => {});
+              await nextBtn.click({ timeout: 8000 }).catch(async () => {
+                await uploadPage
+                  .evaluate(() => {
+                    const nBtn = document.querySelector(
+                      'ytcp-uploads-dialog #next-button button, #next-button button, ytcp-uploads-dialog #next-button'
+                    ) as HTMLElement | null;
+                    if (nBtn) nBtn.click();
+                  })
+                  .catch(() => {});
+              });
             }
             // Wait 2 seconds after each Next click so the next tab step loads completely
             await uploadPage.waitForTimeout(2000);
@@ -1640,7 +1674,7 @@ export class YtStudioBrowserController {
 
             const ytUrl = `https://youtu.be/${videoId}`;
             const mTitle = title.match(/^cmt-([a-zA-Z0-9_-]+)-w(\d+)\b/i);
-            const mWinFile = !mTitle ? title.match(/\bwin-(\d+)-f\d+/i) : null;
+            const mWinFile = !mTitle ? title.match(/\bwin[-_\s]+(\d+)[-_\s]+f\d+/i) : null;
             const rowScanPrefix = mTitle ? mTitle[1] : null;
             const windowNumber = mTitle
               ? Number(mTitle[2])
@@ -1678,46 +1712,54 @@ export class YtStudioBrowserController {
               .trim();
             const restrictions =
               (restCell?.innerText || restCell?.textContent || '').replace(/\s+/g, ' ').trim() ||
-              (/copyright|claimed/i.test(rowText) ? 'Copyright' : 'None');
+              (/copyright|claimed/i.test(rowText)
+                ? 'Copyright'
+                : /checking/i.test(rowText)
+                  ? 'Checking...'
+                  : 'None');
 
-            // User rule: Blocked video works identically to Unlisted — treat Blocked as SD-processed & ready!
+            // User rules:
+            // 1. Blocked video works identically to Unlisted — treat Blocked as ready!
+            // 2. "Checking..." state & "Draft" state also have working YouTube links on Gemini — treat Unlisted, Draft, and Checking as Successful / Ready!
             const isBlocked = /\bblocked\b/i.test(`${rawVisText} ${restrictions} ${rowText}`);
+            const isChecking = /\bchecking\b/i.test(`${restrictions} ${rawVisText} ${dateText} ${rowText}`);
+            const isDraft = /\b(draft|edit\s+draft)\b/i.test(`${rawVisText} ${rowText}`);
+            const hasExplicitReadyVisibility = /\b(unlisted|private|public|draft)\b/i.test(rawVisText);
 
-            // Detect if video is still uploading or processing SD:
-            // On YT Studio Content page, while SD is processing, Visibility shows "Pending" / "Processing" / "Uploading"
-            // or Date/status cell shows "Uploading X%" / "Processing will begin shortly" / "Processing up to SD" / "Processing..."
-            const hasExplicitReadyVisibility = /\b(unlisted|private|public)\b/i.test(rawVisText);
-            const isUploadingOrSdPending =
+            // A video is ONLY still uploading/processing SD if it is actively uploading bytes ("Uploading X%")
+            // or "Processing will begin shortly" / "Processing up to SD" AND is NOT yet in Unlisted, Draft, Checking, or Blocked state!
+            const isActivelyUploadingOrPreSd =
               !isBlocked &&
-              (/\b(uploading|processing\s+up\s+to\s+sd|processing\s+sd|processing\s+will\s+begin|pending|draft|checking)\b/i.test(
-                `${rawVisText} ${dateText}`
-              ) ||
-                /\buploading\s+\d*%/i.test(rowText) ||
-                /\bprocessing\s+(up\s+to\s+sd|sd|will\s+begin)\b/i.test(rowText) ||
-                (!hasExplicitReadyVisibility &&
-                  /\b(pending|processing|uploading|draft)\b/i.test(`${rawVisText} ${dateText} ${rowText}`)));
+              !isChecking &&
+              !isDraft &&
+              !hasExplicitReadyVisibility &&
+              (/\buploading\s*\d*%?/i.test(`${rawVisText} ${dateText} ${rowText}`) ||
+                /\bprocessing\s+(up\s+to\s+sd|sd|will\s+begin|video)\b/i.test(
+                  `${rawVisText} ${dateText} ${rowText}`
+                ) ||
+                /\bpending\b/i.test(rawVisText));
 
             const visibility = isBlocked
               ? 'Unlisted (Blocked)'
-              : isUploadingOrSdPending
-                ? 'Processing SD'
-                : hasExplicitReadyVisibility
-                  ? /unlisted/i.test(rawVisText)
-                    ? 'Unlisted'
+              : /unlisted/i.test(rawVisText) || /unlisted/i.test(rowText)
+                ? isChecking
+                  ? 'Unlisted (Checking)'
+                  : 'Unlisted'
+                : isDraft
+                  ? isChecking
+                    ? 'Draft (Checking)'
+                    : 'Draft'
+                  : isChecking
+                    ? 'Checking'
                     : /private/i.test(rawVisText)
                       ? 'Private'
-                      : 'Public'
-                  : /unlisted/i.test(rowText)
-                    ? 'Unlisted'
-                    : /private/i.test(rowText)
-                      ? 'Private'
-                      : /public/i.test(rowText)
+                      : /public/i.test(rawVisText)
                         ? 'Public'
-                        : 'Processing SD';
+                        : isActivelyUploadingOrPreSd
+                          ? 'Processing SD'
+                          : 'Unlisted';
 
-            const isUnlistedOrPrivateReady =
-              isBlocked ||
-              (!isUploadingOrSdPending && /\b(unlisted|private|public|blocked)\b/i.test(visibility));
+            const isReadyForGemini = !isActivelyUploadingOrPreSd;
 
             const hasClaim =
               isBlocked || /\b(copyright|claimed|blocked)\b/i.test(`${restrictions} ${rowText}`);
@@ -1730,8 +1772,8 @@ export class YtStudioBrowserController {
               scanPrefix: rowScanPrefix,
               visibility,
               restrictions,
-              isReady: isUnlistedOrPrivateReady,
-              isProcessingSd: !isUnlistedOrPrivateReady,
+              isReady: isReadyForGemini,
+              isProcessingSd: !isReadyForGemini,
               hasClaim,
             });
           }

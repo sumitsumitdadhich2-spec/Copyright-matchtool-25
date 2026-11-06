@@ -171,6 +171,12 @@ export interface ParallelWindowState extends ParallelWindowSpec {
   rawResponseText?: string
   matches?: ChunkMatch[]
   error?: string | null
+  ytUploadStatus?: 'QUEUED' | 'EXTRACTING' | 'UPLOADING' | 'READY' | 'FAILED' | 'STOPPED'
+  ytUrl?: string | null
+  ytVideoId?: string | null
+  ytVisibility?: string | null
+  ytStageText?: string | null
+  ytError?: string | null
 }
 
 export interface ParallelWorkerCardSnapshot {
@@ -4226,9 +4232,175 @@ export class StudioParallelManager {
     }
   }
 
+  public stopWindowYtUpload(windowIdOrNumber: string | number) {
+    const win = this.windows.find(
+      (w) => w.id === String(windowIdOrNumber) || w.windowNumber === Number(windowIdOrNumber),
+    )
+    if (!win) return
+    this.stoppedWindowIds.add(win.id)
+    win.ytUploadStatus = 'STOPPED'
+    win.ytStageText = 'Stopped by user'
+    if (win.stage === 'uploading to YT') {
+      win.stage = 'stopped'
+    }
+    this.persistStateToDisk()
+  }
+
+  public async uploadSingleWindowClipToYt(params: {
+    windowId?: string
+    windowNumber?: number
+    username?: string
+    forceUpload?: boolean
+  }): Promise<{ ok: boolean; ytUrl?: string; ytVideoId?: string; message?: string }> {
+    const { windowId, windowNumber, username = 'admin', forceUpload = true } = params
+    const win = this.windows.find(
+      (w) =>
+        (windowId && w.id === windowId) ||
+        (typeof windowNumber === 'number' && w.windowNumber === windowNumber),
+    )
+    if (!win) {
+      throw new Error(`Window ${windowId || windowNumber} not found in scan ${this.scanId}`)
+    }
+
+    this.stoppedWindowIds.delete(win.id)
+    win.ytError = null
+    win.ytUploadStatus = 'EXTRACTING'
+    win.ytStageText = 'Extracting window clip...'
+    if (win.status === 'QUEUED') {
+      win.stage = 'Extracting clip...'
+    }
+    this.persistStateToDisk()
+
+    const clipRes = await ensureWindowClip(this.scanId, {
+      windowNumber: win.windowNumber,
+      startSec: win.startSec,
+      endSec: win.endSec,
+    })
+
+    win.ytUploadStatus = 'UPLOADING'
+    win.ytStageText = 'Uploading window clip to YouTube Studio...'
+    if (win.status === 'QUEUED') {
+      win.stage = 'uploading to YT'
+      win.summaryText = 'Uploading window clip to YouTube Studio...'
+    }
+    this.persistStateToDisk()
+
+    const cfg = loadStudioUserConfig(username)
+    const releaseYt = await globalYtStudioUploadGate.acquire()
+    try {
+      const ytRes = await globalYtStudioController.uploadWindowClip({
+        clipPath: clipRes.clipPath,
+        scanId: this.scanId,
+        windowNumber: win.windowNumber,
+        visibility: cfg.ytVisibility || 'unlisted',
+        username,
+        forceUpload,
+        onProgress: (stg) => {
+          win.ytStageText = stg
+          if (win.status === 'QUEUED') {
+            win.stage = stg
+          }
+          this.persistStateToDisk()
+        },
+      })
+
+      win.ytUploadStatus = 'READY'
+      win.ytUrl = ytRes.ytUrl
+      win.ytVideoId = ytRes.ytVideoId
+      win.ytVisibility = 'Unlisted'
+      win.ytStageText = `Ready (Unlisted) -> ${ytRes.ytUrl}`
+      win.ytError = null
+      if (win.status === 'QUEUED') {
+        win.stage = 'link ready'
+        win.summaryText = `YT link ready (${ytRes.ytUrl})`
+      }
+      this.appendCombinedLog({
+        workerId: 'SYS',
+        windowId: win.id,
+        windowNumber: win.windowNumber,
+        windowRange: `${win.startFormatted}–${win.endFormatted}`,
+        level: 'SUCCESS',
+        step: 'YT manual upload complete',
+        message: `Window #${win.windowNumber} (${win.startFormatted}–${win.endFormatted}) uploaded to YouTube -> ${ytRes.ytUrl}`,
+      })
+      this.persistStateToDisk()
+      return {
+        ok: true,
+        ytUrl: ytRes.ytUrl,
+        ytVideoId: ytRes.ytVideoId,
+        message: `Window #${win.windowNumber} uploaded -> ${ytRes.ytUrl}`,
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      win.ytUploadStatus = 'FAILED'
+      win.ytError = msg
+      win.ytStageText = `Upload failed: ${msg}`
+      this.appendCombinedLog({
+        workerId: 'SYS',
+        windowId: win.id,
+        windowNumber: win.windowNumber,
+        windowRange: `${win.startFormatted}–${win.endFormatted}`,
+        level: 'ERROR',
+        step: 'YT manual upload error',
+        message: `Window #${win.windowNumber} (${win.startFormatted}–${win.endFormatted}) upload failed: ${msg}`,
+      })
+      this.persistStateToDisk()
+      throw err
+    } finally {
+      releaseYt()
+    }
+  }
+
+  public async uploadAllWindowClipsToYt(params?: {
+    username?: string
+    onlyFailedOrMissing?: boolean
+  }): Promise<{ uploaded: number; total: number }> {
+    const username = params?.username || this.username || 'admin'
+    const onlyFailedOrMissing = params?.onlyFailedOrMissing ?? true
+    const ordered = [...this.windows].sort(
+      (a, b) => a.priorityRank - b.priorityRank || a.windowNumber - b.windowNumber,
+    )
+    let uploaded = 0
+    for (const w of ordered) {
+      if (this.stoppingAll || this.stoppedWindowIds.has(w.id)) break
+      const existing = readClipYtSidecar(this.scanId, w.windowNumber)
+      if (onlyFailedOrMissing && existing?.ytUrl && existing.ytVideoId && !existing.ytDeleted) {
+        w.ytUploadStatus = 'READY'
+        w.ytUrl = existing.ytUrl
+        w.ytVideoId = existing.ytVideoId
+        w.ytVisibility = w.ytVisibility || 'Unlisted'
+        w.ytStageText = `Ready (${w.ytVisibility}) -> ${existing.ytUrl}`
+        w.ytError = null
+        continue
+      }
+      try {
+        await this.uploadSingleWindowClipToYt({
+          windowId: w.id,
+          windowNumber: w.windowNumber,
+          username,
+          forceUpload: !onlyFailedOrMissing,
+        })
+        uploaded++
+      } catch {
+        // continue to next window
+      }
+    }
+    await globalYtStudioController
+      .checkAndVerifyContentPage({
+        scanId: this.scanId,
+        waitForSdReady: false,
+        username,
+      })
+      .catch(() => {})
+    this.persistStateToDisk()
+    return { uploaded, total: ordered.length }
+  }
+
   public async getLiveSnapshot(captureThumbnails = true): Promise<ParallelScanLiveSnapshot> {
     this.refreshScanMetadataFromStore()
     let clearedSkipped = false
+    const scanPrefix = this.scanId ? this.scanId.slice(0, 8) : ''
+    const ytContentItems = globalYtStudioController.getContentProgress()?.items || []
     for (const w of this.windows) {
       if (w.status === 'SKIPPED' || w.error === 'YT_DAILY_UPLOAD_LIMIT_REACHED') {
         w.status = 'QUEUED'
@@ -4237,6 +4409,46 @@ export class StudioParallelManager {
         w.error = null
         w.summaryText = 'Queued'
         clearedSkipped = true
+      }
+
+      // Sync per-window YouTube upload status (sidecar + live Content table where Unlisted, Draft, Checking, Blocked = READY)
+      const sidecar = readClipYtSidecar(this.scanId, w.windowNumber)
+      const contentMatch = ytContentItems.find(
+        (it) =>
+          (sidecar?.ytVideoId && it.videoId === sidecar.ytVideoId) ||
+          (it.windowNumber === w.windowNumber &&
+            (!it.scanPrefix || !scanPrefix || it.scanPrefix === scanPrefix)),
+      )
+      const resolvedYtUrl = sidecar?.ytUrl || contentMatch?.ytUrl || w.ytUrl || null
+      const resolvedVideoId = sidecar?.ytVideoId || contentMatch?.videoId || w.ytVideoId || null
+      const resolvedVis = contentMatch?.visibility || w.ytVisibility || (resolvedYtUrl ? 'Unlisted' : null)
+
+      if (resolvedYtUrl && !sidecar?.ytDeleted) {
+        w.ytUrl = resolvedYtUrl
+        w.ytVideoId = resolvedVideoId
+        w.ytVisibility = resolvedVis || 'Unlisted'
+        w.ytUploadStatus = 'READY'
+        w.ytStageText = `${w.ytVisibility} · ${resolvedYtUrl}`
+        w.ytError = null
+        if (w.status === 'QUEUED' && (!w.stage || w.stage === 'queued' || w.stage === 'uploading to YT')) {
+          w.stage = 'link ready'
+          w.summaryText = `YT link ready (${resolvedYtUrl})`
+        }
+      } else if (w.stage === 'uploading to YT' || w.ytUploadStatus === 'UPLOADING') {
+        w.ytUploadStatus = 'UPLOADING'
+        w.ytStageText = 'Uploading clip to YouTube Studio...'
+      } else if (w.stage === 'Extracting clip...' || w.ytUploadStatus === 'EXTRACTING') {
+        w.ytUploadStatus = 'EXTRACTING'
+        w.ytStageText = 'Extracting window clip...'
+      } else if (w.ytError) {
+        w.ytUploadStatus = 'FAILED'
+        w.ytStageText = `Upload failed: ${w.ytError}`
+      } else if (w.status === 'STOPPED' || w.ytUploadStatus === 'STOPPED') {
+        w.ytUploadStatus = 'STOPPED'
+        w.ytStageText = 'Stopped'
+      } else {
+        w.ytUploadStatus = 'QUEUED'
+        w.ytStageText = w.stage || 'Queued for YT upload'
       }
     }
     if (clearedSkipped) {

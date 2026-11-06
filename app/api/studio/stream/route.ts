@@ -25,8 +25,13 @@ export async function GET(req: NextRequest) {
 
   const getSnapshotsForRequest = async () => {
     if (target === 'yt') {
-      const ytSnapshot = await globalYtStudioController.getSnapshot(true)
-      return { ok: true, ytSnapshot }
+      const [ytSnapshot, parallelSnapshot] = await Promise.all([
+        globalYtStudioController.getSnapshot(true),
+        scanId && scanId !== 'default'
+          ? getStudioParallelManager(scanId).getLiveSnapshot(false)
+          : Promise.resolve(null),
+      ])
+      return { ok: true, ytSnapshot, parallelSnapshot }
     }
     const [snap, parallelSnapshot] = await Promise.all([
       studioController.getSnapshot(true),

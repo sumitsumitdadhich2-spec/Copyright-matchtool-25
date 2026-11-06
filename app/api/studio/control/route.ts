@@ -131,6 +131,9 @@ export async function POST(req: NextRequest) {
     windowNumber?: number
     tabIndex?: number
     clipPath?: string
+    waitForSdReady?: boolean
+    forceUpload?: boolean
+    onlyFailedOrMissing?: boolean
     ytVisibility?: 'unlisted' | 'private'
     ytAutoDeleteAtEnd?: boolean
     ytUploadConcurrency?: number
@@ -918,12 +921,69 @@ export async function POST(req: NextRequest) {
           username,
         })
         const firstLink = contentSummary.items[0]?.ytUrl || null
+        const parallelSnapshot =
+          targetScanId && targetScanId !== 'default'
+            ? await getStudioParallelManager(targetScanId).getLiveSnapshot(false)
+            : null
         return NextResponse.json({
           ok: true,
           contentProgress: contentSummary,
           ytUrl: firstLink,
-          message: `Content verified: ${contentSummary.uploadedCount} video(s) found · ${contentSummary.readyCount} SD ready (Unlisted)${firstLink ? ` · Latest link: ${firstLink}` : ''}`,
+          message: `Content verified: ${contentSummary.uploadedCount} video(s) found · ${contentSummary.readyCount} Ready (Unlisted / Draft / Checking)${firstLink ? ` · Latest link: ${firstLink}` : ''}`,
           ytSnapshot: await globalYtStudioController.getSnapshot(true),
+          parallelSnapshot,
+        })
+      }
+      case 'yt_upload_window': {
+        const targetScanId = (body.scanId || '').trim()
+        if (!targetScanId) {
+          return NextResponse.json({ ok: false, error: 'Missing scanId' }, { status: 400 })
+        }
+        const parallelMgr = getStudioParallelManager(targetScanId)
+        const res = await parallelMgr.uploadSingleWindowClipToYt({
+          windowId: body.windowId,
+          windowNumber: body.windowNumber,
+          username,
+          forceUpload: body.forceUpload ?? true,
+        })
+        return NextResponse.json({
+          ok: true,
+          ...res,
+          ytSnapshot: await globalYtStudioController.getSnapshot(true),
+          parallelSnapshot: await parallelMgr.getLiveSnapshot(false),
+        })
+      }
+      case 'yt_stop_window_upload': {
+        const targetScanId = (body.scanId || '').trim()
+        if (!targetScanId) {
+          return NextResponse.json({ ok: false, error: 'Missing scanId' }, { status: 400 })
+        }
+        const parallelMgr = getStudioParallelManager(targetScanId)
+        if (body.windowId || body.windowNumber !== undefined) {
+          parallelMgr.stopWindowYtUpload(body.windowId ?? body.windowNumber!)
+        }
+        return NextResponse.json({
+          ok: true,
+          message: `Stopped window upload`,
+          ytSnapshot: await globalYtStudioController.getSnapshot(false),
+          parallelSnapshot: await parallelMgr.getLiveSnapshot(false),
+        })
+      }
+      case 'yt_upload_all_windows': {
+        const targetScanId = (body.scanId || '').trim()
+        if (!targetScanId) {
+          return NextResponse.json({ ok: false, error: 'Missing scanId' }, { status: 400 })
+        }
+        const parallelMgr = getStudioParallelManager(targetScanId)
+        void parallelMgr.uploadAllWindowClipsToYt({
+          username,
+          onlyFailedOrMissing: body.onlyFailedOrMissing ?? true,
+        })
+        return NextResponse.json({
+          ok: true,
+          message: `Started uploading window clips to YouTube Studio for scan ${targetScanId.slice(0, 8)}...`,
+          ytSnapshot: await globalYtStudioController.getSnapshot(true),
+          parallelSnapshot: await parallelMgr.getLiveSnapshot(false),
         })
       }
       case 'yt_upload_test': {
@@ -976,7 +1036,7 @@ export async function POST(req: NextRequest) {
           ok: true,
           ...upRes,
           contentProgress: contentSummary,
-          message: `Uploaded & verified in Content -> ${upRes.ytUrl} (${contentSummary.readyCount}/${contentSummary.expectedCount || 1} SD ready)`,
+          message: `Uploaded & verified in Content -> ${upRes.ytUrl} (${contentSummary.readyCount}/${contentSummary.expectedCount || 1} Ready)`,
           ytSnapshot: await globalYtStudioController.getSnapshot(true),
         })
       }

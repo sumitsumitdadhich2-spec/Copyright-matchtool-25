@@ -1,10 +1,11 @@
 'use client'
 
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
   CheckCircle2,
   Cookie,
+  Copy,
   CornerDownLeft,
   Globe,
   Keyboard,
@@ -12,6 +13,7 @@ import {
   MousePointerClick,
   Pause,
   Play,
+  RotateCcw,
   ShieldCheck,
   Square,
   Trash2,
@@ -20,15 +22,61 @@ import {
 } from 'lucide-react'
 import type { PublicStudioSettings } from '@/lib/studio-settings'
 import type { YtControllerSnapshot } from '@/lib/yt-studio-automation'
+import type { ParallelScanLiveSnapshot, ParallelWindowState } from '@/lib/studio-parallel-manager'
+import {
+  buildParallelWindowsFromMinuteInput,
+  formatParallelTimecode,
+} from '@/lib/studio-window-planner'
+import type { Scan } from '@/lib/types'
 
 interface YtStudioPanelProps {
   studio?: PublicStudioSettings
   scanId?: string | null
+  scan?: Scan | null
   onRefresh?: () => void
 }
 
-export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps) {
+function formatMmSs(sec: number): string {
+  const s = Math.max(0, Math.round(sec))
+  const m = Math.floor(s / 60)
+  const r = s % 60
+  return `${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`
+}
+
+function shortModelBadge(modelName: string | null | undefined): string {
+  const raw = (modelName || '').toLowerCase()
+  if (raw.includes('argon')) return 'Argon'
+  if (raw.includes('3.6')) return '3.6'
+  if (raw.includes('3.1-pro')) return '3.1 Pro'
+  if (raw.includes('3-pro')) return '3 Pro'
+  if (raw.includes('2.5-pro')) return '2.5 Pro'
+  if (raw.includes('3-flash')) return '3 Flash'
+  if (raw.includes('3.1-flash')) return '3.1 Lite'
+  if (raw.includes('2.5-flash-lite')) return '2.5 Lite'
+  if (raw.includes('2.5-flash')) return '2.5 Flash'
+  return '3.8'
+}
+
+function uploadBadgeStyle(status: string): string {
+  switch (status) {
+    case 'READY':
+      return 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+    case 'UPLOADING':
+    case 'EXTRACTING':
+      return 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40 animate-pulse'
+    case 'FAILED':
+      return 'bg-red-500/25 text-red-300 border-red-500/50'
+    case 'STOPPED':
+      return 'bg-zinc-700/50 text-zinc-300 border-zinc-600'
+    case 'QUEUED':
+    default:
+      return 'bg-amber-500/15 text-amber-300 border-amber-500/35'
+  }
+}
+
+export function YtStudioPanel({ studio, scanId, scan, onRefresh }: YtStudioPanelProps) {
   const [snap, setSnap] = useState<YtControllerSnapshot | null>(null)
+  const [parallelSnap, setParallelSnap] = useState<ParallelScanLiveSnapshot | null>(null)
   const [cookieText, setCookieText] = useState('')
   const [busyAction, setBusyAction] = useState<string | null>(null)
   const [statusMsg, setStatusMsg] = useState<string | null>(null)
@@ -55,10 +103,11 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
     setUploadConcurrency(studio.ytUploadConcurrency || 3)
   }, [studio?.ytVisibility, studio?.ytAutoDeleteAtEnd, studio?.ytUploadConcurrency])
 
-  // Poll / SSE stream for YouTube Studio live snapshot
+  // Poll / SSE stream for YouTube Studio live snapshot + current scan's parallel window upload state
   useEffect(() => {
     let active = true
-    const es = new EventSource('/api/studio/stream?target=yt')
+    const qs = scanId ? `?target=yt&scanId=${encodeURIComponent(scanId)}` : '?target=yt'
+    const es = new EventSource(`/api/studio/stream${qs}`)
     es.onmessage = (ev) => {
       if (!active) return
       try {
@@ -69,6 +118,9 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
             setNavUrl(parsed.ytSnapshot.currentUrl)
           }
         }
+        if (parsed?.parallelSnapshot) {
+          setParallelSnap(parsed.parallelSnapshot)
+        }
       } catch {
         // ignore parse errors
       }
@@ -77,7 +129,7 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
       active = false
       es.close()
     }
-  }, [])
+  }, [scanId])
 
   async function callYtControl(payload: Record<string, unknown>, label: string) {
     setBusyAction(label)
@@ -99,6 +151,9 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
       }
       if (data.ytSnapshot) {
         setSnap(data.ytSnapshot)
+      }
+      if (data.parallelSnapshot) {
+        setParallelSnap(data.parallelSnapshot)
       }
       if (data.message) {
         setStatusMsg(String(data.message))
@@ -169,6 +224,59 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
     snap?.channelId ||
     null
 
+  const effectiveMinuteInput = (
+    parallelSnap?.minuteInput ||
+    scan?.studioMinuteInput ||
+    ''
+  ).trim()
+
+  const effectiveMovieDurationSec = useMemo(() => {
+    const cands = [
+      parallelSnap?.movieDurationSec,
+      scan?.movieDuration,
+      scan?.movie360p?.durationSec,
+    ].filter((v): v is number => typeof v === 'number' && Number.isFinite(v) && v > 0)
+    return cands.length > 0 ? Math.min(...cands) : null
+  }, [parallelSnap?.movieDurationSec, scan?.movieDuration, scan?.movie360p?.durationSec])
+
+  const previewWindows = useMemo(() => {
+    if (!effectiveMinuteInput) return []
+    return buildParallelWindowsFromMinuteInput(
+      effectiveMinuteInput,
+      effectiveMovieDurationSec && effectiveMovieDurationSec > 0
+        ? Math.floor(effectiveMovieDurationSec)
+        : undefined,
+    )
+  }, [effectiveMinuteInput, effectiveMovieDurationSec])
+
+  const scanWindows: ParallelWindowState[] = useMemo(
+    () => parallelSnap?.windows ?? [],
+    [parallelSnap?.windows],
+  )
+
+  const queueWaitReason = useMemo(() => {
+    if (scan?.waitingForTicket) {
+      return `Chunk windows ke liye wait (Ticket #${scan.waitingForTicket}${
+        scan.waitingForScanTitle ? `, Scan ${scan.waitingForScanTitle} chal raha hai` : ''
+      })`
+    }
+    return null
+  }, [scan?.waitingForTicket, scan?.waitingForScanTitle])
+
+  const uploadStats = useMemo(() => {
+    let ready = 0
+    let uploading = 0
+    let failed = 0
+    let queued = 0
+    for (const w of scanWindows) {
+      if (w.ytUploadStatus === 'READY' || w.ytUrl) ready++
+      else if (w.ytUploadStatus === 'UPLOADING' || w.ytUploadStatus === 'EXTRACTING') uploading++
+      else if (w.ytUploadStatus === 'FAILED') failed++
+      else queued++
+    }
+    return { ready, uploading, failed, queued, total: scanWindows.length }
+  }, [scanWindows])
+
   return (
     <div className="rounded-xl border border-rose-500/35 bg-zinc-950/90 p-4 space-y-4 shadow-lg">
       {/* Header */}
@@ -181,11 +289,12 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
             <h3 className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
               YouTube Studio — Clip Uploader &amp; Login Assist
               <span className="rounded bg-rose-500/15 border border-rose-500/30 px-2 py-0.5 font-mono text-[10px] text-rose-300">
-                Unlisted Link Flow
+                Unlisted / Draft / Checking = Ready
               </span>
             </h3>
             <p className="text-[11px] text-zinc-400">
-              Uploads extracted 5-min window clips to your dedicated test YouTube channel and attaches <code className="font-mono">https://youtu.be/...</code> links in AI Studio
+              Uploads extracted 5-min window clips to your test YouTube channel and attaches{' '}
+              <code className="font-mono">https://youtu.be/...</code> links in AI Studio (Unlisted, Draft &amp; Checking states work immediately)
             </p>
           </div>
         </div>
@@ -257,7 +366,7 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
             value={cookieText}
             onChange={(e) => setCookieText(e.target.value)}
             rows={3}
-            placeholder='Paste Cookie-Editor JSON array exported from studio.youtube.com or youtube.com...'
+            placeholder="Paste Cookie-Editor JSON array exported from studio.youtube.com or youtube.com..."
             className="w-full rounded border border-zinc-800 bg-zinc-950 p-2 font-mono text-[11px] text-zinc-200 focus:outline-none focus:border-rose-500/50"
           />
 
@@ -324,7 +433,8 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
             <div>
               <span className="font-medium">Auto-delete all channel videos when scan finishes</span>
               <p className="text-[10px] text-zinc-400">
-                Runs Select All &rarr; Delete forever on locked channel {lockedChannel || '(locked on first login)'}
+                Runs Select All &rarr; Delete forever on locked channel{' '}
+                {lockedChannel || '(locked on first login)'}
               </p>
             </div>
             <input
@@ -418,7 +528,8 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
               ·{' '}
               <span className="font-mono text-emerald-300">
                 {snap.contentProgress.readyCount}/
-                {snap.contentProgress.expectedCount || snap.contentProgress.uploadedCount} SD Ready (Unlisted)
+                {snap.contentProgress.expectedCount || snap.contentProgress.uploadedCount} Ready
+                (Unlisted / Draft / Checking)
               </span>
               {snap.contentProgress.processingCount > 0 && (
                 <span className="font-mono text-amber-300">
@@ -450,13 +561,7 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
               >
                 <div className="truncate">
                   <span className="text-zinc-200 font-semibold">{item.title}</span>{' '}
-                  <span
-                    className={
-                      item.isReady
-                        ? 'text-emerald-400'
-                        : 'text-amber-300'
-                    }
-                  >
+                  <span className={item.isReady ? 'text-emerald-400' : 'text-amber-300'}>
                     ({item.visibility}
                     {item.hasClaim ? ' · Claimed' : ''})
                   </span>
@@ -752,6 +857,248 @@ export function YtStudioPanel({ studio, scanId, onRefresh }: YtStudioPanelProps)
           )}
         </div>
       </div>
+
+      {/* ========================================================================
+          PER-SCAN WINDOW UPLOAD PREVIEW & ACTIVE / SAVED UPLOAD WINDOWS SECTION
+          (Shared YT Browser Screen above, Separate Per-Scan Window Upload Control below)
+          ======================================================================== */}
+      {scanId && (previewWindows.length > 0 || scanWindows.length > 0) && (
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-3.5 space-y-3">
+          {/* 1. Window Preview (N Windows · Max 5:00 · no overlap) */}
+          {previewWindows.length > 0 && (
+            <div className="rounded-lg border border-zinc-800 bg-zinc-950/80 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-cyan-300">
+                    Window Preview ({previewWindows.length} Windows · Max 5:00 · no overlap)
+                  </span>
+                  {effectiveMovieDurationSec && effectiveMovieDurationSec > 0 && (
+                    <span className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-300">
+                      <CheckCircle2 className="w-3 h-3" />
+                      All {previewWindows.length} windows within Movie Length (
+                      {formatParallelTimecode(Math.floor(effectiveMovieDurationSec))})
+                    </span>
+                  )}
+                </div>
+                <span className="text-[10px] font-mono text-zinc-400">
+                  Minutes: <strong className="text-zinc-200">{effectiveMinuteInput}</strong>
+                </span>
+              </div>
+
+              <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto pr-1">
+                {previewWindows.map((pw) => (
+                  <span
+                    key={pw.id}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-zinc-800 bg-zinc-900 text-zinc-200 text-[10px] font-mono"
+                    title={`Run ${pw.runLabel} · Part ${pw.partIndex}/${pw.partsInRun} · Priority #${pw.priorityRank}`}
+                  >
+                    <strong className="text-cyan-400">#{pw.windowNumber}</strong>
+                    <span>
+                      {pw.startFormatted}–{pw.endFormatted}
+                    </span>
+                    <span className="text-zinc-500">({formatMmSs(pw.durationSec)})</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* 2. Active / Saved Scan Upload Windows (Per-Scan Status, Retry & Control) */}
+          {scanWindows.length > 0 && (
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-200">
+                    Active / Saved Upload Windows ({scanWindows.length} Windows · Max 5:00 each · no overlap)
+                  </span>
+                  <span className="rounded bg-emerald-500/15 border border-emerald-500/35 px-2 py-0.5 font-mono text-[10px] text-emerald-300">
+                    Ready (Unlisted/Draft/Checking): {uploadStats.ready}/{uploadStats.total}
+                  </span>
+                  {uploadStats.uploading > 0 && (
+                    <span className="rounded bg-cyan-500/15 border border-cyan-500/35 px-2 py-0.5 font-mono text-[10px] text-cyan-300">
+                      Uploading: {uploadStats.uploading}
+                    </span>
+                  )}
+                  {uploadStats.failed > 0 && (
+                    <span className="rounded bg-red-500/15 border border-red-500/35 px-2 py-0.5 font-mono text-[10px] text-red-300">
+                      Failed: {uploadStats.failed}
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() =>
+                      callYtControl(
+                        { action: 'yt_upload_all_windows', onlyFailedOrMissing: true },
+                        'upload_all_missing',
+                      )
+                    }
+                    className="inline-flex items-center gap-1 rounded bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/40 px-2.5 py-1 text-[10px] font-mono font-semibold text-cyan-200 disabled:opacity-50"
+                    title="Upload all windows in this scan that do not have a YouTube link yet"
+                  >
+                    <Upload className="size-3" />
+                    Upload Pending ({uploadStats.total - uploadStats.ready})
+                  </button>
+
+                  {uploadStats.failed > 0 && (
+                    <button
+                      type="button"
+                      disabled={busyAction !== null}
+                      onClick={() =>
+                        callYtControl(
+                          { action: 'yt_upload_all_windows', onlyFailedOrMissing: true },
+                          'retry_failed_uploads',
+                        )
+                      }
+                      className="inline-flex items-center gap-1 rounded bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 px-2.5 py-1 text-[10px] font-mono font-semibold text-amber-200 disabled:opacity-50"
+                    >
+                      <RotateCcw className="size-3" />
+                      Retry Failed ({uploadStats.failed})
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() =>
+                      callYtControl(
+                        { action: 'yt_check_content', waitForSdReady: false },
+                        'sync_content_links',
+                      )
+                    }
+                    className="inline-flex items-center gap-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 px-2.5 py-1 text-[10px] font-mono font-semibold text-emerald-200 disabled:opacity-50"
+                  >
+                    <CheckCircle2 className="size-3" />
+                    Sync Content (Unlisted/Draft/Checking)
+                  </button>
+                </div>
+              </div>
+
+              <div className="text-[10px] font-mono text-zinc-500 flex items-center justify-between">
+                <span>
+                  Scan: <strong className="text-zinc-300">{parallelSnap?.scanName || scan?.movieName || scanId}</strong>
+                </span>
+                <span>Queue Priority: Largest contiguous runs pulled first</span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 max-h-80 overflow-y-auto pr-1">
+                {scanWindows.map((win) => {
+                  const upStatus = win.ytUrl ? 'READY' : win.ytUploadStatus || 'QUEUED'
+                  const visBadge = win.ytVisibility || (win.ytUrl ? 'Unlisted' : null)
+                  const subText = win.ytUrl
+                    ? `${visBadge || 'Ready'} · ${win.ytUrl}`
+                    : win.ytError
+                      ? win.ytError
+                      : queueWaitReason && win.status === 'QUEUED'
+                        ? `${queueWaitReason} · ${shortModelBadge(win.modelName)}`
+                        : `${win.ytStageText || win.stage || 'Queued'} · ${shortModelBadge(win.modelName)}`
+
+                  return (
+                    <div
+                      key={`yt-up-${win.id}`}
+                      className="rounded-lg border border-zinc-800/90 bg-zinc-950/90 px-3 py-2 flex items-center justify-between gap-2 text-xs"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="font-mono font-bold text-zinc-100">
+                            #{win.windowNumber}
+                          </span>
+                          <span className="font-mono text-cyan-300">
+                            {win.startFormatted}–{win.endFormatted}
+                          </span>
+                          <span className="text-[10px] font-mono text-zinc-500">
+                            ({formatMmSs(win.durationSec)})
+                          </span>
+                          <span
+                            className={`px-1.5 py-0.2 rounded border text-[9px] font-mono font-semibold uppercase ${uploadBadgeStyle(
+                              upStatus,
+                            )}`}
+                          >
+                            {upStatus === 'READY'
+                              ? `READY (${visBadge || 'UNLISTED'})`
+                              : upStatus}
+                          </span>
+                        </div>
+
+                        <div className="mt-0.5 text-[10px] font-mono truncate">
+                          {win.ytUrl ? (
+                            <span className="text-emerald-300 font-medium">{subText}</span>
+                          ) : win.ytError ? (
+                            <span className="text-red-300">{subText}</span>
+                          ) : (
+                            <span className="text-zinc-400">{subText}</span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Per-window upload controls: Copy Link, Stop Upload, Upload / Retry Upload */}
+                      <div className="flex items-center gap-1 shrink-0">
+                        {win.ytUrl && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              navigator.clipboard?.writeText(win.ytUrl || '').catch(() => {})
+                              setStatusMsg(`Copied Window #${win.windowNumber} link: ${win.ytUrl}`)
+                            }}
+                            className="p-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700"
+                            title={`Copy link: ${win.ytUrl}`}
+                          >
+                            <Copy className="w-3 h-3" />
+                          </button>
+                        )}
+
+                        {(upStatus === 'UPLOADING' || upStatus === 'EXTRACTING') && (
+                          <button
+                            type="button"
+                            disabled={busyAction !== null}
+                            onClick={() =>
+                              callYtControl(
+                                {
+                                  action: 'yt_stop_window_upload',
+                                  windowId: win.id,
+                                  windowNumber: win.windowNumber,
+                                },
+                                `yt_stop_${win.id}`,
+                              )
+                            }
+                            className="p-1 rounded bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30"
+                            title={`Stop Window #${win.windowNumber} upload`}
+                          >
+                            <Square className="w-3 h-3" />
+                          </button>
+                        )}
+
+                        <button
+                          type="button"
+                          disabled={busyAction !== null}
+                          onClick={() =>
+                            callYtControl(
+                              {
+                                action: 'yt_upload_window',
+                                windowId: win.id,
+                                windowNumber: win.windowNumber,
+                                forceUpload: true,
+                              },
+                              `yt_retry_${win.id}`,
+                            )
+                          }
+                          className="p-1 rounded bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 disabled:opacity-50"
+                          title={`Upload / Retry Window #${win.windowNumber} (${win.startFormatted}–${win.endFormatted})`}
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                        </button>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
