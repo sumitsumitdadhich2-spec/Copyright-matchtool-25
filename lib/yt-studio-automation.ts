@@ -193,6 +193,8 @@ export class YtStudioBrowserController {
   private contentProgress: YtContentProgressSummary | null = null;
   private dailyUploadLimitReached = false;
   private uploadedVideoIdsInSession: Set<string> = new Set();
+  private unlistedFixQueue: Promise<void> = Promise.resolve();
+  private unlistedFixQueuePending = 0;
 
   private ensureInternalCollections(): void {
     if (!this.inFlightClipUploads) {
@@ -209,6 +211,12 @@ export class YtStudioBrowserController {
     }
     if (!this.uploadedVideoIdsInSession) {
       this.uploadedVideoIdsInSession = new Set();
+    }
+    if (!this.unlistedFixQueue) {
+      this.unlistedFixQueue = Promise.resolve();
+    }
+    if (typeof this.unlistedFixQueuePending !== 'number') {
+      this.unlistedFixQueuePending = 0;
     }
   }
 
@@ -1349,6 +1357,14 @@ export class YtStudioBrowserController {
                   const titleEl = row.querySelector('#video-title, a#video-title') as HTMLElement | null;
                   const rowTitle = (titleEl?.innerText || titleEl?.textContent || '').replace(/\s+/g, ' ').trim();
                   if (rowTitle.toLowerCase() !== expectedTitle.toLowerCase()) continue;
+                  const rowTxt = ((row as HTMLElement).innerText || row.textContent || '').replace(/\s+/g, ' ').trim();
+                  const visCell = row.querySelector(
+                    '#visibility-label, ytcp-video-list-cell-visibility, .tablecell-visibility'
+                  ) as HTMLElement | null;
+                  const visTxt = (visCell?.innerText || visCell?.textContent || '').replace(/\s+/g, ' ').trim();
+                  const isDraftOrPrivate =
+                    /\b(draft|edit\s+draft|private)\b/i.test(visTxt) ||
+                    /\bedit\s+draft\b/i.test(rowTxt);
                   const anchors = Array.from(row.querySelectorAll('a[href]'));
                   for (const a of anchors) {
                     const href = a.getAttribute('href') || '';
@@ -1357,7 +1373,11 @@ export class YtStudioBrowserController {
                       href.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/) ||
                       href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
                     if (m?.[1]) {
-                      return { videoId: m[1], ytUrl: `https://youtu.be/${m[1]}` };
+                      return {
+                        videoId: m[1],
+                        ytUrl: `https://youtu.be/${m[1]}`,
+                        isDraftOrPrivate,
+                      };
                     }
                   }
                 }
@@ -1366,6 +1386,19 @@ export class YtStudioBrowserController {
               .catch(() => null);
 
             if (existingOnTable?.ytUrl && existingOnTable.videoId) {
+              if (existingOnTable.isDraftOrPrivate && visibility === 'unlisted') {
+                this.log(
+                  'fix draft/private',
+                  `[W${String(windowNumber).padStart(2, '0')}] Existing video "${title}" is Draft/Private -> converting to Unlisted...`,
+                  'warn'
+                );
+                await this.convertVideoRowToUnlistedOnContentPage(uploadPage, {
+                  videoId: existingOnTable.videoId,
+                  title,
+                  windowNumber,
+                  scanPrefix,
+                }).catch(() => {});
+              }
               this.uploadedVideoIdsInSession.add(existingOnTable.videoId);
               saveClipYtSidecar(clipPath, {
                 scanId,
@@ -1378,7 +1411,7 @@ export class YtStudioBrowserController {
               onProgress?.('link ready');
               this.log(
                 'already uploaded',
-                `[W${String(windowNumber).padStart(2, '0')}] Video "${title}" already on channel -> ${existingOnTable.ytUrl} (skipping duplicate upload)`,
+                `[W${String(windowNumber).padStart(2, '0')}] Video "${title}" already on channel -> ${existingOnTable.ytUrl} (Unlisted verified, skipping duplicate upload)`,
                 'ok'
               );
               return {
@@ -1902,8 +1935,15 @@ export class YtStudioBrowserController {
               await uploadPage.mouse.click(doneCoords.x, doneCoords.y).catch(() => {});
             }
 
-            // Wait 2.5 seconds after clicking Save
-            await uploadPage.waitForTimeout(2500);
+            // Wait 1.5s then check if "We're still checking your content" popup appeared (Screenshot 2)
+            await uploadPage.waitForTimeout(1500);
+            const handledStillChecking = await this.handleStillCheckingContentPopup(
+              uploadPage,
+              targetRadioName
+            );
+            if (!handledStillChecking) {
+              await uploadPage.waitForTimeout(1000);
+            }
 
             if (!shareUrl) {
               shareUrl = await this.extractShareUrlFromUploadModal(uploadPage, ignoreVideoIds);
@@ -1944,6 +1984,21 @@ export class YtStudioBrowserController {
           // IMMEDIATELY close the "Video processing" / "Checks complete. Claimed content found." popup and wait 2s!
           await this.dismissAllUploadDialogs(uploadPage);
           await uploadPage.waitForTimeout(2000);
+
+          // Check on the Channel Content page if this newly uploaded video accidentally ended up as "Draft" or "Private"
+          // ("notic kro draft to nhi bna agr draft bna to unlisted kr do")
+          if (visibility === 'unlisted') {
+            const extractedVidId =
+              shareUrl?.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/)?.[1] ||
+              shareUrl?.match(/\/video\/([a-zA-Z0-9_-]{11})/)?.[1] ||
+              undefined;
+            await this.convertVideoRowToUnlistedOnContentPage(uploadPage, {
+              videoId: extractedVidId,
+              title,
+              windowNumber,
+              scanPrefix,
+            }).catch(() => {});
+          }
 
           // If shareUrl was not captured inside the dialog, read it from the Content table row by exact title or windowNumber
           if (!shareUrl) {
@@ -2028,6 +2083,728 @@ export class YtStudioBrowserController {
     } finally {
       this.inFlightClipUploads.delete(clipPath);
     }
+  }
+
+  /**
+   * Handles the "We're still checking your content" popup in YouTube Studio (Screenshot 2):
+   * 1. When this popup appears on Save, it otherwise leaves the video in Draft ("Saved as private").
+   * 2. First clicks the top-right × (cross) button on the popup, re-selects Unlisted, and clicks Save (#done-button).
+   * 3. If the popup re-appears on Save, clicks "Publish anyway" so YouTube Studio immediately commits
+   *    the video as Unlisted instead of Draft.
+   */
+  private async handleStillCheckingContentPopup(
+    page: Page,
+    targetRadioName: string = 'UNLISTED'
+  ): Promise<boolean> {
+    try {
+      const detectCheckingDialog = async (): Promise<boolean> => {
+        return await page
+          .evaluate(() => {
+            const dialogs = Array.from(
+              document.querySelectorAll(
+                'tp-yt-paper-dialog, ytcp-confirmation-dialog, ytcp-dialog, [role="dialog"]'
+              )
+            ) as HTMLElement[];
+            for (const d of dialogs) {
+              if (d.offsetWidth === 0 && d.offsetHeight === 0) continue;
+              const txt = (d.innerText || d.textContent || '').toLowerCase();
+              if (
+                txt.includes('still checking your content') ||
+                txt.includes('keeping your content private until checks complete') ||
+                txt.includes('publish anyway')
+              ) {
+                return true;
+              }
+            }
+            return false;
+          })
+          .catch(() => false);
+      };
+
+      if (!(await detectCheckingDialog())) {
+        return false;
+      }
+
+      this.log(
+        'checking popup',
+        'Detected "We\'re still checking your content" popup -> clicking top-right × (cross) button, re-selecting Unlisted, and saving...',
+        'info'
+      );
+
+      // Step 1: Click the top-right × (cross) button on the "We're still checking your content" popup
+      const clickedCross = await page
+        .evaluate(() => {
+          const dialogs = Array.from(
+            document.querySelectorAll(
+              'tp-yt-paper-dialog, ytcp-confirmation-dialog, ytcp-dialog, [role="dialog"]'
+            )
+          ) as HTMLElement[];
+          for (const d of dialogs) {
+            if (d.offsetWidth === 0 && d.offsetHeight === 0) continue;
+            const txt = (d.innerText || d.textContent || '').toLowerCase();
+            if (
+              !txt.includes('still checking your content') &&
+              !txt.includes('keeping your content private until checks complete') &&
+              !txt.includes('publish anyway')
+            ) {
+              continue;
+            }
+            // Don't accidentally click the outer upload dialog's close button
+            if (d.tagName.toLowerCase() === 'ytcp-uploads-dialog') continue;
+
+            const closeSelectors = [
+              '#close-button',
+              '#close-icon-button',
+              'ytcp-icon-button[aria-label*="Close" i]',
+              'button[aria-label*="Close" i]',
+              '[aria-label="Close"]',
+              'tp-yt-iron-icon[icon*="close"]',
+            ];
+            for (const sel of closeSelectors) {
+              const btn = d.querySelector(sel) as HTMLElement | null;
+              if (btn && (btn.offsetWidth > 0 || btn.offsetHeight > 0)) {
+                btn.click();
+                return true;
+              }
+            }
+          }
+          return false;
+        })
+        .catch(() => false);
+
+      if (clickedCross) {
+        await page.waitForTimeout(700).catch(() => {});
+        // Re-select Unlisted radio button inside the Visibility step
+        await page
+          .evaluate((radioName: string) => {
+            const radio = document.querySelector(
+              `tp-yt-paper-radio-button[name="${radioName}"], #privacy-radios tp-yt-paper-radio-button[name="${radioName}"]`
+            ) as HTMLElement | null;
+            if (radio) {
+              radio.scrollIntoView({ block: 'center' });
+              radio.click();
+            }
+          }, targetRadioName)
+          .catch(() => {});
+        await page.waitForTimeout(450).catch(() => {});
+
+        // Click Save (#done-button) again
+        const doneBtn = page.locator('#done-button').first();
+        if (await doneBtn.isVisible().catch(() => false)) {
+          await doneBtn.click({ force: true, timeout: 4000 }).catch(() => {});
+        } else {
+          await page
+            .evaluate(() => {
+              const b = document.querySelector('#done-button') as HTMLElement | null;
+              if (b) b.click();
+            })
+            .catch(() => {});
+        }
+        await page.waitForTimeout(1500).catch(() => {});
+      }
+
+      // Step 2: If "We're still checking your content" is still visible (or popped up again on Save),
+      // click "Publish anyway" (or confirm button) so YouTube commits Unlisted instead of Draft.
+      if (await detectCheckingDialog()) {
+        this.log(
+          'checking popup',
+          '"We\'re still checking your content" popup re-appeared on Save -> clicking "Publish anyway" to force Unlisted',
+          'info'
+        );
+        const publishAnywayClicked = await page
+          .evaluate(() => {
+            const dialogs = Array.from(
+              document.querySelectorAll(
+                'tp-yt-paper-dialog, ytcp-confirmation-dialog, ytcp-dialog, [role="dialog"]'
+              )
+            ) as HTMLElement[];
+            for (const d of dialogs) {
+              if (d.offsetWidth === 0 && d.offsetHeight === 0) continue;
+              const txt = (d.innerText || d.textContent || '').toLowerCase();
+              if (
+                !txt.includes('still checking your content') &&
+                !txt.includes('publish anyway')
+              ) {
+                continue;
+              }
+              const buttons = Array.from(
+                d.querySelectorAll('ytcp-button, button, [role="button"], #confirm-button')
+              ) as HTMLElement[];
+              for (const b of buttons) {
+                const bTxt = (b.innerText || b.textContent || '').trim().toLowerCase();
+                if (
+                  bTxt.includes('publish anyway') ||
+                  bTxt.includes('change visibility') ||
+                  b.id === 'confirm-button'
+                ) {
+                  b.click();
+                  return true;
+                }
+              }
+            }
+            return false;
+          })
+          .catch(() => false);
+
+        if (publishAnywayClicked) {
+          await page.waitForTimeout(1800).catch(() => {});
+        }
+      }
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Finds a video row (`ytcp-video-row`) on the YouTube Studio Content page by `videoId`, `title`, or `windowNumber`,
+   * and if its visibility is `Draft` (`Edit draft`, `Draft (Blocked)`, `Draft (Checking)`) or `Private` (`Private`, `Private (Blocked)`),
+   * immediately converts it to `Unlisted` and saves.
+   */
+  public async convertVideoRowToUnlistedOnContentPage(
+    page: Page,
+    target: {
+      videoId?: string;
+      title?: string;
+      windowNumber?: number;
+      scanPrefix?: string;
+    }
+  ): Promise<boolean> {
+    try {
+      const targetLabel =
+        target.title ||
+        (target.windowNumber ? `W${String(target.windowNumber).padStart(2, '0')}` : '') ||
+        target.videoId ||
+        'video';
+
+      // Make sure we are on the Channel Content page and rows are visible
+      const currentUrl = page.url();
+      if (!currentUrl.includes('studio.youtube.com') || !currentUrl.includes('/videos')) {
+        await page
+          .goto('https://studio.youtube.com/channel/mine/videos/upload', {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000,
+          })
+          .catch(() => {});
+        await page.waitForTimeout(2500).catch(() => {});
+      }
+
+      await this.dismissAllUploadDialogs(page).catch(() => {});
+      await page.waitForSelector('ytcp-video-row', { timeout: 10000 }).catch(() => {});
+
+      const rowMatch = await page
+        .evaluate(
+          (t: { videoId?: string; title?: string; windowNumber?: number; scanPrefix?: string }) => {
+            const rows = Array.from(document.querySelectorAll('ytcp-video-row')) as HTMLElement[];
+            for (let idx = 0; idx < rows.length; idx++) {
+              const row = rows[idx];
+              const rowText = (row.innerText || row.textContent || '').trim();
+              const rowLower = rowText.toLowerCase();
+
+              const titleEl = row.querySelector(
+                '#video-title, a#video-title, .video-title-wrapper'
+              ) as HTMLElement | null;
+              const rawTitle = (titleEl?.innerText || titleEl?.textContent || '').trim();
+
+              let vid = '';
+              const anchors = Array.from(row.querySelectorAll('a[href]')) as HTMLAnchorElement[];
+              for (const a of anchors) {
+                const href = a.getAttribute('href') || a.href || '';
+                const mEdit = href.match(/\/video\/([a-zA-Z0-9_-]{11})/);
+                if (mEdit) {
+                  vid = mEdit[1];
+                  break;
+                }
+                const mShort =
+                  href.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/) ||
+                  href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+                if (mShort) {
+                  vid = mShort[1];
+                  break;
+                }
+              }
+
+              let matches = false;
+              if (t.videoId && vid === t.videoId) {
+                matches = true;
+              } else if (t.title && rawTitle.toLowerCase() === t.title.toLowerCase()) {
+                matches = true;
+              } else if (
+                t.windowNumber !== undefined &&
+                t.scanPrefix &&
+                rawTitle.toLowerCase() === `${t.scanPrefix.toLowerCase()}-w${t.windowNumber}`
+              ) {
+                matches = true;
+              } else if (
+                t.windowNumber !== undefined &&
+                !t.scanPrefix &&
+                new RegExp(`-w${t.windowNumber}\\b`, 'i').test(rawTitle)
+              ) {
+                matches = true;
+              }
+
+              if (!matches) continue;
+
+              const visCell = row.querySelector(
+                'ytcp-video-list-cell-visibility, .cell-body.tablecell-visibility, #visibility-label'
+              ) as HTMLElement | null;
+              const visText = (visCell?.innerText || visCell?.textContent || rowText).toLowerCase();
+
+              const hasEditDraftBtn = Array.from(
+                row.querySelectorAll('ytcp-button, button, a, [role="button"]')
+              ).some((el) =>
+                ((el as HTMLElement).innerText || el.textContent || '')
+                  .trim()
+                  .toLowerCase()
+                  .includes('edit draft')
+              );
+
+              const isDraft =
+                hasEditDraftBtn || /\bdraft\b/i.test(visText) || /\bedit\s+draft\b/i.test(rowLower);
+              const isPrivate = /\bprivate\b/i.test(visText);
+              const isUnlisted = /\bunlisted\b/i.test(visText) && !isDraft && !isPrivate;
+
+              rows.forEach((r) => r.removeAttribute('data-cmt-target-unlisted-row'));
+              row.setAttribute('data-cmt-target-unlisted-row', 'true');
+              row.scrollIntoView({ block: 'center' });
+
+              return {
+                found: true,
+                videoId: vid,
+                title: rawTitle,
+                isDraft,
+                isPrivate,
+                isUnlisted,
+                hasEditDraftBtn,
+              };
+            }
+            return {
+              found: false,
+              videoId: '',
+              title: '',
+              isDraft: false,
+              isPrivate: false,
+              isUnlisted: false,
+              hasEditDraftBtn: false,
+            };
+          },
+          target
+        )
+        .catch(() => ({
+          found: false,
+          videoId: '',
+          title: '',
+          isDraft: false,
+          isPrivate: false,
+          isUnlisted: false,
+          hasEditDraftBtn: false,
+        }));
+
+      if (!rowMatch.found) {
+        return false;
+      }
+
+      if (rowMatch.isUnlisted) {
+        this.log(
+          'visibility ok',
+          `[${targetLabel}] Row "${rowMatch.title}" (${rowMatch.videoId}) is already Unlisted`,
+          'ok'
+        );
+        return true;
+      }
+
+      this.log(
+        'make unlisted',
+        `[${targetLabel}] Row "${rowMatch.title}" (${rowMatch.videoId}) is ${
+          rowMatch.isDraft ? 'Draft' : rowMatch.isPrivate ? 'Private' : 'non-Unlisted'
+        } -> converting to Unlisted now...`,
+        'info'
+      );
+
+      // Case A: Video is in Draft (or has "Edit draft" button) -> click "Edit draft" to open upload wizard dialog
+      if (rowMatch.isDraft || rowMatch.hasEditDraftBtn) {
+        const openedDraftDialog = await page
+          .evaluate(() => {
+            const row = document.querySelector(
+              'ytcp-video-row[data-cmt-target-unlisted-row="true"]'
+            ) as HTMLElement | null;
+            if (!row) return false;
+            const candidates = Array.from(
+              row.querySelectorAll('ytcp-button, button, a, [role="button"]')
+            ) as HTMLElement[];
+            for (const el of candidates) {
+              const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+              if (txt.includes('edit draft')) {
+                el.click();
+                return true;
+              }
+            }
+            const titleEl = row.querySelector('#video-title, a#video-title') as HTMLElement | null;
+            if (titleEl) {
+              titleEl.click();
+              return true;
+            }
+            return false;
+          })
+          .catch(() => false);
+
+        if (openedDraftDialog) {
+          await page.waitForSelector('ytcp-uploads-dialog', { timeout: 10000 }).catch(() => {});
+          await page.waitForTimeout(1200).catch(() => {});
+
+          // Ensure "No, it's not made for kids" is selected if needed
+          await page
+            .evaluate(() => {
+              const r = document.querySelector(
+                'tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"], #audience tp-yt-paper-radio-button:nth-of-type(2)'
+              ) as HTMLElement | null;
+              if (r) r.click();
+            })
+            .catch(() => {});
+          await page.waitForTimeout(350).catch(() => {});
+
+          // Jump to Visibility step (#step-badge-3) or click Next up to 3 times
+          const step3 = page.locator('#step-badge-3').first();
+          if (await step3.isVisible().catch(() => false)) {
+            await step3.click({ force: true, timeout: 3000 }).catch(() => {});
+            await page.waitForTimeout(700).catch(() => {});
+          }
+          for (let i = 0; i < 3; i++) {
+            const unlVis = await page
+              .locator('tp-yt-paper-radio-button[name="UNLISTED"]')
+              .first()
+              .isVisible()
+              .catch(() => false);
+            if (unlVis) break;
+            const nextBtn = page.locator('#next-button').first();
+            if (await nextBtn.isVisible().catch(() => false)) {
+              await nextBtn.click({ force: true, timeout: 3000 }).catch(() => {});
+              await page.waitForTimeout(650).catch(() => {});
+            }
+          }
+
+          // Select Unlisted radio
+          await page
+            .evaluate(() => {
+              const r = document.querySelector(
+                'tp-yt-paper-radio-button[name="UNLISTED"], #privacy-radios tp-yt-paper-radio-button[name="UNLISTED"]'
+              ) as HTMLElement | null;
+              if (r) {
+                r.scrollIntoView({ block: 'center' });
+                r.click();
+              }
+            })
+            .catch(() => {});
+          await page.waitForTimeout(450).catch(() => {});
+
+          // Click Save (#done-button) and handle "We're still checking your content" popup
+          const doneBtn = page.locator('#done-button').first();
+          if (await doneBtn.isVisible().catch(() => false)) {
+            await doneBtn.click({ force: true, timeout: 4000 }).catch(() => {});
+          } else {
+            await page
+              .evaluate(() => {
+                const b = document.querySelector('#done-button') as HTMLElement | null;
+                if (b) b.click();
+              })
+              .catch(() => {});
+          }
+          await page.waitForTimeout(1400).catch(() => {});
+          await this.handleStillCheckingContentPopup(page, 'UNLISTED');
+          await page.waitForTimeout(1500).catch(() => {});
+          await this.dismissAllUploadDialogs(page).catch(() => {});
+        }
+      }
+
+      // Case B: Inline visibility popup on the Content row (works for Private videos or if Draft dialog didn't convert it)
+      const openedInlinePopup = await page
+        .evaluate(() => {
+          const row = document.querySelector(
+            'ytcp-video-row[data-cmt-target-unlisted-row="true"]'
+          ) as HTMLElement | null;
+          if (!row) return false;
+          const visText = (row.innerText || row.textContent || '').toLowerCase();
+          if (
+            /\bunlisted\b/i.test(visText) &&
+            !/\bdraft\b/i.test(visText) &&
+            !/\bprivate\b/i.test(visText)
+          ) {
+            return false; // Already converted by Case A
+          }
+          const cell = row.querySelector(
+            'ytcp-video-list-cell-visibility, .cell-body.tablecell-visibility, #visibility-label'
+          ) as HTMLElement | null;
+          if (cell) {
+            const clickTarget =
+              (cell.querySelector(
+                '.visibility-button, #visibility-label, ytcp-icon-button, button, [role="button"]'
+              ) as HTMLElement | null) || cell;
+            clickTarget.scrollIntoView({ block: 'center' });
+            clickTarget.click();
+            return true;
+          }
+          return false;
+        })
+        .catch(() => false);
+
+      if (openedInlinePopup) {
+        await page.waitForTimeout(900).catch(() => {});
+        // Select Unlisted radio inside the inline visibility popup
+        await page
+          .evaluate(() => {
+            const radios = Array.from(
+              document.querySelectorAll('tp-yt-paper-radio-button[name="UNLISTED"]')
+            ) as HTMLElement[];
+            for (const r of radios) {
+              if (r.offsetWidth > 0 || r.offsetHeight > 0) {
+                r.scrollIntoView({ block: 'center' });
+                r.click();
+              }
+            }
+          })
+          .catch(() => {});
+        await page.waitForTimeout(450).catch(() => {});
+
+        // Click Save / Publish inside the inline visibility popup
+        await page
+          .evaluate(() => {
+            const saveSelectors = [
+              'ytcp-video-visibility-select #save-button',
+              '#save-button',
+              '#done-button',
+              'ytcp-button#save-button',
+            ];
+            for (const sel of saveSelectors) {
+              const btns = Array.from(document.querySelectorAll(sel)) as HTMLElement[];
+              for (const b of btns) {
+                if (b.offsetWidth > 0 || b.offsetHeight > 0) {
+                  b.click();
+                  return;
+                }
+              }
+            }
+            const allBtns = Array.from(
+              document.querySelectorAll('ytcp-button, button, [role="button"]')
+            ) as HTMLElement[];
+            for (const b of allBtns) {
+              if (b.offsetWidth === 0 && b.offsetHeight === 0) continue;
+              const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+              if (t === 'save' || t === 'publish') {
+                b.click();
+                return;
+              }
+            }
+          })
+          .catch(() => {});
+        await page.waitForTimeout(1400).catch(() => {});
+        await this.handleStillCheckingContentPopup(page, 'UNLISTED');
+        await page.waitForTimeout(1500).catch(() => {});
+        await this.dismissAllUploadDialogs(page).catch(() => {});
+      }
+
+      // Verify whether the row is now Unlisted on the Content table
+      const verifiedUnlisted = await page
+        .evaluate(() => {
+          const row = document.querySelector(
+            'ytcp-video-row[data-cmt-target-unlisted-row="true"]'
+          ) as HTMLElement | null;
+          if (!row) return false;
+          const visCell = row.querySelector(
+            'ytcp-video-list-cell-visibility, .cell-body.tablecell-visibility, #visibility-label'
+          ) as HTMLElement | null;
+          const visText = (
+            visCell?.innerText ||
+            visCell?.textContent ||
+            row.innerText ||
+            ''
+          ).toLowerCase();
+          return (
+            /\bunlisted\b/i.test(visText) &&
+            !/\bdraft\b/i.test(visText) &&
+            !/\bprivate\b/i.test(visText)
+          );
+        })
+        .catch(() => false);
+
+      if (verifiedUnlisted) {
+        this.log(
+          'unlisted saved',
+          `[${targetLabel}] Successfully changed "${rowMatch.title}" (${rowMatch.videoId}) visibility to Unlisted`,
+          'ok'
+        );
+        return true;
+      }
+
+      // Fallback Case C: Open direct Video Details edit page (`/video/<id>/edit`) if we have videoId
+      if (rowMatch.videoId) {
+        this.log(
+          'make unlisted',
+          `[${targetLabel}] Opening video edit page for ${rowMatch.videoId} to force Unlisted...`,
+          'info'
+        );
+        await page
+          .goto(`https://studio.youtube.com/video/${rowMatch.videoId}/edit`, {
+            waitUntil: 'domcontentloaded',
+            timeout: 25000,
+          })
+          .catch(() => {});
+        await page.waitForTimeout(2500).catch(() => {});
+
+        // Click the visibility dropdown on the video edit page
+        await page
+          .evaluate(() => {
+            const trigger = document.querySelector(
+              'ytcp-video-metadata-visibility #container, ytcp-video-metadata-visibility, #visibility-button'
+            ) as HTMLElement | null;
+            if (trigger) trigger.click();
+          })
+          .catch(() => {});
+        await page.waitForTimeout(700).catch(() => {});
+
+        // Select Unlisted radio and click Done + top-right Save
+        await page
+          .evaluate(() => {
+            const r = document.querySelector(
+              'tp-yt-paper-radio-button[name="UNLISTED"]'
+            ) as HTMLElement | null;
+            if (r) r.click();
+          })
+          .catch(() => {});
+        await page.waitForTimeout(400).catch(() => {});
+        await page
+          .evaluate(() => {
+            const done = document.querySelector('#done-button') as HTMLElement | null;
+            if (done) done.click();
+          })
+          .catch(() => {});
+        await page.waitForTimeout(700).catch(() => {});
+        await this.handleStillCheckingContentPopup(page, 'UNLISTED');
+        await page
+          .evaluate(() => {
+            const save = document.querySelector('#save') as HTMLElement | null;
+            if (save) save.click();
+          })
+          .catch(() => {});
+        await page.waitForTimeout(1800).catch(() => {});
+        await this.handleStillCheckingContentPopup(page, 'UNLISTED');
+
+        // Return to Channel Content page
+        await page
+          .goto('https://studio.youtube.com/channel/mine/videos/upload', {
+            waitUntil: 'domcontentloaded',
+            timeout: 25000,
+          })
+          .catch(() => {});
+        await page.waitForTimeout(2000).catch(() => {});
+        return true;
+      }
+
+      return false;
+    } catch (err: unknown) {
+      this.log(
+        'make unlisted warn',
+        `Could not auto-convert row to Unlisted: ${err instanceof Error ? err.message : String(err)}`,
+        'error'
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Sequential 1-by-1 FIFO queue for AI Studio worker windows that encounter "This video is private"
+   * mid-script (Screenshot 1). Multiple worker windows queue up in order (1st -> 2nd -> 3rd) without
+   * interrupting other parallel workers, wait until their video is converted to Unlisted in YouTube Studio,
+   * and then resume on their fresh AI Studio page.
+   */
+  public async enqueueMakeVideoUnlisted(params: {
+    scanId?: string;
+    windowNumber?: number;
+    videoId?: string;
+    youtubeUrl?: string;
+    username?: string;
+    workerLabel?: string;
+    onLog?: (msg: string) => void;
+  }): Promise<boolean> {
+    this.ensureInternalCollections();
+    const {
+      scanId,
+      windowNumber,
+      videoId: rawVideoId,
+      youtubeUrl,
+      username = 'admin',
+      workerLabel = 'W00',
+      onLog,
+    } = params;
+
+    let videoId = rawVideoId || '';
+    if (!videoId && youtubeUrl) {
+      const m =
+        youtubeUrl.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/) ||
+        youtubeUrl.match(/[?&]v=([a-zA-Z0-9_-]{11})/) ||
+        youtubeUrl.match(/\/video\/([a-zA-Z0-9_-]{11})/);
+      if (m) videoId = m[1];
+    }
+
+    const scanPrefix = scanId ? `cmt-${scanId.slice(0, 8)}` : undefined;
+    const title =
+      scanPrefix && windowNumber !== undefined ? `${scanPrefix}-w${windowNumber}` : undefined;
+    const winTag =
+      windowNumber !== undefined ? `W${String(windowNumber).padStart(2, '0')}` : videoId || 'video';
+
+    this.unlistedFixQueuePending += 1;
+    const queuePosition = this.unlistedFixQueuePending;
+
+    const queueMsg = `[${workerLabel}] Queued Unlisted fix #${queuePosition} for ${winTag} (${
+      videoId || title || youtubeUrl || 'video'
+    }) — waiting in FIFO order`;
+    this.log('private queue', queueMsg, 'info');
+    onLog?.(queueMsg);
+
+    let converted = false;
+    const runTask = async () => {
+      try {
+        await this.withLock(async () => {
+          const startMsg = `[${workerLabel}] Running queued Unlisted fix for ${winTag} (${
+            videoId || title || 'video'
+          }) in YouTube Studio...`;
+          this.log('private fix start', startMsg, 'info');
+          onLog?.(startMsg);
+
+          const page = await this.ensurePage(username);
+          converted = await this.convertVideoRowToUnlistedOnContentPage(page, {
+            videoId: videoId || undefined,
+            title,
+            windowNumber,
+            scanPrefix,
+          });
+
+          // Refresh Content table state after conversion so progress summary stays accurate
+          await this.checkAndVerifyContentPage({
+            scanId,
+            expectedWindows:
+              windowNumber !== undefined
+                ? [{ windowNumber, title, videoId: videoId || undefined }]
+                : [],
+            waitForSdReady: false,
+            username,
+          }).catch(() => {});
+
+          const doneMsg = converted
+            ? `[${workerLabel}] ${winTag} (${videoId || title}) is now Unlisted — worker resuming on fresh page`
+            : `[${workerLabel}] Finished Unlisted check for ${winTag} (${videoId || title}) — worker resuming`;
+          this.log('private fix done', doneMsg, converted ? 'ok' : 'info');
+          onLog?.(doneMsg);
+        });
+      } finally {
+        this.unlistedFixQueuePending = Math.max(0, this.unlistedFixQueuePending - 1);
+      }
+    };
+
+    const nextInQueue = this.unlistedFixQueue.then(runTask, runTask);
+    this.unlistedFixQueue = nextInQueue.catch(() => {});
+    await nextInQueue;
+    return converted;
   }
 
   /**
@@ -2227,11 +3004,13 @@ export class YtStudioBrowserController {
                   : 'None');
 
             // User rules:
-            // 1. Blocked video works identically to Unlisted — treat Blocked as ready!
-            // 2. "Checking..." state & "Draft" state also have working YouTube links on Gemini — treat Unlisted, Draft, and Checking as Successful / Ready!
+            // 1. Unlisted video works even when Blocked -> "Unlisted (Blocked)" is ready!
+            // 2. Draft video works ONLY while not blocked; if Draft is Blocked ("Draft (Blocked)") or if video is Private ("Private"),
+            //    AI Studio shows "This video is private" unless we convert it to Unlisted!
             const isBlocked = /\bblocked\b/i.test(`${rawVisText} ${restrictions} ${rowText}`);
             const isChecking = /\bchecking\b/i.test(`${restrictions} ${rawVisText} ${dateText} ${rowText}`);
             const isDraft = /\b(draft|edit\s+draft)\b/i.test(`${rawVisText} ${rowText}`);
+            const isPrivate = !isDraft && /\bprivate\b/i.test(rawVisText);
             const hasExplicitReadyVisibility = /\b(unlisted|private|public|draft)\b/i.test(rawVisText);
 
             // A video is ONLY still uploading/processing SD if it is actively uploading bytes ("Uploading X%")
@@ -2247,27 +3026,31 @@ export class YtStudioBrowserController {
                 ) ||
                 /\bpending\b/i.test(rawVisText));
 
-            const visibility = isBlocked
-              ? 'Unlisted (Blocked)'
-              : /unlisted/i.test(rawVisText) || /unlisted/i.test(rowText)
-                ? isChecking
-                  ? 'Unlisted (Checking)'
-                  : 'Unlisted'
-                : isDraft
-                  ? isChecking
-                    ? 'Draft (Checking)'
-                    : 'Draft'
-                  : isChecking
-                    ? 'Checking'
-                    : /private/i.test(rawVisText)
-                      ? 'Private'
+            const visibility = isDraft
+              ? isBlocked
+                ? 'Draft (Blocked)'
+                : isChecking
+                  ? 'Draft (Checking)'
+                  : 'Draft'
+              : isPrivate
+                ? isBlocked
+                  ? 'Private (Blocked)'
+                  : 'Private'
+                : isBlocked
+                  ? 'Unlisted (Blocked)'
+                  : /unlisted/i.test(rawVisText) || /unlisted/i.test(rowText)
+                    ? isChecking
+                      ? 'Unlisted (Checking)'
+                      : 'Unlisted'
+                    : isChecking
+                      ? 'Checking'
                       : /public/i.test(rawVisText)
                         ? 'Public'
                         : isActivelyUploadingOrPreSd
                           ? 'Processing SD'
                           : 'Unlisted';
 
-            const isReadyForGemini = !isActivelyUploadingOrPreSd;
+            const isReadyForGemini = !isActivelyUploadingOrPreSd && !isPrivate && !(isDraft && isBlocked);
 
             const hasClaim =
               isBlocked || /\b(copyright|claimed|blocked)\b/i.test(`${restrictions} ${rowText}`);
@@ -2376,6 +3159,37 @@ export class YtStudioBrowserController {
         await page.waitForTimeout(3000);
         allItems = await readRowsFromDom();
       }
+
+      // Auto-convert any Draft (especially Draft Blocked / Draft) or Private rows belonging to this scan into Unlisted!
+      const draftOrPrivateRows = allItems.filter((it) => {
+        const belongsToScan =
+          expectedWindows.length > 0
+            ? expectedWindows.some((exp) => matchesExpectedWindow(exp, it))
+            : scanPrefix
+              ? !it.scanPrefix || it.scanPrefix.toLowerCase() === scanPrefix.toLowerCase()
+              : true;
+        if (!belongsToScan) return false;
+        return /\b(draft|private)\b/i.test(it.visibility);
+      });
+
+      if (draftOrPrivateRows.length > 0 && !this.stopRequested) {
+        for (const dpItem of draftOrPrivateRows) {
+          if (this.stopRequested) break;
+          this.log(
+            'auto-unlist draft/private',
+            `Converting "${dpItem.title}" (${dpItem.visibility}) -> Unlisted on Channel Content...`,
+            'warn'
+          );
+          await this.convertVideoRowToUnlistedOnContentPage(page, {
+            videoId: dpItem.videoId,
+            title: dpItem.title,
+            windowNumber: dpItem.windowNumber ?? undefined,
+            scanPrefix: dpItem.scanPrefix || scanPrefix || undefined,
+          }).catch(() => {});
+        }
+        allItems = await readRowsFromDom();
+      }
+
       syncSidecarsForItems(allItems);
 
       // Filter relevant items strictly for this scan (never count another scan's cmt-<other>-w<N> videos!)

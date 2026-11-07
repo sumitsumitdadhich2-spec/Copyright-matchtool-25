@@ -55,6 +55,7 @@ import {
 } from './studio-window-planner'
 import { maxMovieEndSecInHissa2, shiftMovieTimestampsInHissa2 } from './studio-clip-offset'
 import { fmtTime } from './format'
+import { globalYtStudioController } from './yt-studio-automation'
 import type { ChunkMatch } from './types'
 
 export interface StudioStepLog {
@@ -4381,6 +4382,41 @@ export class StudioBrowserController {
    * configure Start Time (e.g. 0s), End Time (e.g. 5m), and FPS = 24 via the Video Settings dialog,
    * READ BACK all three values to confirm they stuck, and click Save.
    */
+  /**
+   * Detects if the open AI Studio "Video settings" modal (or embedded YouTube player iframe inside it)
+   * shows "This video is private" / "If the owner of this video has granted you access, please sign in."
+   * (Screenshot 1).
+   */
+  private async isVideoSettingsShowingPrivateVideo(page: Page): Promise<boolean> {
+    try {
+      const privatePattern =
+        /this\s+video\s+is\s+private|if\s+the\s+owner\s+of\s+this\s+video\s+has\s+granted\s+you\s+access/i
+
+      const foundInMainDom = await page
+        .evaluate(() => {
+          const text = document.body?.innerText || ''
+          return /this\s+video\s+is\s+private|if\s+the\s+owner\s+of\s+this\s+video\s+has\s+granted\s+you\s+access/i.test(
+            text,
+          )
+        })
+        .catch(() => false)
+      if (foundInMainDom) return true
+
+      for (const frame of page.frames()) {
+        if (frame === page.mainFrame()) continue
+        const frameText = await frame
+          .evaluate(() => document.body?.innerText || document.documentElement?.innerText || '')
+          .catch(() => '')
+        if (frameText && privatePattern.test(frameText)) {
+          return true
+        }
+      }
+      return false
+    } catch {
+      return false
+    }
+  }
+
   private async attachVideoAndConfigureRange(
     page: Page,
     params: {
@@ -4715,6 +4751,16 @@ export class StudioBrowserController {
         }
       }
       await new Promise((r) => setTimeout(r, 650))
+
+      // Check if the embedded YouTube preview inside the Video settings modal says "This video is private" (Screenshot 1)
+      if (youtubeUrl && (await this.isVideoSettingsShowingPrivateVideo(page))) {
+        this.logStep(
+          `${label} video is private`,
+          `Detected "This video is private" in Video settings for ${youtubeUrl} — opening fresh page & queueing Unlisted fix in YouTube Studio`,
+          'warn',
+        )
+        throw new Error(`YT_VIDEO_IS_PRIVATE:${label}:${youtubeUrl}`)
+      }
 
       // Tag the Start Time, End Time, FPS inputs and Save button inside the open Video settings dialog
       await this.tagVideoSettingsDialogControls(page)
@@ -6762,6 +6808,14 @@ export class StudioBrowserController {
                 if ((await failedEditBtn.count().catch(() => 0)) > 0) {
                   await failedEditBtn.click({ timeout: 2000 }).catch(() => {})
                   await new Promise((r) => setTimeout(r, 900))
+                  if (movieYoutubeUrl && (await this.isVideoSettingsShowingPrivateVideo(page))) {
+                    this.logStep(
+                      'movie video is private',
+                      `Detected "This video is private" inside Video settings for ${movieYoutubeUrl} — opening fresh page & queueing Unlisted fix`,
+                      'warn',
+                    )
+                    throw new Error(`YT_VIDEO_IS_PRIVATE:movie:${movieYoutubeUrl}`)
+                  }
                   await this.tagVideoSettingsDialogControls(page)
                   const saveBtn = await findFirstVisibleLocator(
                     page,
@@ -8177,6 +8231,66 @@ export class StudioBrowserController {
           throw err
         }
         const backoffSec = 15
+        if (msg.startsWith('YT_VIDEO_IS_PRIVATE:')) {
+          const workerLabel = this.workerTag.replace(/^\[|\]$/g, '') || 'W00'
+          const parts = msg.split(':')
+          const privUrl = parts.slice(2).join(':') || movieYoutubeUrl || ''
+          const privLog = `Detected "This video is private" on ${jobLabel} (${privUrl}) -> immediately opening fresh page & waiting in sequential FIFO queue for YouTube Studio to set Unlisted...`
+          this.logStep('YT_VIDEO_IS_PRIVATE -> fresh page + Unlisted queue', privLog, 'warn')
+          onLog?.('warn', privLog)
+
+          // 1. Immediately open a fresh new page (new_chat) in this worker window and close the broken tab
+          try {
+            if (this.context) {
+              const oldPage = this.page
+              const freshPage = await this.context.newPage()
+              await freshPage.setViewportSize({ width: 1280, height: 820 }).catch(() => {})
+              this.page = freshPage
+              if (oldPage && !oldPage.isClosed()) {
+                await oldPage.close({ runBeforeUnload: false }).catch(() => {})
+              }
+              await freshPage
+                .goto(STUDIO_URLS.playgroundNewChat, {
+                  waitUntil: 'domcontentloaded',
+                  timeout: 45_000,
+                })
+                .catch(() => {})
+              this.logStep(
+                'fresh page ready',
+                `[${workerLabel}] Opened fresh AI Studio page for ${jobLabel} while waiting for YouTube Unlisted conversion`,
+                'info',
+              )
+            }
+          } catch {
+            /* ensurePage on next iteration will recover if needed */
+          }
+
+          // 2. Wait in the sequential 1-by-1 FIFO queue until YouTube Studio converts this video to Unlisted
+          await globalYtStudioController
+            .enqueueMakeVideoUnlisted({
+              scanId: scanId || undefined,
+              windowNumber,
+              youtubeUrl: privUrl || movieYoutubeUrl || undefined,
+              username,
+              workerLabel,
+              onLog: (qMsg) => {
+                this.logStep('yt-unlisted-queue', qMsg, 'info')
+                onLog?.('info', qMsg)
+              },
+            })
+            .catch((qErr) => {
+              this.logStep(
+                'yt-unlisted-queue warn',
+                qErr instanceof Error ? qErr.message : String(qErr),
+                'warn',
+              )
+            })
+
+          await new Promise((r) => setTimeout(r, 2000))
+          attempt -= 1
+          continue
+        }
+
         const isPolicy =
           msg.startsWith('POLICY_BLOCKED:') ||
           /(prohibited_content|blocked\s+due\s+to\s+safety)/i.test(msg)
