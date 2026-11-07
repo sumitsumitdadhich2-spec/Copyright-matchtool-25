@@ -3609,6 +3609,7 @@ export class StudioParallelManager {
         username: this.username || 'admin',
         scanId: jobScanScope,
         jobLabel,
+        windowNumber: win.windowNumber,
         modelName: effectiveWinModel,
         thinkingLevel: cfg.studioThinkingLevel,
         maxOutputTokens: resolveEffectiveMaxOutputTokensForModel(

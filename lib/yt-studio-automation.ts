@@ -240,7 +240,52 @@ export class YtStudioBrowserController {
     this.dailyUploadLimitReached = false;
   }
 
+  private getPersistedLogsPath(): string {
+    return path.join(DATA_DIR, 'yt-studio-step-logs.json');
+  }
+
+  private syncLogsFromDiskIfNeeded(): void {
+    try {
+      const logFile = this.getPersistedLogsPath();
+      if (!fs.existsSync(logFile)) return;
+      const raw = JSON.parse(fs.readFileSync(logFile, 'utf8'));
+      if (!Array.isArray(raw)) return;
+      const diskLogs = raw.filter(
+        (item): item is YtStepLog =>
+          item &&
+          typeof item.ts === 'number' &&
+          typeof item.step === 'string' &&
+          typeof item.detail === 'string'
+      );
+      if (diskLogs.length === 0) return;
+      if (this.logs.length === 0) {
+        this.logs = diskLogs.slice(0, 500);
+        return;
+      }
+      // Merge any newer logs written by another route/worker bundle
+      const newestMemTs = this.logs[0]?.ts || 0;
+      const newerFromDisk = diskLogs.filter((d) => d.ts > newestMemTs);
+      if (newerFromDisk.length > 0) {
+        this.logs = [...newerFromDisk, ...this.logs].slice(0, 500);
+      } else if (diskLogs.length > this.logs.length) {
+        const seen = new Set(this.logs.map((l) => `${l.ts}:${l.step}:${l.detail}`));
+        for (const d of diskLogs) {
+          const key = `${d.ts}:${d.step}:${d.detail}`;
+          if (!seen.has(key)) {
+            this.logs.push(d);
+            seen.add(key);
+          }
+        }
+        this.logs.sort((a, b) => b.ts - a.ts);
+        if (this.logs.length > 500) this.logs.length = 500;
+      }
+    } catch {
+      // ignore disk log sync errors
+    }
+  }
+
   private log(step: string, detail: string, status: YtStepLog['status'] = 'info'): void {
+    this.syncLogsFromDiskIfNeeded();
     this.currentStep = `${step}: ${detail}`;
     if (status === 'error') {
       this.lastError = detail;
@@ -251,8 +296,14 @@ export class YtStudioBrowserController {
       detail,
       status,
     });
-    if (this.logs.length > 200) {
-      this.logs.length = 200;
+    if (this.logs.length > 500) {
+      this.logs.length = 500;
+    }
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(this.getPersistedLogsPath(), JSON.stringify(this.logs.slice(0, 500)), 'utf8');
+    } catch {
+      // ignore disk log write errors
     }
   }
 
@@ -1805,25 +1856,11 @@ export class YtStudioBrowserController {
             if (visCoords?.checked) break;
             if (visCoords && visCoords.w > 4 && visCoords.h > 4) {
               await uploadPage.mouse.click(visCoords.x, visCoords.y).catch(() => {});
-              await uploadPage.waitForTimeout(500);
+              await uploadPage.waitForTimeout(600);
+              // Note: When a video is Blocked by copyright policy, YouTube Studio does NOT visually set aria-checked="true"
+              // on the Unlisted radio button even though clicking it selects Unlisted! So break after clicking cleanly.
+              break;
             }
-            const verifiedChecked = await uploadPage
-              .evaluate((rName: string) => {
-                const isVis = (el: Element | null): boolean => {
-                  if (!el || !(el instanceof HTMLElement)) return false;
-                  const r = el.getBoundingClientRect();
-                  const s = window.getComputedStyle(el);
-                  return r.width > 10 && r.height > 10 && s.display !== 'none' && s.visibility !== 'hidden';
-                };
-                const radios = Array.from(
-                  document.querySelectorAll(
-                    `ytcp-uploads-dialog tp-yt-paper-radio-button[name="${rName}"], #privacy-radios tp-yt-paper-radio-button[name="${rName}"], tp-yt-paper-radio-button[name="${rName}"]`
-                  )
-                );
-                return radios.some((r) => isVis(r) && r.getAttribute('aria-checked') === 'true');
-              }, targetRadioName)
-              .catch(() => false);
-            if (verifiedChecked) break;
           }
 
           // Wait 2 seconds after selecting Unlisted / Private
@@ -2260,7 +2297,14 @@ export class YtStudioBrowserController {
   /**
    * Finds a video row (`ytcp-video-row`) on the YouTube Studio Content page by `videoId`, `title`, or `windowNumber`,
    * and if its visibility is `Draft` (`Edit draft`, `Draft (Blocked)`, `Draft (Checking)`) or `Private` (`Private`, `Private (Blocked)`),
-   * immediately converts it to `Unlisted` and saves.
+   * converts it to `Unlisted` using the exact user-specified flow:
+   *   1. Find the row where `Draft` (or `Private`) is shown.
+   *   2. Click on `Draft` -> then click the Pencil icon (`Details` / `Edit draft`) to open the upload/visibility dialog.
+   *   3. Go to the `Visibility` tab (same as at upload time).
+   *   4. Click `Unlisted` (even on Blocked videos where the radio button does not visually show enabled, the click still selects Unlisted!).
+   *   5. Click `Save` (`#done-button`).
+   *   6. Click `Done` / `Publish anyway` / `Close` on the secondary popup (`"Video published"` or confirmation dialog).
+   *   7. Confirm on the Channel Content row that `Draft` has changed to `Unlisted`; if not, retry (up to 3 attempts).
    */
   public async convertVideoRowToUnlistedOnContentPage(
     page: Page,
@@ -2281,430 +2325,610 @@ export class YtStudioBrowserController {
       // Make sure we are on the Channel Content page and rows are visible
       const currentUrl = page.url();
       if (!currentUrl.includes('studio.youtube.com') || !currentUrl.includes('/videos')) {
+        const chId = this.channelId;
+        const targetContentUrl = chId
+          ? `https://studio.youtube.com/channel/${chId}/videos/upload?filter=%5B%5D`
+          : 'https://studio.youtube.com/channel/mine/videos/upload';
+        this.log(
+          'draft->unlisted',
+          `[${targetLabel}] Navigating to YouTube Studio Content page (${targetContentUrl})...`,
+          'info'
+        );
         await page
-          .goto('https://studio.youtube.com/channel/mine/videos/upload', {
+          .goto(targetContentUrl, {
             waitUntil: 'domcontentloaded',
-            timeout: 30000,
+            timeout: 35000,
           })
           .catch(() => {});
         await page.waitForTimeout(2500).catch(() => {});
       }
 
       await this.dismissAllUploadDialogs(page).catch(() => {});
-      await page.waitForSelector('ytcp-video-row', { timeout: 10000 }).catch(() => {});
+      await page.waitForSelector('ytcp-video-row', { timeout: 12000 }).catch(() => {});
 
-      const rowMatch = await page
-        .evaluate(
-          (t: { videoId?: string; title?: string; windowNumber?: number; scanPrefix?: string }) => {
-            const rows = Array.from(document.querySelectorAll('ytcp-video-row')) as HTMLElement[];
-            for (let idx = 0; idx < rows.length; idx++) {
-              const row = rows[idx];
-              const rowText = (row.innerText || row.textContent || '').trim();
-              const rowLower = rowText.toLowerCase();
-
-              const titleEl = row.querySelector(
-                '#video-title, a#video-title, .video-title-wrapper'
-              ) as HTMLElement | null;
-              const rawTitle = (titleEl?.innerText || titleEl?.textContent || '').trim();
-
-              let vid = '';
-              const anchors = Array.from(row.querySelectorAll('a[href]')) as HTMLAnchorElement[];
-              for (const a of anchors) {
-                const href = a.getAttribute('href') || a.href || '';
-                const mEdit = href.match(/\/video\/([a-zA-Z0-9_-]{11})/);
-                if (mEdit) {
-                  vid = mEdit[1];
-                  break;
-                }
-                const mShort =
-                  href.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/) ||
-                  href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
-                if (mShort) {
-                  vid = mShort[1];
-                  break;
-                }
-              }
-
-              let matches = false;
-              if (t.videoId && vid === t.videoId) {
-                matches = true;
-              } else if (t.title && rawTitle.toLowerCase() === t.title.toLowerCase()) {
-                matches = true;
-              } else if (
-                t.windowNumber !== undefined &&
-                t.scanPrefix &&
-                rawTitle.toLowerCase() === `${t.scanPrefix.toLowerCase()}-w${t.windowNumber}`
-              ) {
-                matches = true;
-              } else if (
-                t.windowNumber !== undefined &&
-                !t.scanPrefix &&
-                new RegExp(`-w${t.windowNumber}\\b`, 'i').test(rawTitle)
-              ) {
-                matches = true;
-              }
-
-              if (!matches) continue;
-
-              const visCell = row.querySelector(
-                'ytcp-video-list-cell-visibility, .cell-body.tablecell-visibility, #visibility-label'
-              ) as HTMLElement | null;
-              const visText = (visCell?.innerText || visCell?.textContent || rowText).toLowerCase();
-
-              const hasEditDraftBtn = Array.from(
-                row.querySelectorAll('ytcp-button, button, a, [role="button"]')
-              ).some((el) =>
-                ((el as HTMLElement).innerText || el.textContent || '')
-                  .trim()
-                  .toLowerCase()
-                  .includes('edit draft')
-              );
-
-              const isDraft =
-                hasEditDraftBtn || /\bdraft\b/i.test(visText) || /\bedit\s+draft\b/i.test(rowLower);
-              const isPrivate = /\bprivate\b/i.test(visText);
-              const isUnlisted = /\bunlisted\b/i.test(visText) && !isDraft && !isPrivate;
-
-              rows.forEach((r) => r.removeAttribute('data-cmt-target-unlisted-row'));
-              row.setAttribute('data-cmt-target-unlisted-row', 'true');
-              row.scrollIntoView({ block: 'center' });
-
-              return {
-                found: true,
-                videoId: vid,
-                title: rawTitle,
-                isDraft,
-                isPrivate,
-                isUnlisted,
-                hasEditDraftBtn,
+      const inspectTargetRowOnTable = async () => {
+        return await page
+          .evaluate(
+            (t: { videoId?: string; title?: string; windowNumber?: number; scanPrefix?: string }) => {
+              const isVis = (el: Element | null): el is HTMLElement => {
+                if (!el || !(el instanceof HTMLElement)) return false;
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden';
               };
-            }
-            return {
-              found: false,
-              videoId: '',
-              title: '',
-              isDraft: false,
-              isPrivate: false,
-              isUnlisted: false,
-              hasEditDraftBtn: false,
-            };
-          },
-          target
-        )
-        .catch(() => ({
-          found: false,
-          videoId: '',
-          title: '',
-          isDraft: false,
-          isPrivate: false,
-          isUnlisted: false,
-          hasEditDraftBtn: false,
-        }));
 
-      if (!rowMatch.found) {
+              const rows = Array.from(document.querySelectorAll('ytcp-video-row')) as HTMLElement[];
+              for (let idx = 0; idx < rows.length; idx++) {
+                const row = rows[idx];
+                const rowText = (row.innerText || row.textContent || '').replace(/\s+/g, ' ').trim();
+                const rowLower = rowText.toLowerCase();
+
+                const titleEl = row.querySelector(
+                  '#video-title, a#video-title, .video-title-wrapper'
+                ) as HTMLElement | null;
+                const rawTitle = (titleEl?.innerText || titleEl?.textContent || '')
+                  .replace(/\s+/g, ' ')
+                  .trim();
+
+                let vid = '';
+                const anchors = Array.from(row.querySelectorAll('a[href]')) as HTMLAnchorElement[];
+                for (const a of anchors) {
+                  const href = a.getAttribute('href') || a.href || '';
+                  const mEdit = href.match(/\/video\/([a-zA-Z0-9_-]{11})/);
+                  if (mEdit) {
+                    vid = mEdit[1];
+                    break;
+                  }
+                  const mShort =
+                    href.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/) ||
+                    href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+                  if (mShort) {
+                    vid = mShort[1];
+                    break;
+                  }
+                }
+                if (!vid) {
+                  const imgs = Array.from(row.querySelectorAll('img[src]')) as HTMLImageElement[];
+                  for (const img of imgs) {
+                    const src = img.getAttribute('src') || img.src || '';
+                    const mThumb = src.match(/\/vi(?:_webp)?\/([a-zA-Z0-9_-]{11})\//);
+                    if (mThumb) {
+                      vid = mThumb[1];
+                      break;
+                    }
+                  }
+                }
+                if (!vid) {
+                  const html = row.outerHTML || '';
+                  const mHtml =
+                    html.match(/\/video\/([a-zA-Z0-9_-]{11})/) ||
+                    html.match(/\/vi(?:_webp)?\/([a-zA-Z0-9_-]{11})\//);
+                  if (mHtml) vid = mHtml[1];
+                }
+
+                let matches = false;
+                if (t.videoId && vid && vid === t.videoId) {
+                  matches = true;
+                } else if (t.title && rawTitle.toLowerCase() === t.title.toLowerCase()) {
+                  matches = true;
+                } else if (
+                  t.windowNumber !== undefined &&
+                  t.scanPrefix &&
+                  rawTitle.toLowerCase() === `${t.scanPrefix.toLowerCase()}-w${t.windowNumber}`
+                ) {
+                  matches = true;
+                } else if (
+                  t.windowNumber !== undefined &&
+                  new RegExp(`^cmt-[a-z0-9_-]+-w${t.windowNumber}\\b`, 'i').test(rawTitle) &&
+                  (!t.scanPrefix || rawTitle.toLowerCase().startsWith(`cmt-${t.scanPrefix.toLowerCase()}-`))
+                ) {
+                  matches = true;
+                } else if (
+                  t.windowNumber !== undefined &&
+                  !t.scanPrefix &&
+                  new RegExp(`-w${t.windowNumber}\\b`, 'i').test(rawTitle)
+                ) {
+                  matches = true;
+                }
+
+                if (!matches) continue;
+
+                const visCell = row.querySelector(
+                  'ytcp-video-list-cell-visibility, .cell-body.tablecell-visibility, .tablecell-visibility, #visibility-label'
+                ) as HTMLElement | null;
+                const visLabelEl = row.querySelector(
+                  '#visibility-label, ytcp-video-list-cell-visibility #visibility-label'
+                ) as HTMLElement | null;
+                const rawVisText = (
+                  visLabelEl?.innerText ||
+                  visCell?.innerText ||
+                  visLabelEl?.textContent ||
+                  visCell?.textContent ||
+                  ''
+                )
+                  .replace(/\s+/g, ' ')
+                  .trim();
+                const visLower = rawVisText.toLowerCase();
+
+                const hasEditDraftBtn = Array.from(
+                  row.querySelectorAll('ytcp-button, button, a, [role="button"]')
+                ).some((el) =>
+                  ((el as HTMLElement).innerText || el.textContent || '')
+                    .trim()
+                    .toLowerCase()
+                    .includes('edit draft')
+                );
+
+                const isDraft =
+                  hasEditDraftBtn || /\bdraft\b/i.test(visLower) || /\bedit\s+draft\b/i.test(rowLower);
+                const isPrivate = !isDraft && /\bprivate\b/i.test(visLower);
+                const isUnlisted = /\bunlisted\b/i.test(visLower) && !isDraft && !isPrivate;
+
+                rows.forEach((r) => r.removeAttribute('data-cmt-target-unlisted-row'));
+                row.setAttribute('data-cmt-target-unlisted-row', 'true');
+                row.scrollIntoView({ block: 'center' });
+
+                const rowRect = row.getBoundingClientRect();
+                const draftTarget = (visLabelEl && isVis(visLabelEl) ? visLabelEl : visCell) || row;
+                const draftRect = draftTarget.getBoundingClientRect();
+
+                return {
+                  found: true,
+                  videoId: vid,
+                  title: rawTitle || t.title || '',
+                  rawVisText: rawVisText || (isDraft ? 'Draft' : isPrivate ? 'Private' : 'Unlisted'),
+                  isDraft,
+                  isPrivate,
+                  isUnlisted,
+                  hasEditDraftBtn,
+                  rowCenterX: Math.round(rowRect.left + Math.min(220, rowRect.width / 3)),
+                  rowCenterY: Math.round(rowRect.top + rowRect.height / 2),
+                  draftClickX: Math.round(draftRect.left + draftRect.width / 2),
+                  draftClickY: Math.round(draftRect.top + draftRect.height / 2),
+                };
+              }
+              return {
+                found: false,
+                videoId: '',
+                title: '',
+                rawVisText: '',
+                isDraft: false,
+                isPrivate: false,
+                isUnlisted: false,
+                hasEditDraftBtn: false,
+                rowCenterX: 0,
+                rowCenterY: 0,
+                draftClickX: 0,
+                draftClickY: 0,
+              };
+            },
+            target
+          )
+          .catch(() => ({
+            found: false,
+            videoId: '',
+            title: '',
+            rawVisText: '',
+            isDraft: false,
+            isPrivate: false,
+            isUnlisted: false,
+            hasEditDraftBtn: false,
+            rowCenterX: 0,
+            rowCenterY: 0,
+            draftClickX: 0,
+            draftClickY: 0,
+          }));
+      };
+
+      const initialCheck = await inspectTargetRowOnTable();
+      if (!initialCheck.found) {
+        this.log(
+          'draft->unlisted',
+          `[${targetLabel}] Row not found on current Channel Content view (videoId=${target.videoId || 'none'}, title=${target.title || 'none'})`,
+          'warn'
+        );
         return false;
       }
 
-      if (rowMatch.isUnlisted) {
+      if (initialCheck.isUnlisted) {
         this.log(
-          'visibility ok',
-          `[${targetLabel}] Row "${rowMatch.title}" (${rowMatch.videoId}) is already Unlisted`,
+          'draft->unlisted',
+          `[${targetLabel}] Confirmed: "${initialCheck.title}" (${initialCheck.videoId || 'video'}) is already Unlisted`,
           'ok'
         );
         return true;
       }
 
-      this.log(
-        'make unlisted',
-        `[${targetLabel}] Row "${rowMatch.title}" (${rowMatch.videoId}) is ${
-          rowMatch.isDraft ? 'Draft' : rowMatch.isPrivate ? 'Private' : 'non-Unlisted'
-        } -> converting to Unlisted now...`,
-        'info'
-      );
+      // Retry up to 3 times until "Draft" is confirmed changed to "Unlisted" on the Channel Content row
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        await this.dismissAllUploadDialogs(page).catch(() => {});
+        const rowInfo = attempt === 1 ? initialCheck : await inspectTargetRowOnTable();
+        if (!rowInfo.found) break;
 
-      // Case A: Video is in Draft (or has "Edit draft" button) -> click "Edit draft" to open upload wizard dialog
-      if (rowMatch.isDraft || rowMatch.hasEditDraftBtn) {
-        const openedDraftDialog = await page
+        if (rowInfo.isUnlisted) {
+          this.log(
+            'draft->unlisted',
+            `[${targetLabel}] CONFIRMED: "${rowInfo.title}" (${rowInfo.videoId || 'video'}) is now Unlisted!`,
+            'ok'
+          );
+          return true;
+        }
+
+        this.log(
+          'draft->unlisted',
+          `[${targetLabel}] Attempt ${attempt}/3: Row "${rowInfo.title}" shows "${rowInfo.rawVisText}" -> Step 1: Clicking "Draft" on row to reveal Pencil / Edit draft icon...`,
+          'info'
+        );
+
+        // Step 1: Click on "Draft" in the row's Visibility column and hover the row so the Pencil icon appears
+        if (rowInfo.draftClickX > 0 && rowInfo.draftClickY > 0) {
+          await page.mouse.move(rowInfo.draftClickX, rowInfo.draftClickY).catch(() => {});
+          await page.mouse.click(rowInfo.draftClickX, rowInfo.draftClickY).catch(() => {});
+        }
+        if (rowInfo.rowCenterX > 0 && rowInfo.rowCenterY > 0) {
+          await page.mouse.move(rowInfo.rowCenterX, rowInfo.rowCenterY).catch(() => {});
+        }
+        await page.waitForTimeout(550).catch(() => {});
+
+        // Step 2: Click the Pencil icon (Details / Edit draft) or "Edit draft" button on the row
+        const pencilOrDraftCoords = await page
           .evaluate(() => {
+            const isVis = (el: Element | null): el is HTMLElement => {
+              if (!el || !(el instanceof HTMLElement)) return false;
+              const r = el.getBoundingClientRect();
+              const s = window.getComputedStyle(el);
+              return r.width > 4 && r.height > 4 && s.display !== 'none' && s.visibility !== 'hidden';
+            };
             const row = document.querySelector(
               'ytcp-video-row[data-cmt-target-unlisted-row="true"]'
             ) as HTMLElement | null;
-            if (!row) return false;
-            const candidates = Array.from(
+            if (!row) return null;
+
+            // Priority 1: "Edit draft" button on the row (opens ytcp-uploads-dialog directly on Draft rows)
+            const buttons = Array.from(
               row.querySelectorAll('ytcp-button, button, a, [role="button"]')
             ) as HTMLElement[];
-            for (const el of candidates) {
+            for (const el of buttons) {
               const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
-              if (txt.includes('edit draft')) {
+              if (txt.includes('edit draft') && isVis(el)) {
                 el.click();
-                return true;
+                const inner = el.querySelector('button, a') as HTMLElement | null;
+                if (inner) inner.click();
+                const r = el.getBoundingClientRect();
+                return {
+                  label: 'Edit draft button',
+                  x: Math.round(r.left + r.width / 2),
+                  y: Math.round(r.top + r.height / 2),
+                };
               }
             }
-            const titleEl = row.querySelector('#video-title, a#video-title') as HTMLElement | null;
-            if (titleEl) {
-              titleEl.click();
-              return true;
+
+            // Priority 2: Pencil icon (Details button / create icon) on the hovered/clicked row
+            const pencilSelectors = [
+              'a#details-button',
+              'ytcp-icon-button#details-button',
+              '#details-button',
+              'ytcp-icon-button[aria-label*="Details" i]',
+              'a[aria-label*="Details" i]',
+              'button[aria-label*="Details" i]',
+              'tp-yt-iron-icon[icon*="create"]',
+              '#video-title',
+              'a#video-title',
+            ];
+            for (const sel of pencilSelectors) {
+              const el = row.querySelector(sel) as HTMLElement | null;
+              if (el && isVis(el)) {
+                el.click();
+                const r = el.getBoundingClientRect();
+                return {
+                  label: `Pencil icon (${sel})`,
+                  x: Math.round(r.left + r.width / 2),
+                  y: Math.round(r.top + r.height / 2),
+                };
+              }
             }
-            return false;
+            return null;
           })
-          .catch(() => false);
+          .catch(() => null);
 
-        if (openedDraftDialog) {
-          await page.waitForSelector('ytcp-uploads-dialog', { timeout: 10000 }).catch(() => {});
-          await page.waitForTimeout(1200).catch(() => {});
-
-          // Ensure "No, it's not made for kids" is selected if needed
-          await page
-            .evaluate(() => {
-              const r = document.querySelector(
-                'tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"], #audience tp-yt-paper-radio-button:nth-of-type(2)'
-              ) as HTMLElement | null;
-              if (r) r.click();
-            })
-            .catch(() => {});
-          await page.waitForTimeout(350).catch(() => {});
-
-          // Jump to Visibility step (#step-badge-3) or click Next up to 3 times
-          const step3 = page.locator('#step-badge-3').first();
-          if (await step3.isVisible().catch(() => false)) {
-            await step3.click({ force: true, timeout: 3000 }).catch(() => {});
-            await page.waitForTimeout(700).catch(() => {});
-          }
-          for (let i = 0; i < 3; i++) {
-            const unlVis = await page
-              .locator('tp-yt-paper-radio-button[name="UNLISTED"]')
-              .first()
-              .isVisible()
-              .catch(() => false);
-            if (unlVis) break;
-            const nextBtn = page.locator('#next-button').first();
-            if (await nextBtn.isVisible().catch(() => false)) {
-              await nextBtn.click({ force: true, timeout: 3000 }).catch(() => {});
-              await page.waitForTimeout(650).catch(() => {});
-            }
-          }
-
-          // Select Unlisted radio
-          await page
-            .evaluate(() => {
-              const r = document.querySelector(
-                'tp-yt-paper-radio-button[name="UNLISTED"], #privacy-radios tp-yt-paper-radio-button[name="UNLISTED"]'
-              ) as HTMLElement | null;
-              if (r) {
-                r.scrollIntoView({ block: 'center' });
-                r.click();
-              }
-            })
-            .catch(() => {});
-          await page.waitForTimeout(450).catch(() => {});
-
-          // Click Save (#done-button) and handle "We're still checking your content" popup
-          const doneBtn = page.locator('#done-button').first();
-          if (await doneBtn.isVisible().catch(() => false)) {
-            await doneBtn.click({ force: true, timeout: 4000 }).catch(() => {});
-          } else {
-            await page
-              .evaluate(() => {
-                const b = document.querySelector('#done-button') as HTMLElement | null;
-                if (b) b.click();
-              })
-              .catch(() => {});
-          }
-          await page.waitForTimeout(1400).catch(() => {});
-          await this.handleStillCheckingContentPopup(page, 'UNLISTED');
-          await page.waitForTimeout(1500).catch(() => {});
-          await this.dismissAllUploadDialogs(page).catch(() => {});
+        if (pencilOrDraftCoords) {
+          this.log(
+            'draft->unlisted',
+            `[${targetLabel}] Step 2: Clicking ${pencilOrDraftCoords.label} at (${pencilOrDraftCoords.x}, ${pencilOrDraftCoords.y})...`,
+            'info'
+          );
+          await page.mouse.click(pencilOrDraftCoords.x, pencilOrDraftCoords.y).catch(() => {});
         }
-      }
 
-      // Case B: Inline visibility popup on the Content row (works for Private videos or if Draft dialog didn't convert it)
-      const openedInlinePopup = await page
-        .evaluate(() => {
-          const row = document.querySelector(
-            'ytcp-video-row[data-cmt-target-unlisted-row="true"]'
-          ) as HTMLElement | null;
-          if (!row) return false;
-          const visText = (row.innerText || row.textContent || '').toLowerCase();
-          if (
-            /\bunlisted\b/i.test(visText) &&
-            !/\bdraft\b/i.test(visText) &&
-            !/\bprivate\b/i.test(visText)
-          ) {
-            return false; // Already converted by Case A
-          }
-          const cell = row.querySelector(
-            'ytcp-video-list-cell-visibility, .cell-body.tablecell-visibility, #visibility-label'
-          ) as HTMLElement | null;
-          if (cell) {
-            const clickTarget =
-              (cell.querySelector(
-                '.visibility-button, #visibility-label, ytcp-icon-button, button, [role="button"]'
-              ) as HTMLElement | null) || cell;
-            clickTarget.scrollIntoView({ block: 'center' });
-            clickTarget.click();
-            return true;
-          }
-          return false;
-        })
-        .catch(() => false);
+        await page
+          .waitForSelector('ytcp-uploads-dialog, ytcp-video-visibility-select, #step-badge-3', {
+            timeout: 8000,
+          })
+          .catch(() => {});
+        await page.waitForTimeout(1200).catch(() => {});
 
-      if (openedInlinePopup) {
-        await page.waitForTimeout(900).catch(() => {});
-        // Select Unlisted radio inside the inline visibility popup
+        // Step 3: Navigate to the Visibility tab inside ytcp-uploads-dialog (same as upload time)
         await page
           .evaluate(() => {
-            const radios = Array.from(
-              document.querySelectorAll('tp-yt-paper-radio-button[name="UNLISTED"]')
-            ) as HTMLElement[];
-            for (const r of radios) {
-              if (r.offsetWidth > 0 || r.offsetHeight > 0) {
-                r.scrollIntoView({ block: 'center' });
-                r.click();
-              }
+            const mfk = document.querySelector(
+              'ytcp-uploads-dialog tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"], tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]'
+            ) as HTMLElement | null;
+            if (mfk && mfk.getAttribute('aria-checked') !== 'true') {
+              mfk.click();
             }
           })
           .catch(() => {});
-        await page.waitForTimeout(450).catch(() => {});
+        await page.waitForTimeout(350).catch(() => {});
 
-        // Click Save / Publish inside the inline visibility popup
-        await page
-          .evaluate(() => {
-            const saveSelectors = [
-              'ytcp-video-visibility-select #save-button',
-              '#save-button',
-              '#done-button',
-              'ytcp-button#save-button',
-            ];
-            for (const sel of saveSelectors) {
-              const btns = Array.from(document.querySelectorAll(sel)) as HTMLElement[];
-              for (const b of btns) {
-                if (b.offsetWidth > 0 || b.offsetHeight > 0) {
+        for (let stepTry = 0; stepTry < 4; stepTry++) {
+          const onVisTab = await page
+            .evaluate(() => {
+              const isVis = (el: Element | null): boolean => {
+                if (!el || !(el instanceof HTMLElement)) return false;
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return r.width > 8 && r.height > 8 && s.display !== 'none' && s.visibility !== 'hidden';
+              };
+              const radios = Array.from(
+                document.querySelectorAll(
+                  'ytcp-uploads-dialog tp-yt-paper-radio-button[name="UNLISTED"], #privacy-radios tp-yt-paper-radio-button[name="UNLISTED"], tp-yt-paper-radio-button[name="UNLISTED"]'
+                )
+              );
+              return radios.some((r) => isVis(r));
+            })
+            .catch(() => false);
+          if (onVisTab) break;
+
+          const navCoords = await page
+            .evaluate((preferBadge: boolean) => {
+              const isVis = (el: Element | null): el is HTMLElement => {
+                if (!el || !(el instanceof HTMLElement)) return false;
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return r.width > 8 && r.height > 8 && s.display !== 'none' && s.visibility !== 'hidden';
+              };
+              if (preferBadge) {
+                const badges = Array.from(
+                  document.querySelectorAll(
+                    'ytcp-uploads-dialog #step-badge-3, ytcp-uploads-dialog [test-id="REVIEW"], #step-badge-3'
+                  )
+                );
+                const b = badges.find((el) => isVis(el));
+                if (b) {
                   b.click();
-                  return;
+                  const r = b.getBoundingClientRect();
+                  return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
                 }
               }
-            }
-            const allBtns = Array.from(
-              document.querySelectorAll('ytcp-button, button, [role="button"]')
-            ) as HTMLElement[];
-            for (const b of allBtns) {
-              if (b.offsetWidth === 0 && b.offsetHeight === 0) continue;
-              const t = (b.innerText || b.textContent || '').trim().toLowerCase();
-              if (t === 'save' || t === 'publish') {
-                b.click();
-                return;
+              const nexts = Array.from(
+                document.querySelectorAll(
+                  'ytcp-uploads-dialog #next-button button, ytcp-uploads-dialog #next-button, #next-button'
+                )
+              );
+              const n = nexts.find((el) => isVis(el));
+              if (n) {
+                n.click();
+                const r = n.getBoundingClientRect();
+                return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
               }
-            }
-          })
-          .catch(() => {});
-        await page.waitForTimeout(1400).catch(() => {});
-        await this.handleStillCheckingContentPopup(page, 'UNLISTED');
-        await page.waitForTimeout(1500).catch(() => {});
-        await this.dismissAllUploadDialogs(page).catch(() => {});
-      }
+              return null;
+            }, stepTry === 0)
+            .catch(() => null);
 
-      // Verify whether the row is now Unlisted on the Content table
-      const verifiedUnlisted = await page
-        .evaluate(() => {
-          const row = document.querySelector(
-            'ytcp-video-row[data-cmt-target-unlisted-row="true"]'
-          ) as HTMLElement | null;
-          if (!row) return false;
-          const visCell = row.querySelector(
-            'ytcp-video-list-cell-visibility, .cell-body.tablecell-visibility, #visibility-label'
-          ) as HTMLElement | null;
-          const visText = (
-            visCell?.innerText ||
-            visCell?.textContent ||
-            row.innerText ||
-            ''
-          ).toLowerCase();
-          return (
-            /\bunlisted\b/i.test(visText) &&
-            !/\bdraft\b/i.test(visText) &&
-            !/\bprivate\b/i.test(visText)
+          if (navCoords) {
+            await page.mouse.click(navCoords.x, navCoords.y).catch(() => {});
+          }
+          await page.waitForTimeout(900).catch(() => {});
+        }
+
+        // Step 4: Click "Unlisted" on the Visibility screen.
+        // CRITICAL (from user): On Blocked videos, clicking "Unlisted" will NOT visually highlight/enable the radio button,
+        // ("lekin es bar unlisted pr click krne pr bhi vo enable nhi dikhaega lekin vo ho gya he click jarur krna he")
+        // so we MUST click it via both DOM and real mouse coordinates and proceed directly to Save!
+        const unlistedClickCoords = await page
+          .evaluate(() => {
+            const isVis = (el: Element | null): el is HTMLElement => {
+              if (!el || !(el instanceof HTMLElement)) return false;
+              const r = el.getBoundingClientRect();
+              const s = window.getComputedStyle(el);
+              return r.width > 6 && r.height > 6 && s.display !== 'none' && s.visibility !== 'hidden';
+            };
+            const radios = Array.from(
+              document.querySelectorAll(
+                'ytcp-uploads-dialog tp-yt-paper-radio-button[name="UNLISTED"], #privacy-radios tp-yt-paper-radio-button[name="UNLISTED"], tp-yt-paper-radio-button[name="UNLISTED"]'
+              )
+            );
+            const targetRadio = radios.find((el) => isVis(el)) as HTMLElement | undefined;
+            if (!targetRadio) return null;
+
+            targetRadio.removeAttribute('disabled');
+            targetRadio.removeAttribute('aria-disabled');
+            targetRadio.style.removeProperty('pointer-events');
+            targetRadio.scrollIntoView({ block: 'center' });
+            targetRadio.click();
+
+            const radioCircle = targetRadio.querySelector(
+              '#radioContainer, #offRadio, #onRadio'
+            ) as HTMLElement | null;
+            if (radioCircle) radioCircle.click();
+            const radioLabel = targetRadio.querySelector('#radioLabel') as HTMLElement | null;
+            if (radioLabel) radioLabel.click();
+
+            const rect = (radioCircle || targetRadio).getBoundingClientRect();
+            return {
+              x: Math.round(rect.left + rect.width / 2),
+              y: Math.round(rect.top + rect.height / 2),
+            };
+          })
+          .catch(() => null);
+
+        if (unlistedClickCoords) {
+          await page.mouse.click(unlistedClickCoords.x, unlistedClickCoords.y).catch(() => {});
+          this.log(
+            'draft->unlisted',
+            `[${targetLabel}] Step 3 & 4: Reached Visibility & clicked "Unlisted" at (${unlistedClickCoords.x}, ${unlistedClickCoords.y}) (note: radio may stay visually unhighlighted on Blocked video, but click is active)`,
+            'info'
           );
-        })
-        .catch(() => false);
+        } else {
+          this.log(
+            'draft->unlisted',
+            `[${targetLabel}] Step 4 warn: Could not find visible Unlisted radio on attempt ${attempt}/3`,
+            'warn'
+          );
+        }
 
-      if (verifiedUnlisted) {
-        this.log(
-          'unlisted saved',
-          `[${targetLabel}] Successfully changed "${rowMatch.title}" (${rowMatch.videoId}) visibility to Unlisted`,
-          'ok'
-        );
-        return true;
-      }
+        await page.waitForTimeout(1000).catch(() => {});
 
-      // Fallback Case C: Open direct Video Details edit page (`/video/<id>/edit`) if we have videoId
-      if (rowMatch.videoId) {
-        this.log(
-          'make unlisted',
-          `[${targetLabel}] Opening video edit page for ${rowMatch.videoId} to force Unlisted...`,
-          'info'
-        );
-        await page
-          .goto(`https://studio.youtube.com/video/${rowMatch.videoId}/edit`, {
-            waitUntil: 'domcontentloaded',
-            timeout: 25000,
-          })
-          .catch(() => {});
-        await page.waitForTimeout(2500).catch(() => {});
-
-        // Click the visibility dropdown on the video edit page
-        await page
+        // Step 5: Click Save (#done-button)
+        const saveCoords = await page
           .evaluate(() => {
-            const trigger = document.querySelector(
-              'ytcp-video-metadata-visibility #container, ytcp-video-metadata-visibility, #visibility-button'
-            ) as HTMLElement | null;
-            if (trigger) trigger.click();
+            const isVis = (el: Element | null): el is HTMLElement => {
+              if (!el || !(el instanceof HTMLElement)) return false;
+              const r = el.getBoundingClientRect();
+              const s = window.getComputedStyle(el);
+              return r.width > 8 && r.height > 8 && s.display !== 'none' && s.visibility !== 'hidden';
+            };
+            const candidates = Array.from(
+              document.querySelectorAll(
+                'ytcp-uploads-dialog #done-button button, ytcp-uploads-dialog #done-button, #done-button button, ytcp-button#done-button, #save-button'
+              )
+            );
+            const btn = candidates.find((el) => isVis(el));
+            if (!btn) return null;
+            btn.removeAttribute('disabled');
+            btn.removeAttribute('aria-disabled');
+            btn.scrollIntoView({ block: 'center' });
+            btn.click();
+            const inner = btn.querySelector('button') as HTMLElement | null;
+            if (inner) {
+              inner.removeAttribute('disabled');
+              inner.click();
+            }
+            const r = btn.getBoundingClientRect();
+            return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
           })
-          .catch(() => {});
-        await page.waitForTimeout(700).catch(() => {});
+          .catch(() => null);
 
-        // Select Unlisted radio and click Done + top-right Save
-        await page
-          .evaluate(() => {
-            const r = document.querySelector(
-              'tp-yt-paper-radio-button[name="UNLISTED"]'
-            ) as HTMLElement | null;
-            if (r) r.click();
-          })
-          .catch(() => {});
-        await page.waitForTimeout(400).catch(() => {});
-        await page
-          .evaluate(() => {
-            const done = document.querySelector('#done-button') as HTMLElement | null;
-            if (done) done.click();
-          })
-          .catch(() => {});
-        await page.waitForTimeout(700).catch(() => {});
+        if (saveCoords) {
+          await page.mouse.click(saveCoords.x, saveCoords.y).catch(() => {});
+          this.log(
+            'draft->unlisted',
+            `[${targetLabel}] Step 5: Clicked "Save" (#done-button) at (${saveCoords.x}, ${saveCoords.y})`,
+            'info'
+          );
+        }
+
+        await page.waitForTimeout(1600).catch(() => {});
+
+        // Step 6: Handle the secondary popup ("fir ek or pop up ayega done dbao" / "Publish anyway" / "Video published" Close)
         await this.handleStillCheckingContentPopup(page, 'UNLISTED');
-        await page
-          .evaluate(() => {
-            const save = document.querySelector('#save') as HTMLElement | null;
-            if (save) save.click();
-          })
-          .catch(() => {});
+
+        for (let popPoll = 0; popPoll < 4; popPoll++) {
+          const popupBtnClicked = await page
+            .evaluate(() => {
+              const isVis = (el: Element | null): el is HTMLElement => {
+                if (!el || !(el instanceof HTMLElement)) return false;
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return r.width > 6 && r.height > 6 && s.display !== 'none' && s.visibility !== 'hidden';
+              };
+              const dialogs = Array.from(
+                document.querySelectorAll(
+                  'ytcp-video-share-dialog, ytcp-uploads-still-processing-dialog, ytcp-confirmation-dialog, tp-yt-paper-dialog[aria-modal="true"], tp-yt-paper-dialog, ytcp-dialog, [role="dialog"]'
+                )
+              ) as HTMLElement[];
+
+              for (const dlg of dialogs) {
+                if (!isVis(dlg)) continue;
+                if (dlg.tagName.toLowerCase() === 'ytcp-uploads-dialog') continue;
+
+                const buttons = Array.from(
+                  dlg.querySelectorAll(
+                    'ytcp-button, button, [role="button"], #confirm-button, #done-button, #close-button, #close-icon-button'
+                  )
+                ) as HTMLElement[];
+
+                // First check for "Done", "Publish anyway", "Confirm", "Save", or "Close"
+                for (const b of buttons) {
+                  if (!isVis(b)) continue;
+                  const txt = (b.innerText || b.textContent || '').trim().toLowerCase();
+                  const id = (b.getAttribute('id') || '').toLowerCase();
+                  const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                  if (
+                    txt === 'done' ||
+                    txt === 'publish anyway' ||
+                    txt === 'close' ||
+                    txt === 'got it' ||
+                    id === 'confirm-button' ||
+                    id === 'close-button' ||
+                    aria === 'close'
+                  ) {
+                    b.click();
+                    const inner = b.querySelector('button, tp-yt-iron-icon') as HTMLElement | null;
+                    if (inner) inner.click();
+                    const r = b.getBoundingClientRect();
+                    return {
+                      label: txt || id || aria || 'popup-button',
+                      x: Math.round(r.left + r.width / 2),
+                      y: Math.round(r.top + r.height / 2),
+                    };
+                  }
+                }
+              }
+              return null;
+            })
+            .catch(() => null);
+
+          if (popupBtnClicked) {
+            await page.mouse.click(popupBtnClicked.x, popupBtnClicked.y).catch(() => {});
+            this.log(
+              'draft->unlisted',
+              `[${targetLabel}] Step 6: Clicked "${popupBtnClicked.label}" on post-Save popup`,
+              'info'
+            );
+            await page.waitForTimeout(900).catch(() => {});
+          } else {
+            break;
+          }
+        }
+
+        await this.dismissAllUploadDialogs(page).catch(() => {});
         await page.waitForTimeout(1800).catch(() => {});
-        await this.handleStillCheckingContentPopup(page, 'UNLISTED');
 
-        // Return to Channel Content page
-        await page
-          .goto('https://studio.youtube.com/channel/mine/videos/upload', {
-            waitUntil: 'domcontentloaded',
-            timeout: 25000,
-          })
-          .catch(() => {});
-        await page.waitForTimeout(2000).catch(() => {});
-        return true;
+        // Step 7: Confirm on the Channel Content table that "Draft" has changed to "Unlisted"!
+        // ("or fir draft confirm kro draft ki jagah unlisted aya he ya nhi nhi to fir se kro")
+        let verifyRow = await inspectTargetRowOnTable();
+        if (verifyRow.found && !verifyRow.isUnlisted && attempt >= 2) {
+          // Reload Content table once to be 100% sure DOM isn't showing stale Draft badge
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+          await page.waitForSelector('ytcp-video-row', { timeout: 12000 }).catch(() => {});
+          await page.waitForTimeout(1500).catch(() => {});
+          verifyRow = await inspectTargetRowOnTable();
+        }
+
+        if (verifyRow.found && verifyRow.isUnlisted) {
+          this.log(
+            'draft->unlisted',
+            `[${targetLabel}] Step 7 CONFIRMED: "${verifyRow.title}" (${verifyRow.videoId || 'video'}) changed from Draft -> Unlisted (attempt ${attempt}/3)!`,
+            'ok'
+          );
+          return true;
+        }
+
+        this.log(
+          'draft->unlisted',
+          `[${targetLabel}] Step 7 check: "${verifyRow.title || targetLabel}" still shows "${
+            verifyRow.rawVisText || 'Draft'
+          }" after attempt ${attempt}/3${attempt < 3 ? ' -> retrying...' : ''}`,
+          'warn'
+        );
       }
 
       return false;
     } catch (err: unknown) {
       this.log(
-        'make unlisted warn',
-        `Could not auto-convert row to Unlisted: ${err instanceof Error ? err.message : String(err)}`,
+        'draft->unlisted error',
+        `Could not convert row to Unlisted: ${err instanceof Error ? err.message : String(err)}`,
         'error'
       );
       return false;
@@ -2954,10 +3178,25 @@ export class YtStudioBrowserController {
                 break;
               }
             }
+            if (!videoId) {
+              const imgs = Array.from(row.querySelectorAll('img[src]'));
+              for (const img of imgs) {
+                const src = img.getAttribute('src') || (img as HTMLImageElement).src || '';
+                const mThumb = src.match(/\/vi(?:_webp)?\/([a-zA-Z0-9_-]{11})\//);
+                if (mThumb) {
+                  videoId = mThumb[1];
+                  break;
+                }
+              }
+            }
+            if (!videoId) {
+              const html = row.outerHTML || '';
+              const mHtml =
+                html.match(/\/video\/([a-zA-Z0-9_-]{11})/) ||
+                html.match(/\/vi(?:_webp)?\/([a-zA-Z0-9_-]{11})\//);
+              if (mHtml) videoId = mHtml[1];
+            }
 
-            if (!videoId) continue;
-
-            const ytUrl = `https://youtu.be/${videoId}`;
             const mTitle = title.match(/^cmt-([a-zA-Z0-9_-]+)-w(\d+)\b/i);
             const mWinFile = !mTitle ? title.match(/\bwin[-_\s]+(\d+)[-_\s]+f\d+/i) : null;
             const rowScanPrefix = mTitle ? mTitle[1] : null;
@@ -2966,6 +3205,10 @@ export class YtStudioBrowserController {
               : mWinFile
                 ? Number(mWinFile[1])
                 : null;
+
+            // Never skip a Draft row with a valid cmt-<prefix>-w<N> title even if YouTube Studio hasn't rendered <a href="/video/..."> yet!
+            if (!videoId && windowNumber === null && !title) continue;
+            const ytUrl = videoId ? `https://youtu.be/${videoId}` : '';
 
             const visLabelEl = row.querySelector(
               '#visibility-label, ytcp-video-list-cell-visibility #visibility-label, .tablecell-visibility #visibility-label'
@@ -3812,6 +4055,7 @@ export class YtStudioBrowserController {
           }))
       : [];
 
+    this.syncLogsFromDiskIfNeeded();
     return {
       status: this.status,
       assistMode: this.assistMode,
@@ -3819,7 +4063,7 @@ export class YtStudioBrowserController {
       currentUrl: this.page && !this.page.isClosed() ? this.page.url() : '',
       channelId: this.channelId,
       channelHandle: this.channelHandle,
-      logs: this.logs.slice(0, 80),
+      logs: this.logs.slice(0, 500),
       lastError: this.lastError,
       screenshotBase64,
       viewport: this.viewport,

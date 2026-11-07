@@ -836,31 +836,38 @@ export function YtStudioPanel({ studio, scanId, scan, onRefresh }: YtStudioPanel
         </div>
 
         {/* NICHE STEP LOGS */}
-        <div className="border-t border-zinc-800 bg-zinc-950/95 p-2.5 max-h-40 overflow-y-auto font-mono text-[11px] space-y-1">
-          {snap?.logs && snap.logs.length > 0 ? (
-            snap.logs.slice(0, 30).map((l, idx) => (
-              <div key={`${l.ts}-${idx}`} className="flex items-start gap-2">
-                <span className="text-zinc-500 shrink-0">
-                  {new Date(l.ts).toTimeString().slice(0, 8)}
-                </span>
-                <span
-                  className={
-                    l.status === 'error'
-                      ? 'text-red-400'
-                      : l.status === 'warn'
-                        ? 'text-amber-300'
-                        : l.status === 'ok'
-                          ? 'text-emerald-300'
-                          : 'text-zinc-300'
-                  }
-                >
-                  [{l.step}] {l.detail}
-                </span>
-              </div>
-            ))
-          ) : (
-            <div className="text-zinc-500">No YouTube Studio logs yet.</div>
-          )}
+        <div className="border-t border-zinc-800 bg-zinc-950/95">
+          <div className="px-2.5 py-1 border-b border-zinc-800/80 flex items-center justify-between text-[10px] font-mono text-zinc-400">
+            <span>
+              YouTube Studio Step Logs ({snap?.logs?.length || 0}/500 lines — preserved, including Draft → Unlisted steps)
+            </span>
+          </div>
+          <div className="p-2.5 max-h-72 overflow-y-auto font-mono text-[11px] space-y-1">
+            {snap?.logs && snap.logs.length > 0 ? (
+              snap.logs.map((l, idx) => (
+                <div key={`${l.ts}-${idx}`} className="flex items-start gap-2">
+                  <span className="text-zinc-500 shrink-0">
+                    {new Date(l.ts).toTimeString().slice(0, 8)}
+                  </span>
+                  <span
+                    className={
+                      l.status === 'error'
+                        ? 'text-red-400'
+                        : l.status === 'warn'
+                          ? 'text-amber-300'
+                          : l.status === 'ok'
+                            ? 'text-emerald-300'
+                            : 'text-zinc-300'
+                    }
+                  >
+                    [{l.step}] {l.detail}
+                  </span>
+                </div>
+              ))
+            ) : (
+              <div className="text-zinc-500">No YouTube Studio logs yet.</div>
+            )}
+          </div>
         </div>
       </div>
 

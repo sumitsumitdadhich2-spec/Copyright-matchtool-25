@@ -6103,6 +6103,7 @@ export class StudioBrowserController {
     username: string
     scanId: string
     jobLabel: string
+    windowNumber?: number
     modelName: string
     thinkingLevel?: StudioThinkingLevel
     maxOutputTokens: number
@@ -6163,6 +6164,12 @@ export class StudioBrowserController {
       measuredTokenRate = null,
       onLog,
     } = params
+
+    const windowNumber: number | undefined =
+      params.windowNumber ??
+      (Number(jobLabel.match(/Window\s*#(\d+)/i)?.[1]) ||
+        Number(windowClip?.clipPath?.match(/\bwin-(\d+)-/i)?.[1]) ||
+        undefined)
 
     const userCfg = await loadStudioUserConfig(username)
     const effectiveThinkingLevel = normalizeStudioThinkingLevel(
