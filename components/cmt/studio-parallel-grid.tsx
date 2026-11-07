@@ -785,7 +785,7 @@ export function StudioParallelGrid({
                       minuteInput: minuteInput.trim(),
                       minuteInputSource,
                       concurrency,
-                      resumeExisting: false,
+                      resumeExisting: true,
                     },
                     'start_parallel',
                   )

@@ -11,7 +11,6 @@ import {
 import { MEDIA_DIR } from './paths';
 import {
   markAllChannelClipsYtDeleted,
-  markClipYtDeleted,
   readClipYtSidecar,
   saveClipYtSidecar,
 } from './studio-window-clips';
@@ -1196,18 +1195,38 @@ export class YtStudioBrowserController {
     } = opts;
 
     if (!forceUpload) {
-      const existing = readClipYtSidecar(clipPath);
-      if (existing && existing.ytUrl && existing.ytVideoId && !existing.ytDeleted) {
-        this.uploadedVideoIdsInSession.add(existing.ytVideoId);
+      const scanPrefix = scanId ? scanId.slice(0, 8).toLowerCase() : '';
+      const existing =
+        readClipYtSidecar(clipPath) ||
+        readClipYtSidecar(scanId, windowNumber);
+      const contentMatch = this.contentProgress?.items?.find(
+        (it) =>
+          it.windowNumber === windowNumber &&
+          (!it.scanPrefix || !scanPrefix || it.scanPrefix.toLowerCase() === scanPrefix)
+      );
+      const cachedUrl = existing?.ytUrl || contentMatch?.ytUrl;
+      const cachedId = existing?.ytVideoId || contentMatch?.videoId;
+      if (cachedUrl && cachedId && !existing?.ytDeleted) {
+        this.uploadedVideoIdsInSession.add(cachedId);
+        if (!existing?.ytUrl) {
+          saveClipYtSidecar(clipPath, {
+            scanId,
+            windowNumber,
+            ytUrl: cachedUrl,
+            ytVideoId: cachedId,
+            ytUploadedAt: Date.now(),
+            ytDeleted: false,
+          });
+        }
         this.log(
           'sidecar hit',
-          `Reusing cached YouTube link for W${String(windowNumber).padStart(2, '0')}: ${existing.ytUrl}`,
+          `Reusing cached YouTube link for W${String(windowNumber).padStart(2, '0')}: ${cachedUrl}`,
           'ok'
         );
         onProgress?.('link ready');
         return {
-          ytUrl: existing.ytUrl,
-          ytVideoId: existing.ytVideoId,
+          ytUrl: cachedUrl,
+          ytVideoId: cachedId,
           reused: true,
         };
       }
@@ -1319,6 +1338,55 @@ export class YtStudioBrowserController {
           if (preExistingModalUrl) {
             const preMatch = preExistingModalUrl.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
             if (preMatch?.[1]) ignoreVideoIds.add(preMatch[1]);
+          }
+
+          // Before opening the upload picker, check if this window's video ("cmt-<prefix>-w<N>") is ALREADY on the Content table
+          if (!forceUpload) {
+            const existingOnTable = await uploadPage
+              .evaluate((expectedTitle: string) => {
+                const rows = Array.from(document.querySelectorAll('ytcp-video-row'));
+                for (const row of rows) {
+                  const titleEl = row.querySelector('#video-title, a#video-title') as HTMLElement | null;
+                  const rowTitle = (titleEl?.innerText || titleEl?.textContent || '').replace(/\s+/g, ' ').trim();
+                  if (rowTitle.toLowerCase() !== expectedTitle.toLowerCase()) continue;
+                  const anchors = Array.from(row.querySelectorAll('a[href]'));
+                  for (const a of anchors) {
+                    const href = a.getAttribute('href') || '';
+                    const m =
+                      href.match(/\/video\/([a-zA-Z0-9_-]{11})/) ||
+                      href.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/) ||
+                      href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+                    if (m?.[1]) {
+                      return { videoId: m[1], ytUrl: `https://youtu.be/${m[1]}` };
+                    }
+                  }
+                }
+                return null;
+              }, title)
+              .catch(() => null);
+
+            if (existingOnTable?.ytUrl && existingOnTable.videoId) {
+              this.uploadedVideoIdsInSession.add(existingOnTable.videoId);
+              saveClipYtSidecar(clipPath, {
+                scanId,
+                windowNumber,
+                ytUrl: existingOnTable.ytUrl,
+                ytVideoId: existingOnTable.videoId,
+                ytUploadedAt: Date.now(),
+                ytDeleted: false,
+              });
+              onProgress?.('link ready');
+              this.log(
+                'already uploaded',
+                `[W${String(windowNumber).padStart(2, '0')}] Video "${title}" already on channel -> ${existingOnTable.ytUrl} (skipping duplicate upload)`,
+                'ok'
+              );
+              return {
+                ytUrl: existingOnTable.ytUrl,
+                ytVideoId: existingOnTable.videoId,
+                reused: true,
+              };
+            }
           }
 
           this.log(
@@ -1684,7 +1752,7 @@ export class YtStudioBrowserController {
                     `ytcp-uploads-dialog tp-yt-paper-radio-button[name="${rName}"], #privacy-radios tp-yt-paper-radio-button[name="${rName}"], tp-yt-paper-radio-button[name="${rName}"]`
                   )
                 );
-                const target = (radios.find((el) => isVis(el)) || radios[0]) as HTMLElement | undefined;
+                const target = radios.find((el) => isVis(el)) as HTMLElement | undefined;
                 if (!target) return null;
                 target.scrollIntoView({ block: 'center' });
                 target.click();
@@ -1708,12 +1776,18 @@ export class YtStudioBrowserController {
             }
             const verifiedChecked = await uploadPage
               .evaluate((rName: string) => {
+                const isVis = (el: Element | null): boolean => {
+                  if (!el || !(el instanceof HTMLElement)) return false;
+                  const r = el.getBoundingClientRect();
+                  const s = window.getComputedStyle(el);
+                  return r.width > 10 && r.height > 10 && s.display !== 'none' && s.visibility !== 'hidden';
+                };
                 const radios = Array.from(
                   document.querySelectorAll(
                     `ytcp-uploads-dialog tp-yt-paper-radio-button[name="${rName}"], #privacy-radios tp-yt-paper-radio-button[name="${rName}"], tp-yt-paper-radio-button[name="${rName}"]`
                   )
                 );
-                return radios.some((r) => r.getAttribute('aria-checked') === 'true');
+                return radios.some((r) => isVis(r) && r.getAttribute('aria-checked') === 'true');
               }, targetRadioName)
               .catch(() => false);
             if (verifiedChecked) break;
@@ -1740,7 +1814,7 @@ export class YtStudioBrowserController {
                 const hosts = Array.from(
                   document.querySelectorAll('ytcp-uploads-dialog #done-button, ytcp-button#done-button, #done-button')
                 );
-                const host = (hosts.find((el) => isVis(el)) || hosts[0]) as HTMLElement | undefined;
+                const host = hosts.find((el) => isVis(el)) as HTMLElement | undefined;
                 const innerBtn = host?.querySelector('button') as HTMLButtonElement | null;
                 const progEl = document.querySelector(
                   'ytcp-uploads-dialog ytcp-video-upload-progress, ytcp-video-upload-progress, .progress-label'
@@ -1774,13 +1848,40 @@ export class YtStudioBrowserController {
           // Click the VISIBLE Save / Done button and verify the Visibility dialog closes (retry up to 6 times)
           for (let saveTry = 1; saveTry <= 6; saveTry++) {
             const doneCoords = await uploadPage
-              .evaluate(() => {
+              .evaluate((rName: string) => {
                 const isVis = (el: Element | null): el is HTMLElement => {
                   if (!el || !(el instanceof HTMLElement)) return false;
                   const r = el.getBoundingClientRect();
                   const s = window.getComputedStyle(el);
                   return r.width > 10 && r.height > 10 && s.display !== 'none' && s.visibility !== 'hidden';
                 };
+                // If still on Details / Video elements / Checks tab (#next-button visible), click #step-badge-3 or #next-button first
+                const nextBtns = Array.from(
+                  document.querySelectorAll(
+                    'ytcp-uploads-dialog #next-button button, ytcp-uploads-dialog #next-button'
+                  )
+                );
+                const visNext = nextBtns.find((el) => isVis(el));
+                if (visNext) {
+                  const stepBadges = Array.from(
+                    document.querySelectorAll('ytcp-uploads-dialog #step-badge-3, #step-badge-3')
+                  );
+                  const visBadge = stepBadges.find((el) => isVis(el));
+                  if (visBadge) visBadge.click();
+                  else visNext.click();
+                }
+
+                // Ensure Unlisted/Private radio is selected if visible
+                const radios = Array.from(
+                  document.querySelectorAll(
+                    `ytcp-uploads-dialog tp-yt-paper-radio-button[name="${rName}"], #privacy-radios tp-yt-paper-radio-button[name="${rName}"], tp-yt-paper-radio-button[name="${rName}"]`
+                  )
+                );
+                const visRadio = radios.find((el) => isVis(el));
+                if (visRadio && visRadio.getAttribute('aria-checked') !== 'true') {
+                  visRadio.click();
+                }
+
                 const candidates = Array.from(
                   document.querySelectorAll(
                     'ytcp-uploads-dialog #done-button button, ytcp-uploads-dialog #done-button, #done-button button, ytcp-button#done-button'
@@ -1794,7 +1895,7 @@ export class YtStudioBrowserController {
                 if (inner) inner.click();
                 const r = visDone.getBoundingClientRect();
                 return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
-              })
+              }, targetRadioName)
               .catch(() => null);
 
             if (doneCoords) {
@@ -1808,7 +1909,7 @@ export class YtStudioBrowserController {
               shareUrl = await this.extractShareUrlFromUploadModal(uploadPage, ignoreVideoIds);
             }
 
-            // Check if ANY visible #done-button or visibility radio inside ytcp-uploads-dialog is still on screen
+            // Check if ANY visible #done-button, #next-button, or visibility radio inside ytcp-uploads-dialog is still on screen
             const modalStillOnEditOrVisibility = await uploadPage
               .evaluate((rName: string) => {
                 const isVis = (el: Element | null): boolean => {
@@ -1824,7 +1925,7 @@ export class YtStudioBrowserController {
 
                 const editOrVisOpen = Array.from(
                   document.querySelectorAll(
-                    `ytcp-uploads-dialog #done-button, ytcp-uploads-dialog tp-yt-paper-radio-button[name="${rName}"], ytcp-uploads-dialog #title-textarea`
+                    `ytcp-uploads-dialog #done-button, ytcp-uploads-dialog #next-button, ytcp-uploads-dialog tp-yt-paper-radio-button[name="${rName}"], ytcp-uploads-dialog #title-textarea`
                   )
                 ).some((el) => isVis(el));
                 return editOrVisOpen;
@@ -2213,7 +2314,7 @@ export class YtStudioBrowserController {
       return false;
     };
 
-    const syncSidecarsForItems = (items: YtContentVideoItem[], tableConfirmedLoaded: boolean) => {
+    const syncSidecarsForItems = (items: YtContentVideoItem[]) => {
       for (const item of items) {
         if (!item.videoId || !item.ytUrl) continue;
         // 1. Check explicit expectedWindows list (strictly filtered by matchesExpectedWindow so cross-scan items never pollute)
@@ -2267,89 +2368,15 @@ export class YtStudioBrowserController {
           }
         }
       }
-
-      // 3. Invalidate stale/deleted/polluted sidecars for this scan that do NOT exist on the live channel Content table
-      if (tableConfirmedLoaded && scanId && scanPrefix && items.length < 28) {
-        try {
-          const clipsFolder = path.join(MEDIA_DIR, scanId, 'clips');
-          if (fs.existsSync(clipsFolder)) {
-            const liveScanVideoIds = new Set(
-              items
-                .filter(
-                  (it) =>
-                    !it.scanPrefix || it.scanPrefix.toLowerCase() === scanPrefix.toLowerCase()
-                )
-                .map((it) => it.videoId)
-            );
-            const liveScanWindowNums = new Set(
-              items
-                .filter(
-                  (it) =>
-                    it.windowNumber !== null &&
-                    (!it.scanPrefix || it.scanPrefix.toLowerCase() === scanPrefix.toLowerCase())
-                )
-                .map((it) => it.windowNumber as number)
-            );
-            const jsonFiles = fs.readdirSync(clipsFolder).filter((f) => f.endsWith('.json'));
-            for (const jf of jsonFiles) {
-              const fullPath = path.join(clipsFolder, jf);
-              try {
-                const raw = JSON.parse(fs.readFileSync(fullPath, 'utf8')) as {
-                  windowNumber?: number;
-                  ytUrl?: string;
-                  ytVideoId?: string;
-                  ytDeleted?: boolean;
-                };
-                if (!raw || !raw.ytUrl || raw.ytDeleted) continue;
-                const mWin = jf.match(/^win-(\d+)-/);
-                const winNum = raw.windowNumber ?? (mWin ? Number(mWin[1]) : null);
-                const existsById = raw.ytVideoId ? liveScanVideoIds.has(raw.ytVideoId) : false;
-                const existsByWin = winNum !== null ? liveScanWindowNums.has(winNum) : false;
-                if (!existsById && !existsByWin) {
-                  if (winNum !== null) {
-                    markClipYtDeleted(scanId, winNum);
-                  }
-                  const updated = { ...raw, ytDeleted: true };
-                  fs.writeFileSync(fullPath, JSON.stringify(updated, null, 2), 'utf8');
-                }
-              } catch {
-                // ignore individual sidecar parse error
-              }
-            }
-          }
-        } catch {
-          // ignore stale sidecar cleanup error
-        }
-      }
     };
 
     while (true) {
       let allItems = await readRowsFromDom();
-      let isEmptyTableConfirmed = false;
-      if (allItems.length === 0 && page.url().includes('/videos')) {
-        isEmptyTableConfirmed = await page
-          .evaluate(() => {
-            const txt = (document.body?.innerText || '').toLowerCase();
-            return txt.includes('no content available') || txt.includes('upload videos');
-          })
-          .catch(() => false);
-        if (!isEmptyTableConfirmed && refreshCycle === 0) {
-          await page.waitForTimeout(3500);
-          allItems = await readRowsFromDom();
-          if (allItems.length === 0) {
-            isEmptyTableConfirmed = await page
-              .evaluate(() => {
-                const txt = (document.body?.innerText || '').toLowerCase();
-                return txt.includes('no content available');
-              })
-              .catch(() => false);
-          }
-        }
+      if (allItems.length === 0 && refreshCycle === 0 && page.url().includes('/videos')) {
+        await page.waitForTimeout(3000);
+        allItems = await readRowsFromDom();
       }
-
-      const tableConfirmedLoaded =
-        page.url().includes('/videos') && (allItems.length > 0 || isEmptyTableConfirmed);
-      syncSidecarsForItems(allItems, tableConfirmedLoaded);
+      syncSidecarsForItems(allItems);
 
       // Filter relevant items strictly for this scan (never count another scan's cmt-<other>-w<N> videos!)
       const relevantItems =
@@ -2402,7 +2429,7 @@ export class YtStudioBrowserController {
       // If processingCount === 0 and tableConfirmedLoaded (or refreshCycle >= 1), all uploaded videos on the channel are already Ready,
       // and any remaining expectedCount - uploadedCount videos are missing from the channel and need to be uploaded rather than waited on.
       const noVideosProcessingSd =
-        processingCount === 0 && (tableConfirmedLoaded || refreshCycle >= 1);
+        processingCount === 0 && (page.url().includes('/videos') || refreshCycle >= 1);
 
       if (
         this.stopRequested ||

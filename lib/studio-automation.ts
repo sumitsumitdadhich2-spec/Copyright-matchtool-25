@@ -1823,63 +1823,129 @@ export class StudioBrowserController {
   }
 
   /**
-   * Close any "paid API key" / billing / API key selection dialog ONLY via its cross (X / close) button.
-   * Never clicks any button that selects an API key, links a project, or sets up billing.
+   * Close any "Redeem your credits" popover or "paid API key" / billing / API key selection dialog
+   * ONLY via its cross (X / close) button. Never clicks "Redeem credits" or billing upgrade buttons.
    */
   private async closePaidApiKeyPopupByCrossButton(page: Page): Promise<boolean> {
     try {
-      const closed = await page.evaluate(() => {
+      if (!page || page.isClosed()) return false
+      const res = await page.evaluate(() => {
         const isVisible = (el: Element | null): el is HTMLElement => {
           if (!el) return false
           const h = el as HTMLElement
           const r = h.getBoundingClientRect()
-          return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+          const s = window.getComputedStyle(h)
+          return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'
         }
 
-        const dialogs = Array.from(
-          document.querySelectorAll('mat-dialog-container, [role="dialog"], [aria-modal="true"]'),
-        ).filter(isVisible)
-
         let closedAny = false
-        for (const dlg of dialogs) {
-          const txt = (dlg.innerText || dlg.textContent || '').trim()
-          if (
-            !/paid\s+api\s+key|billing|select\s+an?\s+api\s+key|link\s+a\s+paid|pay-as-you-go|api\s+key\s+required|set\s+up\s+billing/i.test(
-              txt,
-            )
-          ) {
-            continue
-          }
+        let crossCoords: { x: number; y: number } | null = null
 
-          const buttons = Array.from(dlg.querySelectorAll('button, [role="button"]')).filter(isVisible)
-          for (const b of buttons) {
+        // 1. Check floating "Redeem your credits" / "Redeem your free credits" popovers & cards
+        const allContainers = Array.from(
+          document.querySelectorAll(
+            '.cdk-overlay-pane, mat-dialog-container, [role="dialog"], [role="alertdialog"], [role="tooltip"], [class*="popover" i], [class*="callout" i], [class*="onboarding" i], [class*="promo" i], div, section, aside',
+          ),
+        ).filter((el) => {
+          if (!isVisible(el)) return false
+          const r = el.getBoundingClientRect()
+          if (r.width < 120 || r.width > 720 || r.height < 60 || r.height > 560) return false
+          const txt = ((el as HTMLElement).innerText || el.textContent || '').replace(/\s+/g, ' ').trim()
+          return /redeem\s+your\s+credits|redeem\s+your\s+free\s+credits|paid\s+api\s+key|select\s+an?\s+api\s+key|link\s+a\s+paid|pay-as-you-go|api\s+key\s+required|set\s+up\s+billing/i.test(
+            txt,
+          )
+        })
+
+        // Sort smallest container first so we target the exact floating card, not a page wrapper
+        allContainers.sort((a, b) => {
+          const ra = a.getBoundingClientRect()
+          const rb = b.getBoundingClientRect()
+          return ra.width * ra.height - rb.width * rb.height
+        })
+
+        for (const card of allContainers) {
+          const cardRect = card.getBoundingClientRect()
+          const clickables = Array.from(
+            card.querySelectorAll(
+              'button, [role="button"], mat-icon, .material-symbols-outlined, .google-symbols, span, a, svg',
+            ),
+          ).filter(isVisible)
+
+          for (const b of clickables) {
             const aria = (b.getAttribute('aria-label') || '').trim()
             const title = (b.getAttribute('title') || b.getAttribute('mattooltip') || '').trim()
-            const iconText = (b.innerText || b.textContent || '').trim()
-            const isCloseCross =
+            const iconText = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim()
+            const bRect = b.getBoundingClientRect()
+
+            const isForbiddenAction =
+              /\b(redeem|claim|select|save|confirm|upgrade|billing|link|create|enable|continue|accept|learn)\b/i.test(
+                `${aria} ${title} ${iconText}`,
+              ) && !/^(close|×|✕|✖|x)$/i.test(iconText)
+
+            if (isForbiddenAction) continue
+
+            const isExplicitCross =
               /\b(close|dismiss)\b/i.test(aria) ||
               /\b(close|dismiss)\b/i.test(title) ||
-              /^(close|×|✕|✖|x)$/i.test(iconText)
-            const isForbiddenAction =
-              /\b(select|save|confirm|upgrade|billing|link|create|enable|continue|accept)\b/i.test(
-                `${aria} ${iconText}`,
-              ) && !/^(close|×|✕|✖)$/i.test(iconText)
+              /^(close|clear|×|✕|✖|x)$/i.test(iconText)
 
-            if (isCloseCross && !isForbiddenAction) {
-              b.click()
+            const isTopRightSmallCloseBtn =
+              bRect.width <= 44 &&
+              bRect.height <= 44 &&
+              bRect.left >= cardRect.left + cardRect.width * 0.65 &&
+              bRect.top <= cardRect.top + Math.min(80, cardRect.height * 0.45) &&
+              (b.tagName.toLowerCase() === 'button' ||
+                b.getAttribute('role') === 'button' ||
+                b.tagName.toLowerCase() === 'mat-icon' ||
+                b.tagName.toLowerCase() === 'svg')
+
+            if (isExplicitCross || isTopRightSmallCloseBtn) {
+              const btnTarget = (b.closest('button, [role="button"]') as HTMLElement | null) || b
+              btnTarget.click()
+              const r = btnTarget.getBoundingClientRect()
+              if (r.width > 0 && r.height > 0) {
+                crossCoords = {
+                  x: Math.round(r.left + r.width / 2),
+                  y: Math.round(r.top + r.height / 2),
+                }
+              }
               closedAny = true
               break
             }
           }
+          if (closedAny) break
         }
-        return closedAny
+
+        // Also hide any remaining floating "Redeem your credits" overlay pane so it never blocks video chips
+        const redeemOverlays = Array.from(
+          document.querySelectorAll('.cdk-overlay-pane, [class*="popover" i], [class*="callout" i]'),
+        ).filter((el) => {
+          if (!isVisible(el)) return false
+          const txt = ((el as HTMLElement).innerText || el.textContent || '').trim()
+          return /redeem\s+your\s+credits|redeem\s+your\s+free\s+credits/i.test(txt)
+        })
+        for (const ov of redeemOverlays) {
+          ;(ov as HTMLElement).style.display = 'none'
+          ;(ov as HTMLElement).style.pointerEvents = 'none'
+          closedAny = true
+        }
+
+        return { closedAny, crossCoords }
       })
 
-      if (closed) {
-        this.logStep('paid API key popup closed', 'Closed paid API key / billing dialog via X button', 'info')
-        await new Promise((r) => setTimeout(r, 350))
+      if (res?.crossCoords) {
+        await page.mouse.click(res.crossCoords.x, res.crossCoords.y).catch(() => {})
       }
-      return closed
+
+      if (res?.closedAny) {
+        this.logStep(
+          'popup closed',
+          'Closed "Redeem your credits" / billing popup via cross (X) button',
+          'info',
+        )
+        await new Promise((r) => setTimeout(r, 300))
+      }
+      return Boolean(res?.closedAny)
     } catch {
       return false
     }
@@ -1895,6 +1961,9 @@ export class StudioBrowserController {
   public async closeModelSelectionPanelIfOpen(page: Page): Promise<boolean> {
     try {
       if (!page || page.isClosed()) return false
+
+      // Always dismiss any "Redeem your credits" or billing popup whenever this guard runs!
+      await this.closePaidApiKeyPopupByCrossButton(page)
 
       const isPanelOpen = await page.evaluate(() => {
         const isVisible = (el: Element | null): el is HTMLElement => {
@@ -3489,20 +3558,50 @@ export class StudioBrowserController {
     desiredTokens: number,
     modelLabel?: string,
   ): Promise<void> {
-    if (!/\bargon\b/i.test(modelLabel || '')) {
+    const visibleCardNow = await this.readVisibleModelCardText(page).catch(() => '')
+    if (!/\bargon\b/i.test(modelLabel || '') && !/\bargon\b/i.test(visibleCardNow || '')) {
       return
     }
     const desiredMaxOut = String(desiredTokens || 1000000)
     try {
+      await this.closePaidApiKeyPopupByCrossButton(page)
       await this.closeModelSelectionPanelIfOpen(page)
       await this.waitForRunSettingsPanelElements(page, 3000)
 
-      // Helper: scroll the right-hand Run Settings panel (and any scrollable ancestor of Run Settings items)
-      // and locate/tag the genuine Output length <input> inside the "Output length" compact row.
+      const scrollRightPanelToBottom = async () => {
+        try {
+          const vp = page.viewportSize() || { width: 1280, height: 800 }
+          await page.mouse.move(Math.round(vp.width - 140), Math.round(vp.height * 0.65)).catch(() => {})
+          await page.mouse.wheel(0, 900).catch(() => {})
+        } catch {
+          /* ignore mouse wheel error */
+        }
+        await page
+          .evaluate(() => {
+            const allElements = Array.from(document.body.querySelectorAll('*'))
+            for (const el of allElements) {
+              const h = el as HTMLElement
+              const r = h.getBoundingClientRect()
+              if (
+                r.left >= window.innerWidth * 0.42 &&
+                r.height >= 80 &&
+                h.scrollHeight > h.clientHeight + 4
+              ) {
+                h.scrollTop = h.scrollHeight
+              }
+            }
+          })
+          .catch(() => {})
+      }
+
+      // Helper: locate/tag the genuine Output length <input> on the "Output length" row (never "Add stop sequence")
       const findAndTagOutputLengthInput = async (scrollDownPx: number = 0): Promise<boolean> => {
+        if (scrollDownPx > 0) {
+          await scrollRightPanelToBottom()
+        }
         return await page
           .evaluate(
-            ({ sels, scrollPx }) => {
+            ({ sels }) => {
               const isVis = (el: Element | null): el is HTMLElement => {
                 if (!el) return false
                 const h = el as HTMLElement
@@ -3517,44 +3616,26 @@ export class StudioBrowserController {
                 )
               }
 
-              const scrollAncestorsAndRightPanel = (deltaPx: number) => {
-                if (deltaPx <= 0) return
-                const rightPanelCandidates = Array.from(
-                  document.querySelectorAll(
-                    'ms-run-settings, .run-settings-panel, [class*="run-settings" i], [class*="runsettings" i], aside, mat-sidenav, mat-drawer, div',
-                  ),
-                )
-                for (const c of rightPanelCandidates) {
-                  const h = c as HTMLElement
-                  const r = h.getBoundingClientRect()
-                  if (
-                    r.left >= window.innerWidth * 0.45 &&
-                    r.height > 140 &&
-                    h.scrollHeight > h.clientHeight + 5
-                  ) {
-                    h.scrollTop = deltaPx >= 9000 ? h.scrollHeight : h.scrollTop + deltaPx
-                  }
+              const isExcludedInput = (inp: HTMLInputElement): boolean => {
+                const type = (inp.getAttribute('type') || '').toLowerCase()
+                if (type === 'checkbox' || type === 'radio' || type === 'range' || type === 'hidden' || type === 'file') {
+                  return true
                 }
-                // Also walk up from any right-panel label ("Advanced settings", "Tools", "Thinking level", "Output length")
-                const allNodes = Array.from(document.body.querySelectorAll('*'))
-                for (const node of allNodes) {
-                  if (!isVis(node) || node.children.length > 3) continue
-                  const nr = node.getBoundingClientRect()
-                  if (nr.left < window.innerWidth * 0.45) continue
-                  const nt = ((node as HTMLElement).innerText || node.textContent || '').trim()
-                  if (/^(advanced\s+settings|output\s+length|tools|thinking\s+level)$/i.test(nt)) {
-                    let anc: HTMLElement | null = node.parentElement
-                    while (anc && anc !== document.body) {
-                      if (anc.scrollHeight > anc.clientHeight + 5) {
-                        anc.scrollTop = deltaPx >= 9000 ? anc.scrollHeight : anc.scrollTop + deltaPx
-                      }
-                      anc = anc.parentElement
-                    }
-                  }
+                const ph = (inp.getAttribute('placeholder') || '').toLowerCase()
+                const aria = (inp.getAttribute('aria-label') || '').toLowerCase()
+                if (
+                  ph.includes('stop') ||
+                  ph.includes('search') ||
+                  aria.includes('stop') ||
+                  aria.includes('search') ||
+                  aria.includes('temperature') ||
+                  aria.includes('top p') ||
+                  aria.includes('top k')
+                ) {
+                  return true
                 }
+                return false
               }
-
-              scrollAncestorsAndRightPanel(scrollPx)
 
               for (const prev of Array.from(
                 document.querySelectorAll('[data-cmt-output-length-input]'),
@@ -3562,17 +3643,19 @@ export class StudioBrowserController {
                 prev.removeAttribute('data-cmt-output-length-input')
               }
 
-              // 1. Check explicit CSS selectors (skipping Playwright-only :has-text selectors)
+              // 1. Check explicit CSS selectors first
               for (const sel of sels) {
                 if (sel.includes(':has-text(') || sel.includes('data-cmt-output-length-input')) continue
                 try {
                   const found = Array.from(document.querySelectorAll(sel))
                   for (const node of found) {
                     if (isVis(node) && node.tagName.toLowerCase() === 'input') {
-                      const nr = node.getBoundingClientRect()
+                      const inp = node as HTMLInputElement
+                      if (isExcludedInput(inp)) continue
+                      const nr = inp.getBoundingClientRect()
                       if (nr.left < window.innerWidth * 0.45) continue
-                      ;(node as HTMLElement).scrollIntoView({ block: 'center', inline: 'nearest' })
-                      node.setAttribute('data-cmt-output-length-input', 'true')
+                      inp.scrollIntoView({ block: 'center', inline: 'nearest' })
+                      inp.setAttribute('data-cmt-output-length-input', 'true')
                       return true
                     }
                   }
@@ -3598,16 +3681,42 @@ export class StudioBrowserController {
 
               for (const leaf of labelLeaves) {
                 leaf.scrollIntoView({ block: 'center', inline: 'nearest' })
+                const leafRect = leaf.getBoundingClientRect()
+                const leafCenterY = leafRect.top + leafRect.height / 2
+
+                // Look for any visible non-excluded <input> in the right panel aligned horizontally with "Output length"
+                const allInputs = Array.from(document.body.querySelectorAll('input')) as HTMLInputElement[]
+                let bestInput: HTMLInputElement | null = null
+                let bestDistY = 9999
+                for (const inp of allInputs) {
+                  if (!isVis(inp) || isExcludedInput(inp)) continue
+                  const ir = inp.getBoundingClientRect()
+                  if (ir.left < window.innerWidth * 0.45) continue
+                  const inpCenterY = ir.top + ir.height / 2
+                  const distY = Math.abs(inpCenterY - leafCenterY)
+                  if (distY <= 44 && distY < bestDistY) {
+                    bestDistY = distY
+                    bestInput = inp
+                  }
+                }
+                if (bestInput) {
+                  bestInput.scrollIntoView({ block: 'center', inline: 'nearest' })
+                  bestInput.setAttribute('data-cmt-output-length-input', 'true')
+                  return true
+                }
+
+                // Fallback: walk up compact row ancestors that do not include "Add stop sequence"
                 let row: Element | null = leaf.parentElement
                 for (let depth = 0; depth < 6 && row; depth++) {
                   const rowRect = row.getBoundingClientRect()
-                  if (rowRect.height >= 16 && rowRect.height <= 140 && rowRect.width <= 550) {
-                    const inp = row.querySelector(
-                      'input[type="number"], input:not([type="checkbox"]):not([type="radio"]):not([type="range"])',
-                    ) as HTMLInputElement | null
-                    if (inp && isVis(inp)) {
-                      inp.scrollIntoView({ block: 'center', inline: 'nearest' })
-                      inp.setAttribute('data-cmt-output-length-input', 'true')
+                  const rowTxt = ((row as HTMLElement).innerText || row.textContent || '').toLowerCase()
+                  if (rowTxt.includes('add stop sequence')) break
+                  if (rowRect.height >= 16 && rowRect.height <= 180 && rowRect.width <= 550) {
+                    const candidates = Array.from(row.querySelectorAll('input')) as HTMLInputElement[]
+                    const validInp = candidates.find((c) => isVis(c) && !isExcludedInput(c))
+                    if (validInp) {
+                      validInp.scrollIntoView({ block: 'center', inline: 'nearest' })
+                      validInp.setAttribute('data-cmt-output-length-input', 'true')
                       return true
                     }
                   }
@@ -3616,19 +3725,18 @@ export class StudioBrowserController {
               }
               return false
             },
-            { sels: [...STUDIO_SELECTORS.maxOutputTokensInput], scrollPx: scrollDownPx },
+            { sels: [...STUDIO_SELECTORS.maxOutputTokensInput] },
           )
           .catch(() => false)
       }
 
-      // Try up to 3 attempts to ensure Advanced settings is expanded, scrolled down, and Output length is set to 1,000,000
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        // First scroll down the right panel in case Advanced settings is already expanded and Output length is just below the fold
-        let inputFound = await findAndTagOutputLengthInput(attempt === 1 ? 600 : 9999)
+      // Try up to 4 attempts to ensure Advanced settings is expanded, scrolled down, and Output length is set to 1,000,000 (with double-check!)
+      for (let attempt = 1; attempt <= 4; attempt++) {
+        let inputFound = await findAndTagOutputLengthInput(9999)
 
         if (!inputFound) {
-          // Output length <input> is not visible -> locate the "Advanced settings" header & arrow in the right panel and click ONCE to expand it
-          const advTarget = await page
+          // Check whether Advanced settings is ALREADY expanded before clicking its header (so we never accidentally collapse it!)
+          const isAdvAlreadyExpanded = await page
             .evaluate(() => {
               const isVis = (el: Element | null): el is HTMLElement => {
                 if (!el) return false
@@ -3637,112 +3745,134 @@ export class StudioBrowserController {
                 const style = window.getComputedStyle(h)
                 return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'
               }
-
-              for (const prev of Array.from(
-                document.querySelectorAll('[data-cmt-adv-settings-toggle]'),
-              )) {
-                prev.removeAttribute('data-cmt-adv-settings-toggle')
-              }
-
-              // Scroll right-side Run Settings panel down so "Advanced settings" header is visible
-              const allNodes = Array.from(document.body.querySelectorAll('*'))
-              for (const node of allNodes) {
-                if (!isVis(node) || node.children.length > 3) continue
-                const nr = node.getBoundingClientRect()
-                if (nr.left < window.innerWidth * 0.45) continue
-                const nt = ((node as HTMLElement).innerText || node.textContent || '').replace(/\s+/g, ' ').trim()
-                if (/^(advanced\s+settings|tools|thinking\s+level)$/i.test(nt)) {
-                  let anc: HTMLElement | null = node.parentElement
-                  while (anc && anc !== document.body) {
-                    if (anc.scrollHeight > anc.clientHeight + 5) {
-                      anc.scrollTop = anc.scrollHeight
-                    }
-                    anc = anc.parentElement
-                  }
-                }
-              }
-
-              // Find leaf or compact header matching "Advanced settings"
-              const candidates = Array.from(
-                document.querySelectorAll(
-                  'mat-expansion-panel-header, button, [role="button"], .settings-group-header, div, span, h3, h4',
-                ),
-              )
-              for (const el of candidates) {
-                if (!isVis(el)) continue
-                const h = el as HTMLElement
-                const r = h.getBoundingClientRect()
+              const all = Array.from(document.body.querySelectorAll('*'))
+              for (const el of all) {
+                if (!isVis(el) || el.children.length > 2) continue
+                const r = el.getBoundingClientRect()
                 if (r.left < window.innerWidth * 0.45) continue
-                if (r.height > 85 || r.width < 40) continue
-                const txt = (h.innerText || h.textContent || '').replace(/\s+/g, ' ').trim()
-                const aria = (h.getAttribute('aria-label') || '').trim()
-                if (
-                  /^advanced\s+settings(?:\s*(?:expand_more|expand_less|keyboard_arrow_down|keyboard_arrow_up|chevron_right))?$/i.test(
-                    txt,
-                  ) ||
-                  /^advanced\s+settings$/i.test(aria)
-                ) {
-                  const clickable =
-                    (h.closest(
-                      'mat-expansion-panel-header, button, [role="button"], .settings-group-header',
-                    ) as HTMLElement | null) ||
-                    (h.parentElement &&
-                    h.parentElement.getBoundingClientRect().height <= 85 &&
-                    h.parentElement.getBoundingClientRect().width >= 120
-                      ? h.parentElement
-                      : h)
-
-                  clickable.scrollIntoView({ block: 'center', inline: 'nearest' })
-                  clickable.setAttribute('data-cmt-adv-settings-toggle', 'true')
-
-                  // Find the arrow icon inside the header row if present
-                  const arrowIcon = clickable.querySelector(
-                    'mat-icon, .google-symbols, .material-symbols-outlined, svg, .mat-expansion-indicator',
-                  ) as HTMLElement | null
-                  const cr = clickable.getBoundingClientRect()
-                  const ar = arrowIcon && isVis(arrowIcon) ? arrowIcon.getBoundingClientRect() : null
-                  return {
-                    x: Math.round(cr.left + cr.width / 2),
-                    arrowX: ar
-                      ? Math.round(ar.left + ar.width / 2)
-                      : Math.round(cr.right - Math.min(22, cr.width * 0.12)),
-                    y: ar
-                      ? Math.round(ar.top + ar.height / 2)
-                      : Math.round(cr.top + cr.height / 2),
-                  }
+                const t = ((el as HTMLElement).innerText || el.textContent || '').replace(/\s+/g, ' ').trim()
+                if (/^(output\s+length|add\s+stop\s+sequence|media\s+resolution|safety\s+settings)$/i.test(t)) {
+                  return true
                 }
               }
-              return null
+              return false
             })
-            .catch(() => null)
+            .catch(() => false)
 
-          const taggedAdvLoc = page.locator('[data-cmt-adv-settings-toggle="true"]').first()
-          if ((await taggedAdvLoc.count().catch(() => 0)) > 0) {
-            await taggedAdvLoc.scrollIntoViewIfNeeded().catch(() => {})
-            await taggedAdvLoc.click({ timeout: 2500 }).catch(async () => {
-              if (advTarget) {
-                await page.mouse.click(advTarget.arrowX, advTarget.y).catch(() => {})
+          if (!isAdvAlreadyExpanded) {
+            const advTarget = await page
+              .evaluate(() => {
+                const isVis = (el: Element | null): el is HTMLElement => {
+                  if (!el) return false
+                  const h = el as HTMLElement
+                  const r = h.getBoundingClientRect()
+                  const style = window.getComputedStyle(h)
+                  return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'
+                }
+
+                for (const prev of Array.from(
+                  document.querySelectorAll('[data-cmt-adv-settings-toggle]'),
+                )) {
+                  prev.removeAttribute('data-cmt-adv-settings-toggle')
+                }
+
+                // Scroll right-side Run Settings panel down so "Advanced settings" header is visible
+                const allNodes = Array.from(document.body.querySelectorAll('*'))
+                for (const node of allNodes) {
+                  const h = node as HTMLElement
+                  const r = h.getBoundingClientRect()
+                  if (
+                    r.left >= window.innerWidth * 0.42 &&
+                    r.height >= 80 &&
+                    h.scrollHeight > h.clientHeight + 4
+                  ) {
+                    h.scrollTop = h.scrollHeight
+                  }
+                }
+
+                // Find leaf or compact header matching "Advanced settings"
+                const candidates = Array.from(
+                  document.querySelectorAll(
+                    'mat-expansion-panel-header, button, [role="button"], .settings-group-header, div, span, h3, h4',
+                  ),
+                )
+                for (const el of candidates) {
+                  if (!isVis(el)) continue
+                  const h = el as HTMLElement
+                  const r = h.getBoundingClientRect()
+                  if (r.left < window.innerWidth * 0.45) continue
+                  if (r.height > 85 || r.width < 40) continue
+                  const txt = (h.innerText || h.textContent || '').replace(/\s+/g, ' ').trim()
+                  const aria = (h.getAttribute('aria-label') || '').trim()
+                  if (
+                    /^advanced\s+settings(?:\s*(?:expand_more|expand_less|keyboard_arrow_down|keyboard_arrow_up|chevron_right))?$/i.test(
+                      txt,
+                    ) ||
+                    /^advanced\s+settings$/i.test(aria)
+                  ) {
+                    const clickable =
+                      (h.closest(
+                        'mat-expansion-panel-header, button, [role="button"], .settings-group-header',
+                      ) as HTMLElement | null) ||
+                      (h.parentElement &&
+                      h.parentElement.getBoundingClientRect().height <= 85 &&
+                      h.parentElement.getBoundingClientRect().width >= 120
+                        ? h.parentElement
+                        : h)
+
+                    clickable.scrollIntoView({ block: 'center', inline: 'nearest' })
+                    clickable.setAttribute('data-cmt-adv-settings-toggle', 'true')
+
+                    const arrowIcon = clickable.querySelector(
+                      'mat-icon, .google-symbols, .material-symbols-outlined, svg, .mat-expansion-indicator',
+                    ) as HTMLElement | null
+                    const cr = clickable.getBoundingClientRect()
+                    const ar = arrowIcon && isVis(arrowIcon) ? arrowIcon.getBoundingClientRect() : null
+                    return {
+                      x: Math.round(cr.left + cr.width / 2),
+                      arrowX: ar
+                        ? Math.round(ar.left + ar.width / 2)
+                        : Math.round(cr.right - Math.min(22, cr.width * 0.12)),
+                      y: ar
+                        ? Math.round(ar.top + ar.height / 2)
+                        : Math.round(cr.top + cr.height / 2),
+                    }
+                  }
+                }
+                return null
+              })
+              .catch(() => null)
+
+            const taggedAdvLoc = page.locator('[data-cmt-adv-settings-toggle="true"]').first()
+            if ((await taggedAdvLoc.count().catch(() => 0)) > 0) {
+              await taggedAdvLoc.scrollIntoViewIfNeeded().catch(() => {})
+              await taggedAdvLoc.click({ timeout: 2500 }).catch(async () => {
+                if (advTarget) {
+                  await page.mouse.click(advTarget.arrowX, advTarget.y).catch(() => {})
+                }
+              })
+            } else if (advTarget) {
+              await page.mouse.click(advTarget.arrowX, advTarget.y).catch(() => {})
+            } else {
+              const fallbackAdv = await findFirstVisibleLocator(
+                page,
+                STUDIO_SELECTORS.advancedSettingsToggle,
+                1500,
+              )
+              if (fallbackAdv) {
+                await fallbackAdv.scrollIntoViewIfNeeded().catch(() => {})
+                await fallbackAdv.click({ timeout: 2500 }).catch(() => {})
               }
-            })
-          } else if (advTarget) {
-            await page.mouse.click(advTarget.arrowX, advTarget.y).catch(() => {})
-          } else {
-            const fallbackAdv = await findFirstVisibleLocator(
-              page,
-              STUDIO_SELECTORS.advancedSettingsToggle,
-              1500,
-            )
-            if (fallbackAdv) {
-              await fallbackAdv.scrollIntoViewIfNeeded().catch(() => {})
-              await fallbackAdv.click({ timeout: 2500 }).catch(() => {})
             }
           }
 
           // Wait for Advanced settings accordion animation to expand, then scroll all the way down to Output length
-          await new Promise((r) => setTimeout(r, 650))
+          await new Promise((r) => setTimeout(r, 600))
+          await scrollRightPanelToBottom()
+          await new Promise((r) => setTimeout(r, 250))
           inputFound = await findAndTagOutputLengthInput(9999)
           if (!inputFound) {
-            await new Promise((r) => setTimeout(r, 350))
+            await new Promise((r) => setTimeout(r, 400))
             inputFound = await findAndTagOutputLengthInput(9999)
           }
         }
@@ -3767,8 +3897,8 @@ export class StudioBrowserController {
           await maxOutInput.click({ clickCount: 3 }).catch(() => {})
           await page.keyboard.press('Control+A').catch(() => {})
           await page.keyboard.press('Backspace').catch(() => {})
-          await maxOutInput.fill(desiredMaxOut).catch(async () => {
-            await page.keyboard.type(desiredMaxOut, { delay: 20 })
+          await page.keyboard.type(desiredMaxOut, { delay: 15 }).catch(async () => {
+            await maxOutInput.fill(desiredMaxOut).catch(() => {})
           })
           await maxOutInput
             .evaluate((el, val) => {
@@ -3785,20 +3915,28 @@ export class StudioBrowserController {
               input.dispatchEvent(new Event('input', { bubbles: true }))
               input.dispatchEvent(new Event('change', { bubbles: true }))
               input.dispatchEvent(new Event('blur', { bubbles: true }))
+              input.blur()
             }, desiredMaxOut)
             .catch(() => {})
-          await maxOutInput.press('Tab').catch(() => {})
-          await new Promise((r) => setTimeout(r, 250))
+          await new Promise((r) => setTimeout(r, 300))
         }
 
-        const verifiedMaxOut = (await maxOutInput.inputValue().catch(() => ''))
+        const verifiedMaxOut1 = (await maxOutInput.inputValue().catch(() => ''))
           .replace(/,/g, '')
           .trim()
 
-        if (verifiedMaxOut === desiredMaxOut) {
+        // Double-check after 350ms by re-locating and reading back the Output length input a second time
+        await new Promise((r) => setTimeout(r, 350))
+        await findAndTagOutputLengthInput(0)
+        const doubleCheckLoc = page.locator('input[data-cmt-output-length-input="true"]').first()
+        const verifiedMaxOut2 = (await doubleCheckLoc.inputValue().catch(() => ''))
+          .replace(/,/g, '')
+          .trim()
+
+        if (verifiedMaxOut1 === desiredMaxOut && verifiedMaxOut2 === desiredMaxOut) {
           this.logStep(
             'output tokens set',
-            `Output length=${verifiedMaxOut} (target=${desiredMaxOut}, model=${modelLabel || 'Argon'}, attempt=${attempt})`,
+            `Output length=${verifiedMaxOut2} (double-checked 2/2, model=${modelLabel || 'Argon'}, attempt=${attempt})`,
             'info',
           )
           return
@@ -3807,7 +3945,7 @@ export class StudioBrowserController {
 
       this.logStep(
         'output tokens warn',
-        `Output length input could not be verified at ${desiredMaxOut} after 3 attempts (model=${modelLabel || 'Argon'})`,
+        `Output length input could not be verified at ${desiredMaxOut} after 4 attempts (model=${modelLabel || 'Argon'})`,
         'warn',
       )
     } catch (err: unknown) {
@@ -4157,6 +4295,7 @@ export class StudioBrowserController {
    * "FPS (frames per second)" with placeholder "Defaults to 1 FPS", and buttons "Cancel" / "Save").
    */
   private async tagVideoSettingsDialogControls(page: Page): Promise<void> {
+    await this.closePaidApiKeyPopupByCrossButton(page)
     await page
       .evaluate(() => {
         document
@@ -4177,7 +4316,12 @@ export class StudioBrowserController {
           document.querySelectorAll(
             'mat-dialog-container, [role="dialog"], .cdk-overlay-pane, [class*="video-settings" i], [class*="video-options" i]',
           ),
-        ).filter((el) => isVisible(el) && el.querySelectorAll('input').length >= 2)
+        ).filter((el) => {
+          if (!isVisible(el)) return false
+          const txt = ((el as HTMLElement).innerText || el.textContent || '').trim()
+          if (/redeem\s+your\s+credits|redeem\s+your\s+free\s+credits/i.test(txt)) return false
+          return el.querySelectorAll('input').length >= 2
+        })
 
         const root = dialogs[dialogs.length - 1] || document.body
         const visibleInputs = Array.from(root.querySelectorAll('input')).filter(
@@ -4718,31 +4862,57 @@ export class StudioBrowserController {
           }
         }
 
-        // 2. Sum token counts across all attached media chips (each chip has one Edit video options button)
+        // 2. Inspect all attached media chips (each chip has one Edit video options button)
+        // Crucial: if any attached chip shows "Token count failed" or still lacks its individual token count,
+        // return null so token_poll does not falsely settle on just 1 video's token count!
         let chipTokensSum = 0
+        let totalVisibleChips = 0
+        let chipsWithValidTokens = 0
+        let anyChipFailed = false
         const editBtns = Array.from(
           document.body.querySelectorAll(
             'button[aria-label="Edit video options" i], button[aria-label*="Edit video options" i], button[aria-label*="Video options" i]',
           ),
-        )
+        ).filter((b) => isVisible(b))
         const visitedChips = new Set<Element>()
         for (const btn of editBtns) {
           let curr: Element | null = btn.parentElement
           for (let d = 0; d < 6 && curr && curr !== document.body; d++) {
-            const txt = ((curr as HTMLElement).innerText || curr.textContent || '').trim()
-            const m = txt.match(/([\d,]+)\s*tokens?\b/i)
-            if (m && curr.querySelectorAll('button[aria-label*="Edit video" i]').length === 1) {
-              if (!visitedChips.has(curr)) {
-                visitedChips.add(curr)
-                const val = parseInt(m[1].replace(/,/g, ''), 10)
-                if (Number.isFinite(val) && val > 0) {
-                  chipTokensSum += val
+            const editInCurr = curr.querySelectorAll(
+              'button[aria-label*="Edit video" i], button[aria-label*="Video options" i]',
+            ).length
+            if (editInCurr === 1) {
+              const r = (curr as HTMLElement).getBoundingClientRect()
+              if (r.width >= 90 && r.height >= 24) {
+                if (!visitedChips.has(curr)) {
+                  visitedChips.add(curr)
+                  totalVisibleChips += 1
+                  const txt = ((curr as HTMLElement).innerText || curr.textContent || '').trim()
+                  if (/token\s+count\s+failed|failed\s+to\s+count|error\s+loading/i.test(txt)) {
+                    anyChipFailed = true
+                  }
+                  const m = txt.match(/([\d,]+)\s*tokens?\b/i)
+                  if (m) {
+                    const val = parseInt(m[1].replace(/,/g, ''), 10)
+                    if (Number.isFinite(val) && val > 0) {
+                      chipTokensSum += val
+                      chipsWithValidTokens += 1
+                    }
+                  }
                 }
+                break
               }
-              break
             }
+            if (editInCurr > 1) break
             curr = curr.parentElement
           }
+        }
+
+        if (anyChipFailed) {
+          return null
+        }
+        if (totalVisibleChips >= 2 && chipsWithValidTokens < totalVisibleChips) {
+          return null
         }
 
         // 3. Also scan all token occurrences in bodyText and take the maximum
@@ -4767,6 +4937,134 @@ export class StudioBrowserController {
     } catch {
       return null
     }
+  }
+
+  /**
+   * Check whether any attached video chip in the composer displays "Token count failed",
+   * and tag its Edit video options button so we can re-save or fail fast.
+   */
+  private async inspectChipTokenCountFailure(
+    page: Page,
+  ): Promise<{ hasFailedChip: boolean; totalChips: number; readyChips: number }> {
+    return page
+      .evaluate(() => {
+        const isVisible = (el: Element | null): el is HTMLElement => {
+          if (!el) return false
+          const h = el as HTMLElement
+          const r = h.getBoundingClientRect()
+          return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+        }
+        document
+          .querySelectorAll('[data-cmt-failed-chip-edit]')
+          .forEach((el) => el.removeAttribute('data-cmt-failed-chip-edit'))
+
+        const editBtns = Array.from(
+          document.body.querySelectorAll(
+            'button[aria-label="Edit video options" i], button[aria-label*="Edit video options" i], button[aria-label*="Video options" i]',
+          ),
+        ).filter((b) => isVisible(b))
+
+        let totalChips = 0
+        let readyChips = 0
+        let hasFailedChip = false
+        const visited = new Set<Element>()
+
+        for (const btn of editBtns) {
+          let curr: Element | null = btn.parentElement
+          for (let d = 0; d < 6 && curr && curr !== document.body; d++) {
+            const editCount = curr.querySelectorAll(
+              'button[aria-label*="Edit video" i], button[aria-label*="Video options" i]',
+            ).length
+            if (editCount === 1) {
+              const r = (curr as HTMLElement).getBoundingClientRect()
+              if (r.width >= 90 && r.height >= 24 && !visited.has(curr)) {
+                visited.add(curr)
+                totalChips += 1
+                const txt = ((curr as HTMLElement).innerText || curr.textContent || '').trim()
+                if (/token\s+count\s+failed|failed\s+to\s+count|error\s+loading/i.test(txt)) {
+                  hasFailedChip = true
+                  ;(btn as HTMLElement).setAttribute('data-cmt-failed-chip-edit', 'true')
+                } else if (/([\d,]+)\s*tokens?\b/i.test(txt)) {
+                  readyChips += 1
+                }
+                break
+              }
+            }
+            if (editCount > 1) break
+            curr = curr.parentElement
+          }
+        }
+        return { hasFailedChip, totalChips, readyChips }
+      })
+      .catch(() => ({ hasFailedChip: false, totalChips: 0, readyChips: 0 }))
+  }
+
+  /**
+   * Check whether the prompt is still sitting unsubmitted in the bottom prompt composer
+   * (e.g. Run click was ignored, welcome banner is still visible, or ms-run-button still says "Run").
+   */
+  private async checkPromptUnsubmittedInComposer(
+    page: Page,
+    preRunTurnCount: number,
+  ): Promise<boolean> {
+    return page
+      .evaluate(
+        ({ turnSels, preCount }) => {
+          const isVis = (el: Element | null): el is HTMLElement => {
+            if (!el) return false
+            const h = el as HTMLElement
+            const r = h.getBoundingClientRect()
+            const style = window.getComputedStyle(h)
+            return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'
+          }
+
+          let turns: Element[] = []
+          for (const sel of turnSels) {
+            if (sel.includes(':has-text(')) continue
+            try {
+              const found = Array.from(document.querySelectorAll(sel))
+              if (found.length > 0) {
+                turns = found
+                break
+              }
+            } catch {
+              // ignore
+            }
+          }
+          if (turns.length > preCount) {
+            return false
+          }
+
+          // Check ms-run-button text: if it says "Stop", generation IS running
+          const runBtns = Array.from(
+            document.querySelectorAll('ms-run-button button, button.run-button, button.stop-button'),
+          ).filter((b) => isVis(b))
+          const anyStopBtn = runBtns.some((b) =>
+            /\bstop\b/i.test((b as HTMLElement).innerText || b.getAttribute('aria-label') || ''),
+          )
+          if (anyStopBtn) {
+            return false
+          }
+
+          const anyRunBtn = runBtns.some((b) =>
+            /\brun\b/i.test((b as HTMLElement).innerText || b.getAttribute('aria-label') || ''),
+          )
+
+          // Check if prompt textarea still has non-empty prompt text OR welcome banner is still in center
+          const ta = document.querySelector(
+            'ms-autosize-textarea textarea, textarea[aria-label*="Type something" i], textarea',
+          ) as HTMLTextAreaElement | null
+          const taHasPrompt = Boolean(ta && isVis(ta) && (ta.value || '').trim().length > 25)
+
+          const bodyTxt = document.body?.innerText || ''
+          const hasWelcomeBanner =
+            /\b(?:Build\s+with\s+Gemini|Start\s+building\s+with\s+Gemini)\b/i.test(bodyTxt)
+
+          return Boolean(anyRunBtn && (taHasPrompt || hasWelcomeBanner))
+        },
+        { turnSels: [...STUDIO_SELECTORS.modelTurnContainers], preCount: preRunTurnCount },
+      )
+      .catch(() => false)
   }
 
   /**
@@ -6436,11 +6734,56 @@ export class StudioBrowserController {
           let lastReadTokens: number | null = null
           let consecutiveSameReads = 0
           let pollCount = 0
+          let failedChipPolls = 0
+          let triedFailedChipResave = false
           const tokenWaitDeadline = Date.now() + 60_000
 
           while (Date.now() < tokenWaitDeadline) {
             await new Promise((r) => setTimeout(r, 1000))
             pollCount += 1
+            const chipStatus = await this.inspectChipTokenCountFailure(page)
+            if (chipStatus.hasFailedChip) {
+              failedChipPolls += 1
+              lastReadTokens = null
+              consecutiveSameReads = 0
+              this.logStep(
+                `token poll ${pollCount}s`,
+                `Token count failed on attached video chip (${chipStatus.readyChips}/${chipStatus.totalChips} chips ready, failPoll=${failedChipPolls})`,
+                'warn',
+              )
+              if (failedChipPolls >= 3 && !triedFailedChipResave) {
+                triedFailedChipResave = true
+                this.logStep(
+                  'recover token count failed',
+                  'Re-opening & saving Video options on chip with "Token count failed" to re-trigger token counting',
+                  'warn',
+                )
+                const failedEditBtn = page.locator('[data-cmt-failed-chip-edit="true"]').first()
+                if ((await failedEditBtn.count().catch(() => 0)) > 0) {
+                  await failedEditBtn.click({ timeout: 2000 }).catch(() => {})
+                  await new Promise((r) => setTimeout(r, 900))
+                  await this.tagVideoSettingsDialogControls(page)
+                  const saveBtn = await findFirstVisibleLocator(
+                    page,
+                    STUDIO_SELECTORS.videoSettingsSaveButton,
+                    2000,
+                  )
+                  if (saveBtn) {
+                    await saveBtn.click().catch(() => {})
+                  } else {
+                    await page.keyboard.press('Enter').catch(() => {})
+                  }
+                  await new Promise((r) => setTimeout(r, 3000))
+                }
+              }
+              if (failedChipPolls >= 9) {
+                throw new Error(
+                  `Studio chip "Token count failed" persisted after ${failedChipPolls}s on ${jobLabel} — retrying in fresh chat`,
+                )
+              }
+              continue
+            }
+
             const readVal = await this.readStudioTokenCount(page)
             if (readVal !== null) {
               tokens = readVal
@@ -6468,15 +6811,20 @@ export class StudioBrowserController {
             } else {
               lastReadTokens = null
               consecutiveSameReads = 0
-              this.logStep(`token poll ${pollCount}s`, 'null (counter not readable)')
+              this.logStep(
+                `token poll ${pollCount}s`,
+                chipStatus.totalChips >= 2
+                  ? `waiting for all ${chipStatus.totalChips} video chips to finish token count (${chipStatus.readyChips}/${chipStatus.totalChips} ready)`
+                  : 'null (counter not readable)',
+              )
             }
           }
         }
 
         if (tokens === null) {
-          const warnMsg = `Token counter was never readable (null) after 60s for ${jobLabel} — continuing with fallback estimate`
-          this.logStep('token counter warning', warnMsg, 'warn')
-          onLog?.('warn', warnMsg)
+          throw new Error(
+            `Token counter never settled for all attached video chips after 60s on ${jobLabel} — retrying in fresh chat`,
+          )
         } else if (settledTokens === null) {
           throw new Error(
             `FPS/range not applied: token counter (${tokens}) is implausibly low for ${totalVideoSec.toFixed(0)}s at 24 FPS (expected >= ${minPlausible24FpsTokens})`,
@@ -6649,45 +6997,96 @@ export class StudioBrowserController {
             },
           })
 
+          await this.closePaidApiKeyPopupByCrossButton(page)
           await this.closeModelSelectionPanelIfOpen(page)
 
-          // (e) Press Run
-          const runBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 4000)
-          const runBtnEnabled = runBtn ? await runBtn.isEnabled().catch(() => false) : false
-          if (runBtn && runBtnEnabled) {
-            await runBtn.click()
-          } else {
-            const rerunBtn = await findFirstVisibleLocator(
+          // Mandatory Pre-Run Double-Check for Argon: verify Output length = 1,000,000 right before clicking Run!
+          const preRunUiCard = await this.readVisibleModelCardText(page).catch(() => '')
+          if (/\bargon\b/i.test(activeModelName) || /\bargon\b/i.test(preRunUiCard || '')) {
+            await this.setOutputLengthInRunSettings(
               page,
-              [
-                'button[aria-label*="Rerun" i]',
-                'button[mattooltip*="Rerun" i]',
-                'ms-chat-turn button:has-text("Rerun")',
-              ],
-              1500,
+              resolveEffectiveMaxOutputTokensForModel(activeModelName, maxOutputTokens),
+              activeModelName,
             )
-            if (rerunBtn && (await rerunBtn.isEnabled().catch(() => false))) {
-              await rerunBtn.click()
-            } else if (runBtn) {
-              // Ensure prompt text is in promptInput so Run becomes enabled
-              const curPromptVal = await promptInput.inputValue().catch(() => '')
-              if (!curPromptVal || !curPromptVal.trim()) {
-                await promptInput.click().catch(() => {})
-                await promptInput.fill(promptText).catch(() => {})
-                await new Promise((r) => setTimeout(r, 500))
-              }
-              const enabledAfterFill = await runBtn.isEnabled().catch(() => false)
-              if (enabledAfterFill) {
-                await runBtn.click()
-              } else {
-                await promptInput.press('Control+Enter')
-              }
+          }
+
+          // Re-verify no chip broke with "Token count failed" during the pre-run wait
+          const preRunChipCheck = await this.inspectChipTokenCountFailure(page)
+          if (preRunChipCheck.hasFailedChip) {
+            throw new Error(
+              `Attached video chip shows "Token count failed" before Run on ${jobLabel} — retrying in fresh chat`,
+            )
+          }
+
+          // (e) Press Run and verify that the prompt actually submits (up to 3 attempts) so it never enters Fake Running!
+          const triggerRunButtonOrShortcut = async (attemptIdx: number) => {
+            const curPromptVal = await promptInput.inputValue().catch(() => '')
+            if (!curPromptVal || !curPromptVal.trim()) {
+              await promptInput.click().catch(() => {})
+              await promptInput.fill(promptText).catch(() => {})
+              await new Promise((r) => setTimeout(r, 400))
+            }
+            const runBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 2500)
+            const runBtnEnabled = runBtn ? await runBtn.isEnabled().catch(() => false) : false
+            if (runBtn && runBtnEnabled) {
+              await runBtn.scrollIntoViewIfNeeded().catch(() => {})
+              await runBtn.click({ timeout: 2500 }).catch(async () => {
+                await runBtn.click({ force: true }).catch(() => {})
+              })
             } else {
-              await promptInput.press('Control+Enter')
+              const rerunBtn = await findFirstVisibleLocator(
+                page,
+                [
+                  'button[aria-label*="Rerun" i]',
+                  'button[mattooltip*="Rerun" i]',
+                  'ms-chat-turn button:has-text("Rerun")',
+                ],
+                1000,
+              )
+              if (rerunBtn && (await rerunBtn.isEnabled().catch(() => false))) {
+                await rerunBtn.click().catch(() => {})
+              } else {
+                await promptInput.focus().catch(() => {})
+                await promptInput.press('Control+Enter').catch(() => {})
+              }
+            }
+            if (attemptIdx >= 2) {
+              await promptInput.focus().catch(() => {})
+              await promptInput.press('Control+Enter').catch(() => {})
+              await page
+                .evaluate(() => {
+                  const btn = document.querySelector(
+                    'ms-run-button button:not([disabled])',
+                  ) as HTMLElement | null
+                  if (btn && !/\bstop\b/i.test(btn.innerText || '')) {
+                    btn.click()
+                  }
+                })
+                .catch(() => {})
             }
           }
-          globalStudioRunStaggerGate.recordRunPressed()
-          this.logStep('press Run', `${jobLabel} [${activeModelName}]`)
+
+          for (let runClickTry = 1; runClickTry <= 3; runClickTry++) {
+            await triggerRunButtonOrShortcut(runClickTry)
+            if (runClickTry === 1) {
+              globalStudioRunStaggerGate.recordRunPressed()
+              this.logStep('press Run', `${jobLabel} [${activeModelName}]`)
+            } else {
+              this.logStep(
+                're-press Run',
+                `Prompt still in composer — re-pressing Run (try ${runClickTry}/3) on ${jobLabel}`,
+                'warn',
+              )
+            }
+            await new Promise((r) => setTimeout(r, 1800))
+            const stillUnsubmitted = await this.checkPromptUnsubmittedInComposer(
+              page,
+              preRunTurnSnap.count,
+            )
+            if (!stillUnsubmitted || genContentSeenCount > 0) {
+              break
+            }
+          }
 
           // Poll every 1 s up to 10-min timeout.
           while (Date.now() - runStarted < TIMEOUT_MS) {
@@ -7097,19 +7496,41 @@ export class StudioBrowserController {
               }
 
               const candidateText = await this.extractFinalAnswerWithoutThoughts(page)
+              const unsubmittedNow =
+                !stopEverSeen &&
+                !stopVisible &&
+                !spinnerVisible &&
+                genContentInFlight === 0 &&
+                !candidateText.trim()
+                  ? await this.checkPromptUnsubmittedInComposer(page, preRunTurnSnap.count)
+                  : false
 
-              // Fake-Running Detector: if >= 20s have elapsed since pressing Run and AI Studio has shown
-              // no Stop button, no thinking/running spinner, no in-flight GenerateContent request, and no output text,
-              // then nothing is actually running -> break immediately to Hard Refresh + New Page!
+              if (unsubmittedNow && (elapsed === 6 || elapsed === 11)) {
+                this.logStep(
+                  're-trigger Run',
+                  `${jobLabel}: prompt still unsubmitted at ${elapsed}s — clicking Run + Control+Enter`,
+                  'warn',
+                )
+                const retryRunBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 1000)
+                if (retryRunBtn && (await retryRunBtn.isEnabled().catch(() => false))) {
+                  await retryRunBtn.click({ force: true }).catch(() => {})
+                }
+                await promptInput.focus().catch(() => {})
+                await promptInput.press('Control+Enter').catch(() => {})
+              }
+
+              // Fake-Running Detector: if >= 15s (when prompt is still unsubmitted in composer) or >= 20s have elapsed
+              // since pressing Run and AI Studio has shown no Stop button, no thinking/running spinner,
+              // no in-flight GenerateContent request, and no output text, break immediately to Hard Refresh + New Page!
               if (
-                elapsed >= 20 &&
+                ((unsubmittedNow && elapsed >= 15) || elapsed >= 20) &&
                 !stopEverSeen &&
                 !stopVisible &&
                 !spinnerVisible &&
                 genContentInFlight === 0 &&
                 !candidateText.trim()
               ) {
-                const fakeMsg = `No generation activity after ${elapsed}s (stopEverSeen=false, spinner=false, inFlight=0) -> hard refresh + new page`
+                const fakeMsg = `No generation activity after ${elapsed}s (unsubmitted=${unsubmittedNow}, stopEverSeen=false, spinner=false, inFlight=0) -> hard refresh + new page`
                 this.logStep('fake running detected', `${jobLabel} [${activeModelName}]: ${fakeMsg}`, 'warn')
                 onLog?.('warn', `${jobLabel}: fake running detected (${fakeMsg})`)
                 internalErrorDetected = true
@@ -7117,7 +7538,9 @@ export class StudioBrowserController {
                 break
               }
 
-              this.logStep(`running ${mm}:${ss}`, `${jobLabel} [${activeModelName}]`)
+              if (!unsubmittedNow) {
+                this.logStep(`running ${mm}:${ss}`, `${jobLabel} [${activeModelName}]`)
+              }
 
               if (!hissa2FirstSeenLogged && /HISSA\s*2\b/i.test(candidateText)) {
                 hissa2FirstSeenLogged = true

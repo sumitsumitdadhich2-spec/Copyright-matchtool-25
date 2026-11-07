@@ -1770,7 +1770,7 @@ class Scheduler {
               : 10,
           shortDurationSec: scan.shortDuration || 150,
           movieDurationSec: (scan.movieTrimEnd ?? scan.movieDuration) || undefined,
-          resumeExisting: job.resume,
+          resumeExisting: true,
           onLog: (lvl, msg) => {
             addLog(scan, lvl, msg)
             this.mark(job)

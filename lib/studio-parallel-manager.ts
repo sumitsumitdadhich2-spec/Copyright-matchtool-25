@@ -1972,21 +1972,19 @@ export class StudioParallelManager {
         this.onLogCallback?.('info', 'rebuilt windows: saved windows had overlap')
       }
 
+      // Always preserve already completed (DONE / PROHIBITED) windows when starting a scan unless 100% of windows are already DONE/PROHIBITED
+      const hasUnfinishedWindows =
+        this.windows.length > 0 &&
+        this.windows.some((w) => w.status !== 'DONE' && w.status !== 'PROHIBITED')
+      const hasCompletedWindows =
+        this.windows.length > 0 &&
+        this.windows.some((w) => w.status === 'DONE' || w.status === 'PROHIBITED')
+
       const canResume =
         !savedWindowsHadOverlap &&
-        Boolean(params.resumeExisting) &&
-        this.hasResumableStateOnDisk() &&
         this.windows.length > 0 &&
-        this.windows.some(
-          (w) =>
-            w.status === 'DONE' ||
-            w.status === 'PROHIBITED' ||
-            w.status === 'QUEUED' ||
-            w.status === 'FAILED' ||
-            w.status === 'RETRYING' ||
-            w.status === 'STOPPED' ||
-            w.status === 'NEEDS_ATTENTION',
-        )
+        hasUnfinishedWindows &&
+        (Boolean(params.resumeExisting) || hasCompletedWindows || this.hasResumableStateOnDisk())
 
       const initialEffectiveModel =
         (await getEffectiveModel(cfg.studioModelName)) ||
@@ -1994,39 +1992,81 @@ export class StudioParallelManager {
         DEFAULT_STUDIO_MODEL_NAME
 
       if (!canResume) {
+        const prevWinByNum = new Map<number, ParallelWindowState>()
+        for (const pw of this.windows) {
+          prevWinByNum.set(pw.windowNumber, pw)
+        }
         const effectiveMovieDur =
           this.movieDurationSec && this.movieDurationSec > 0 ? this.movieDurationSec : undefined
         const { windows } = buildParallelWindowsFromMinuteInput(
           this.minuteInput,
           effectiveMovieDur,
         )
-        this.windows = windows.map((w) => ({
-          ...w,
-          status: 'QUEUED',
-          workerId: null,
-          modelName: initialEffectiveModel,
-          stage: 'queued',
-          tokens: null,
-          attempt: 0,
-          maxAttempts: 5,
-          permRetry: 0,
-          startedAt: null,
-          finishedAt: null,
-          elapsedSec: 0,
-          matchCount: 0,
-          summaryText: 'Queued',
-          error: null,
-        }))
+        const rebuiltHaveUnfinished = windows.some((w) => {
+          const prev = prevWinByNum.get(w.windowNumber)
+          return !prev || (prev.status !== 'DONE' && prev.status !== 'PROHIBITED')
+        })
+        this.windows = windows.map((w) => {
+          const prev = prevWinByNum.get(w.windowNumber)
+          const sidecar = readClipYtSidecar(this.scanId, w.windowNumber)
+          const preservedYtUrl =
+            (!sidecar?.ytDeleted && (sidecar?.ytUrl || prev?.ytUrl)) || null
+          const preservedYtVideoId =
+            (!sidecar?.ytDeleted && (sidecar?.ytVideoId || prev?.ytVideoId)) || null
+          if (
+            rebuiltHaveUnfinished &&
+            prev &&
+            (prev.status === 'DONE' || prev.status === 'PROHIBITED') &&
+            prev.startSec === w.startSec &&
+            prev.endSec === w.endSec
+          ) {
+            return {
+              ...prev,
+              id: w.id,
+              priorityRank: w.priorityRank,
+              ytUrl: preservedYtUrl,
+              ytVideoId: preservedYtVideoId,
+            }
+          }
+          return {
+            ...w,
+            status: 'QUEUED',
+            workerId: null,
+            modelName: initialEffectiveModel,
+            stage: preservedYtUrl ? 'link ready' : 'queued',
+            tokens: null,
+            attempt: 0,
+            maxAttempts: 5,
+            permRetry: 0,
+            startedAt: null,
+            finishedAt: null,
+            elapsedSec: 0,
+            matchCount: 0,
+            summaryText: preservedYtUrl ? `YT link ready (${preservedYtUrl})` : 'Queued',
+            error: null,
+            ytUrl: preservedYtUrl,
+            ytVideoId: preservedYtVideoId,
+            ytVisibility: preservedYtUrl ? prev?.ytVisibility || 'Unlisted' : null,
+            ytUploadStatus: preservedYtUrl ? 'READY' : 'IDLE',
+          }
+        })
         this.startedAt = Date.now()
         this.finishedAt = null
       } else {
         for (const w of this.windows) {
+          const sidecar = readClipYtSidecar(this.scanId, w.windowNumber)
+          if (!sidecar?.ytDeleted && (sidecar?.ytUrl || w.ytUrl)) {
+            w.ytUrl = sidecar?.ytUrl || w.ytUrl || null
+            w.ytVideoId = sidecar?.ytVideoId || w.ytVideoId || null
+            w.ytVisibility = w.ytVisibility || 'Unlisted'
+            w.ytUploadStatus = 'READY'
+          }
           if (w.status !== 'DONE' && w.status !== 'PROHIBITED') {
             w.status = 'QUEUED'
             w.workerId = null
-            w.stage = 'queued'
+            w.stage = w.ytUrl ? 'link ready' : 'queued'
             w.error = null
-            w.summaryText = 'Queued'
+            w.summaryText = w.ytUrl ? `YT link ready (${w.ytUrl})` : 'Queued'
           }
         }
         this.startedAt = Date.now()
@@ -2805,30 +2845,11 @@ export class StudioParallelManager {
           .sort((a, b) => a.priorityRank - b.priorityRank || a.windowNumber - b.windowNumber)
 
         if (pendingWins.length > 0) {
-          const anyHasCachedSidecar = pendingWins.some((w) =>
-            Boolean(readClipYtSidecar(this.scanId, w.windowNumber)?.ytUrl),
-          )
-          if (anyHasCachedSidecar && !this.stoppingAll) {
-            this.appendCombinedLog({
-              workerId: 'SYS',
-              level: 'INFO',
-              step: 'YT cache verify',
-              message: `Verifying cached YouTube links for scan ${this.scanId.slice(0, 8)} against live YouTube Studio Content table before uploading...`,
-            })
-            await globalYtStudioController
-              .checkAndVerifyContentPage({
-                scanId: this.scanId,
-                waitForSdReady: false,
-                username: this.username || 'admin',
-              })
-              .catch(() => {})
-          }
-
           this.appendCombinedLog({
             workerId: 'SYS',
             level: 'INFO',
             step: 'YT batch upload phase',
-            message: `Uploading ${pendingWins.length} window clip(s) to YouTube Studio (2s step delay, Content check at the end)...`,
+            message: `Checking / uploading ${pendingWins.length} remaining window clip(s) to YouTube Studio (already uploaded clips will be skipped)...`,
           })
 
           const cfg = await loadStudioUserConfig(this.username || 'admin')
@@ -2851,15 +2872,23 @@ export class StudioParallelManager {
             const existingYt =
               readClipYtSidecar(clipRes.clipPath) ||
               readClipYtSidecar(this.scanId, w.windowNumber)
-            if (existingYt?.ytUrl && existingYt.ytVideoId && !existingYt.ytDeleted) {
+            const knownUrl =
+              (!existingYt?.ytDeleted && (existingYt?.ytUrl || w.ytUrl)) || null
+            const knownVideoId =
+              (!existingYt?.ytDeleted && (existingYt?.ytVideoId || w.ytVideoId)) || null
+            if (knownUrl && knownVideoId) {
+              w.ytUrl = knownUrl
+              w.ytVideoId = knownVideoId
+              w.ytVisibility = w.ytVisibility || 'Unlisted'
+              w.ytUploadStatus = 'READY'
               w.stage = 'link ready'
-              w.summaryText = `YT link ready (${existingYt.ytUrl})`
+              w.summaryText = `YT link ready (${knownUrl})`
               this.persistStateToDisk()
               expectedForContent.push({
                 windowNumber: w.windowNumber,
                 clipPath: clipRes.clipPath,
                 title: `cmt-${this.scanId.slice(0, 8)}-w${w.windowNumber}`,
-                videoId: existingYt.ytVideoId,
+                videoId: knownVideoId,
               })
               continue
             }
@@ -3024,12 +3053,11 @@ export class StudioParallelManager {
       const allWindowsCompleted =
         !this.stoppingAll &&
         this.windows.length > 0 &&
-        failedCount === 0 &&
-        (doneCount > 0 || prohibitedCount > 0)
+        this.windows.every((w) => w.status === 'DONE' || w.status === 'PROHIBITED')
 
       // End-of-scan YouTube Studio auto-delete cleanup FIRST (Select All -> More actions -> Delete forever)
       // Whenever all windows are done (e.g. 13/13 DONE), automatically run Delete forever before moving to the next global scan!
-      // If any window is still FAILED, keep the videos on YT Studio so retrying the failed window does not need to re-upload.
+      // If any window is still FAILED/unfinished, keep the videos on YT Studio so retrying the remaining windows does not re-upload.
       try {
         const cleanupCfg = await loadStudioUserConfig(this.username || 'admin')
         if (
@@ -3048,6 +3076,9 @@ export class StudioParallelManager {
           )
           for (const w of this.windows) {
             markClipYtDeleted(this.scanId, w.windowNumber)
+            w.ytUrl = null
+            w.ytVideoId = null
+            w.ytVisibility = null
           }
           this.appendCombinedLog({
             workerId: 'SYS',
@@ -4454,8 +4485,8 @@ export class StudioParallelManager {
           ((sidecar?.ytVideoId && it.videoId === sidecar.ytVideoId) ||
             it.windowNumber === w.windowNumber),
       )
-      const resolvedYtUrl = contentMatch?.ytUrl || sidecar?.ytUrl || null
-      const resolvedVideoId = contentMatch?.videoId || sidecar?.ytVideoId || null
+      const resolvedYtUrl = contentMatch?.ytUrl || sidecar?.ytUrl || w.ytUrl || null
+      const resolvedVideoId = contentMatch?.videoId || sidecar?.ytVideoId || w.ytVideoId || null
       const resolvedVis =
         contentMatch?.visibility || (resolvedYtUrl ? w.ytVisibility || 'Unlisted' : null)
 
@@ -4470,7 +4501,7 @@ export class StudioParallelManager {
           w.stage = 'link ready'
           w.summaryText = `YT link ready (${resolvedYtUrl})`
         }
-      } else {
+      } else if (sidecar?.ytDeleted) {
         w.ytUrl = null
         w.ytVideoId = null
         w.ytVisibility = null

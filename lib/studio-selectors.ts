@@ -439,15 +439,18 @@ export const STUDIO_SELECTORS = {
 
   /** Run / Stop button */
   runButton: [
-    'ms-run-button button',
+    'ms-run-button button:has-text("Run")',
+    'ms-run-button button[aria-label*="Run" i]',
+    'button.run-button:has-text("Run")',
     'button.run-button',
-    'button[aria-label*="Run" i]',
-    'button:has-text("Run")',
+    'ms-run-button button:not(:has-text("Stop"))',
   ],
 
   stopButton: [
-    'button[aria-label*="Stop" i]',
     'ms-run-button button:has-text("Stop")',
+    'ms-run-button button[aria-label*="Stop" i]',
+    'button.run-button:has-text("Stop")',
+    'button.stop-button:has-text("Stop")',
     'button.stop-button',
   ],
 
