@@ -6202,6 +6202,7 @@ export class StudioBrowserController {
             sanitized,
           })
 
+          const isSamePageHardRefresh = false
           const needConfigureRunSettings = true
           const needAttachShort = true
           const needAttachMovie = true
@@ -6572,7 +6573,7 @@ export class StudioBrowserController {
         let hissa2FirstSeenLogged = false
         let incompleteAfterAbStartedAt: number | null = null
         let lastIncompleteLogAt = 0
-        let doneIndicator: 'COMPLETION_GATE' | 'INCOMPLETE_60S_CAP' | null = null
+        let doneIndicator: 'COMPLETION_GATE' | 'INCOMPLETE_60S_CAP' | 'RESCUED_ON_LATE_403' | null = null
         let permissionDeniedTriggered = false
         let internalErrorDetected = false
         let internalErrorContinueTriedInChat = false
@@ -7752,6 +7753,7 @@ export class StudioBrowserController {
           )
           throw err
         }
+        const backoffSec = 15
         const isPolicy =
           msg.startsWith('POLICY_BLOCKED:') ||
           /(prohibited_content|blocked\s+due\s+to\s+safety)/i.test(msg)
@@ -7798,7 +7800,6 @@ export class StudioBrowserController {
         }
 
         const isCrash = this.isBrowserOrTargetCrashError(msg)
-        const backoffSec = 15
 
         if (isCrash) {
           await new Promise((r) => setTimeout(r, 150))

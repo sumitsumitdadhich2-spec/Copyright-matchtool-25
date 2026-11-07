@@ -63,7 +63,7 @@ export interface StudioUserConfig {
   ytChannelHandle?: string | null
   ytLastLoginStatus?: 'logged_in' | 'logged_out' | 'untested'
   ytLastLoginTestedAt?: number | null
-  ytVisibility?: 'unlisted' | 'public'
+  ytVisibility?: 'unlisted' | 'private' | 'public'
   ytAutoDeleteAtEnd?: boolean
   ytUploadConcurrency?: number
   updatedAt: number
@@ -317,7 +317,12 @@ export async function loadStudioUserConfig(username: string): Promise<StudioUser
     studioDisableDevShmUsage:
       raw?.studioDisableDevShmUsage !== undefined ? Boolean(raw.studioDisableDevShmUsage) : true,
     studioAttachMovieFromDrive: Boolean(raw?.studioAttachMovieFromDrive ?? false),
-    ytVisibility: raw?.ytVisibility === 'public' ? 'public' : 'unlisted',
+    ytVisibility:
+      raw?.ytVisibility === 'public'
+        ? 'public'
+        : raw?.ytVisibility === 'private'
+          ? 'private'
+          : 'unlisted',
     ytAutoDeleteAtEnd: raw?.ytAutoDeleteAtEnd !== undefined ? Boolean(raw.ytAutoDeleteAtEnd) : true,
     ytUploadConcurrency: Math.max(
       1,

@@ -947,8 +947,8 @@ export async function POST(req: NextRequest) {
           forceUpload: body.forceUpload ?? true,
         })
         return NextResponse.json({
-          ok: true,
           ...res,
+          ok: true,
           ytSnapshot: await globalYtStudioController.getSnapshot(true),
           parallelSnapshot: await parallelMgr.getLiveSnapshot(false),
         })
@@ -1015,7 +1015,7 @@ export async function POST(req: NextRequest) {
           clipPath: testClipPath,
           scanId: targetScanId,
           windowNumber: winNum,
-          visibility: cfg.ytVisibility || 'unlisted',
+          visibility: cfg.ytVisibility === 'private' ? 'private' : 'unlisted',
           forceUpload: Boolean(body.forceUpload),
           username,
         })

@@ -216,6 +216,11 @@ export class YtStudioBrowserController {
     return false;
   }
 
+  public getContentProgress(): YtContentProgressSummary | null {
+    this.ensureInternalCollections();
+    return this.contentProgress || null;
+  }
+
   public resetDailyUploadLimitFlag(): void {
     this.ensureInternalCollections();
     this.dailyUploadLimitReached = false;
@@ -715,8 +720,8 @@ export class YtStudioBrowserController {
     }
 
     return {
-      channelId: detected.channelId || cfg.ytChannelId,
-      channelHandle: detected.channelHandle || cfg.ytChannelHandle,
+      channelId: detected.channelId || cfg.ytChannelId || null,
+      channelHandle: detected.channelHandle || cfg.ytChannelHandle || null,
     };
   }
 

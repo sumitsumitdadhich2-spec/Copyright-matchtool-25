@@ -416,7 +416,7 @@ class Scheduler {
     scan.pipelineStage = 'chunk_scanning'
     scan.waitingForTicket = null
     scan.waitingForScanTitle = null
-    scan.finishedAt = undefined
+    scan.finishedAt = null
     scan.error = null
     if (!scan.startedAt) scan.startedAt = Date.now()
 

@@ -19,10 +19,10 @@ export const CHUNK_MODEL_POOL: ModelSpec[] = [
 /**
  * MatchTool Chunk Scan Orchestrator Model Specs
  */
-export const ORCHESTRATOR_PRIMARY_MODEL = 'gemini-3.6-flash'
-export const ORCHESTRATOR_SECONDARY_MODEL = 'gemini-3.8-flash'
-export const ORCHESTRATOR_TERTIARY_MODEL = 'gemini-3.8-flash'
-export const ORCHESTRATOR_CANARY_MODEL = 'gemini-3.5-flash'
+export const ORCHESTRATOR_PRIMARY_MODEL: string = 'gemini-3.6-flash'
+export const ORCHESTRATOR_SECONDARY_MODEL: string = 'gemini-3.8-flash'
+export const ORCHESTRATOR_TERTIARY_MODEL: string = 'gemini-3.8-flash'
+export const ORCHESTRATOR_CANARY_MODEL: string = 'gemini-3.5-flash'
 
 /** Active worker slots: 16 slots configured (1-13, 15, 16). Key 1 reserved, Slot 14 non-existent. */
 export const ORCHESTRATOR_WORKER_KEY_SLOTS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16] as const

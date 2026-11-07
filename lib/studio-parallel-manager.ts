@@ -2060,7 +2060,7 @@ export class StudioParallelManager {
       scanRecord.pipelineStage = 'chunk_scanning'
       scanRecord.waitingForTicket = null
       scanRecord.waitingForScanTitle = null
-      scanRecord.finishedAt = undefined
+      scanRecord.finishedAt = null
       saveScan(scanRecord, { immediate: true })
 
       const shortReady = await ensureStudioShortReady(this.scanId)
@@ -2247,7 +2247,7 @@ export class StudioParallelManager {
               sClipStart.pipelineStage = 'clips_extract'
               sClipStart.waitingForTicket = null
               sClipStart.waitingForScanTitle = null
-              sClipStart.finishedAt = undefined
+              sClipStart.finishedAt = null
               saveScan(sClipStart, { immediate: true })
             }
           }
@@ -2812,7 +2812,7 @@ export class StudioParallelManager {
             message: `Uploading ${pendingWins.length} window clip(s) to YouTube Studio (2s step delay, Content check at the end)...`,
           })
 
-          const cfg = loadStudioUserConfig(this.username || 'admin')
+          const cfg = await loadStudioUserConfig(this.username || 'admin')
           const expectedForContent: Array<{
             windowNumber: number
             clipPath?: string
@@ -2856,7 +2856,7 @@ export class StudioParallelManager {
                 clipPath: clipRes.clipPath,
                 scanId: this.scanId,
                 windowNumber: w.windowNumber,
-                visibility: cfg.ytVisibility || 'unlisted',
+                visibility: cfg.ytVisibility === 'private' ? 'private' : 'unlisted',
                 username: this.username || 'admin',
                 onProgress: (stg) => {
                   if (w.status === 'QUEUED') {
@@ -3535,7 +3535,7 @@ export class StudioParallelManager {
               clipPath: windowClip.clipPath,
               scanId: this.scanId,
               windowNumber: win.windowNumber,
-              visibility: cfg.ytVisibility || 'unlisted',
+              visibility: cfg.ytVisibility === 'private' ? 'private' : 'unlisted',
               username: this.username || 'admin',
               onProgress: (stg) => {
                 win.stage = stg
@@ -4225,9 +4225,9 @@ export class StudioParallelManager {
           workerId,
           level: res.loggedIn ? 'SUCCESS' : 'ERROR',
           step: 'worker test login',
-          message: `[${workerId}] ${res.detail}`,
+          message: `[${workerId}] ${res.message}`,
         })
-        return { ok: true, message: res.detail }
+        return { ok: true, message: res.message }
       }
       default:
         return { ok: false, message: 'Unknown worker subAction' }
@@ -4287,14 +4287,14 @@ export class StudioParallelManager {
     }
     this.persistStateToDisk()
 
-    const cfg = loadStudioUserConfig(username)
+    const cfg = await loadStudioUserConfig(username)
     const releaseYt = await globalYtStudioUploadGate.acquire()
     try {
       const ytRes = await globalYtStudioController.uploadWindowClip({
         clipPath: clipRes.clipPath,
         scanId: this.scanId,
         windowNumber: win.windowNumber,
-        visibility: cfg.ytVisibility || 'unlisted',
+        visibility: cfg.ytVisibility === 'private' ? 'private' : 'unlisted',
         username,
         forceUpload,
         onProgress: (stg) => {
@@ -4402,7 +4402,10 @@ export class StudioParallelManager {
     this.refreshScanMetadataFromStore()
     let clearedSkipped = false
     const scanPrefix = this.scanId ? this.scanId.slice(0, 8) : ''
-    const ytContentItems = globalYtStudioController.getContentProgress()?.items || []
+    const ytContentItems =
+      (typeof globalYtStudioController?.getContentProgress === 'function'
+        ? globalYtStudioController.getContentProgress()?.items
+        : undefined) || []
     for (const w of this.windows) {
       if (w.status === 'SKIPPED' || w.error === 'YT_DAILY_UPLOAD_LIMIT_REACHED') {
         w.status = 'QUEUED'

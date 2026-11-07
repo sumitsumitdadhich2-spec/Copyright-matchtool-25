@@ -241,7 +241,7 @@ export function startGeminiMinuteFinder(
     scan.status = 'created'
   }
   scan.pipelineStage = 'minute_finder'
-  scan.finishedAt = undefined
+  scan.finishedAt = null
   saveScan(scan)
 
   const isNewDay = checkDailyReset()
@@ -764,7 +764,7 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
       scan.status = 'created'
     }
     scan.pipelineStage = 'waiting_chunk_ticket'
-    scan.finishedAt = undefined
+    scan.finishedAt = null
     reactivateScanTicket(id)
     addLog(scan, 'success', `Minute list applied: movie minute(s) ${minuteList} — Gemini chunk scan start ho raha hai`)
     if (applied.rangeNotes.length > 0) addLog(scan, 'info', `Per-minute movie ranges (Gemini Minute Finder se): ${applied.rangeNotes.join('; ')}`)

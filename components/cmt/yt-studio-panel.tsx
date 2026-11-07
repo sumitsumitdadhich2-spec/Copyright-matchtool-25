@@ -85,7 +85,7 @@ export function YtStudioPanel({ studio, scanId, scan, onRefresh }: YtStudioPanel
   const [navUrl, setNavUrl] = useState('https://studio.youtube.com')
   const [confirmCleanupOpen, setConfirmCleanupOpen] = useState(false)
   const [visibility, setVisibility] = useState<'unlisted' | 'private'>(
-    studio?.ytVisibility ?? 'unlisted',
+    studio?.ytVisibility === 'private' ? 'private' : 'unlisted',
   )
   const [autoDeleteAtEnd, setAutoDeleteAtEnd] = useState<boolean>(
     studio?.ytAutoDeleteAtEnd ?? true,
@@ -98,7 +98,7 @@ export function YtStudioPanel({ studio, scanId, scan, onRefresh }: YtStudioPanel
 
   useEffect(() => {
     if (!studio) return
-    setVisibility(studio.ytVisibility || 'unlisted')
+    setVisibility(studio.ytVisibility === 'private' ? 'private' : 'unlisted')
     setAutoDeleteAtEnd(studio.ytAutoDeleteAtEnd ?? true)
     setUploadConcurrency(studio.ytUploadConcurrency || 3)
   }, [studio?.ytVisibility, studio?.ytAutoDeleteAtEnd, studio?.ytUploadConcurrency])
@@ -231,13 +231,15 @@ export function YtStudioPanel({ studio, scanId, scan, onRefresh }: YtStudioPanel
   ).trim()
 
   const effectiveMovieDurationSec = useMemo(() => {
+    const m360Dur = (scan?.movie360p as { durationSec?: number; duration?: number } | null | undefined)
     const cands = [
       parallelSnap?.movieDurationSec,
       scan?.movieDuration,
-      scan?.movie360p?.durationSec,
+      m360Dur?.durationSec,
+      m360Dur?.duration,
     ].filter((v): v is number => typeof v === 'number' && Number.isFinite(v) && v > 0)
     return cands.length > 0 ? Math.min(...cands) : null
-  }, [parallelSnap?.movieDurationSec, scan?.movieDuration, scan?.movie360p?.durationSec])
+  }, [parallelSnap?.movieDurationSec, scan?.movieDuration, scan?.movie360p])
 
   const previewWindows = useMemo(() => {
     if (!effectiveMinuteInput) return []
@@ -246,7 +248,7 @@ export function YtStudioPanel({ studio, scanId, scan, onRefresh }: YtStudioPanel
       effectiveMovieDurationSec && effectiveMovieDurationSec > 0
         ? Math.floor(effectiveMovieDurationSec)
         : undefined,
-    )
+    ).windows
   }, [effectiveMinuteInput, effectiveMovieDurationSec])
 
   const scanWindows: ParallelWindowState[] = useMemo(
