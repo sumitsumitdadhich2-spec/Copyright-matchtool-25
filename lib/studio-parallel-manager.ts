@@ -2805,6 +2805,25 @@ export class StudioParallelManager {
           .sort((a, b) => a.priorityRank - b.priorityRank || a.windowNumber - b.windowNumber)
 
         if (pendingWins.length > 0) {
+          const anyHasCachedSidecar = pendingWins.some((w) =>
+            Boolean(readClipYtSidecar(this.scanId, w.windowNumber)?.ytUrl),
+          )
+          if (anyHasCachedSidecar && !this.stoppingAll) {
+            this.appendCombinedLog({
+              workerId: 'SYS',
+              level: 'INFO',
+              step: 'YT cache verify',
+              message: `Verifying cached YouTube links for scan ${this.scanId.slice(0, 8)} against live YouTube Studio Content table before uploading...`,
+            })
+            await globalYtStudioController
+              .checkAndVerifyContentPage({
+                scanId: this.scanId,
+                waitForSdReady: false,
+                username: this.username || 'admin',
+              })
+              .catch(() => {})
+          }
+
           this.appendCombinedLog({
             workerId: 'SYS',
             level: 'INFO',
@@ -4359,6 +4378,15 @@ export class StudioParallelManager {
   }): Promise<{ uploaded: number; total: number }> {
     const username = params?.username || this.username || 'admin'
     const onlyFailedOrMissing = params?.onlyFailedOrMissing ?? true
+    if (onlyFailedOrMissing) {
+      await globalYtStudioController
+        .checkAndVerifyContentPage({
+          scanId: this.scanId,
+          waitForSdReady: false,
+          username,
+        })
+        .catch(() => {})
+    }
     const ordered = [...this.windows].sort(
       (a, b) => a.priorityRank - b.priorityRank || a.windowNumber - b.windowNumber,
     )
@@ -4380,7 +4408,7 @@ export class StudioParallelManager {
           windowId: w.id,
           windowNumber: w.windowNumber,
           username,
-          forceUpload: !onlyFailedOrMissing,
+          forceUpload: true,
         })
         uploaded++
       } catch {
@@ -4420,13 +4448,16 @@ export class StudioParallelManager {
       const sidecar = readClipYtSidecar(this.scanId, w.windowNumber)
       const contentMatch = ytContentItems.find(
         (it) =>
-          (sidecar?.ytVideoId && it.videoId === sidecar.ytVideoId) ||
-          (it.windowNumber === w.windowNumber &&
-            (!it.scanPrefix || !scanPrefix || it.scanPrefix === scanPrefix)),
+          (!it.scanPrefix ||
+            !scanPrefix ||
+            it.scanPrefix.toLowerCase() === scanPrefix.toLowerCase()) &&
+          ((sidecar?.ytVideoId && it.videoId === sidecar.ytVideoId) ||
+            it.windowNumber === w.windowNumber),
       )
-      const resolvedYtUrl = sidecar?.ytUrl || contentMatch?.ytUrl || w.ytUrl || null
-      const resolvedVideoId = sidecar?.ytVideoId || contentMatch?.videoId || w.ytVideoId || null
-      const resolvedVis = contentMatch?.visibility || w.ytVisibility || (resolvedYtUrl ? 'Unlisted' : null)
+      const resolvedYtUrl = contentMatch?.ytUrl || sidecar?.ytUrl || null
+      const resolvedVideoId = contentMatch?.videoId || sidecar?.ytVideoId || null
+      const resolvedVis =
+        contentMatch?.visibility || (resolvedYtUrl ? w.ytVisibility || 'Unlisted' : null)
 
       if (resolvedYtUrl && !sidecar?.ytDeleted) {
         w.ytUrl = resolvedYtUrl
@@ -4439,21 +4470,30 @@ export class StudioParallelManager {
           w.stage = 'link ready'
           w.summaryText = `YT link ready (${resolvedYtUrl})`
         }
-      } else if (w.stage === 'uploading to YT' || w.ytUploadStatus === 'UPLOADING') {
-        w.ytUploadStatus = 'UPLOADING'
-        w.ytStageText = 'Uploading clip to YouTube Studio...'
-      } else if (w.stage === 'Extracting clip...' || w.ytUploadStatus === 'EXTRACTING') {
-        w.ytUploadStatus = 'EXTRACTING'
-        w.ytStageText = 'Extracting window clip...'
-      } else if (w.ytError) {
-        w.ytUploadStatus = 'FAILED'
-        w.ytStageText = `Upload failed: ${w.ytError}`
-      } else if (w.status === 'STOPPED' || w.ytUploadStatus === 'STOPPED') {
-        w.ytUploadStatus = 'STOPPED'
-        w.ytStageText = 'Stopped'
       } else {
-        w.ytUploadStatus = 'QUEUED'
-        w.ytStageText = w.stage || 'Queued for YT upload'
+        w.ytUrl = null
+        w.ytVideoId = null
+        w.ytVisibility = null
+        if (w.status === 'QUEUED' && (w.stage === 'link ready' || (w.summaryText || '').startsWith('YT '))) {
+          w.stage = 'queued'
+          w.summaryText = 'Queued'
+        }
+        if (w.stage === 'uploading to YT' || w.ytUploadStatus === 'UPLOADING') {
+          w.ytUploadStatus = 'UPLOADING'
+          w.ytStageText = 'Uploading clip to YouTube Studio...'
+        } else if (w.stage === 'Extracting clip...' || w.ytUploadStatus === 'EXTRACTING') {
+          w.ytUploadStatus = 'EXTRACTING'
+          w.ytStageText = 'Extracting window clip...'
+        } else if (w.ytError) {
+          w.ytUploadStatus = 'FAILED'
+          w.ytStageText = `Upload failed: ${w.ytError}`
+        } else if (w.status === 'STOPPED' || w.ytUploadStatus === 'STOPPED') {
+          w.ytUploadStatus = 'STOPPED'
+          w.ytStageText = 'Stopped'
+        } else {
+          w.ytUploadStatus = 'QUEUED'
+          w.ytStageText = w.stage || 'Queued for YT upload'
+        }
       }
     }
     if (clearedSkipped) {

@@ -364,6 +364,7 @@ export function readClipYtSidecar(
   clipPathOrScanId: string,
   windowNumber?: number,
 ): {
+  scanId?: string
   ytUrl?: string
   ytVideoId?: string
   ytUploadedAt?: number
@@ -372,9 +373,20 @@ export function readClipYtSidecar(
   const sidecarPath = resolveClipSidecarPath(clipPathOrScanId, windowNumber)
   if (!sidecarPath || !fs.existsSync(sidecarPath)) return null
   try {
-    const raw = JSON.parse(fs.readFileSync(sidecarPath, 'utf8')) as Partial<WindowClipSidecar>
+    const raw = JSON.parse(fs.readFileSync(sidecarPath, 'utf8')) as Partial<WindowClipSidecar> & {
+      scanId?: string
+    }
     if (raw && raw.ytUrl && !raw.ytDeleted) {
+      // If called with a scanId, verify the sidecar wasn't written with a different scanId/scanPrefix
+      if (typeof windowNumber === 'number' && raw.scanId && clipPathOrScanId) {
+        const expectedPrefix = clipPathOrScanId.slice(0, 8).toLowerCase()
+        const rawPrefix = raw.scanId.slice(0, 8).toLowerCase()
+        if (expectedPrefix && rawPrefix && expectedPrefix !== rawPrefix) {
+          return null
+        }
+      }
       return {
+        scanId: raw.scanId,
         ytUrl: raw.ytUrl,
         ytVideoId: raw.ytVideoId,
         ytUploadedAt: raw.ytUploadedAt,
@@ -406,11 +418,13 @@ export function saveClipYtSidecar(
   let ytUrl = ''
   let ytVideoId = ''
   let ytUploadedAt = Date.now()
+  let scanIdMeta: string | undefined
   let clipSize = 0
   let clipMtime = 0
 
   if (typeof windowNumberOrYtUrlOrData === 'number') {
     const scanId = clipPathOrScanId
+    scanIdMeta = scanId
     const winNum = windowNumberOrYtUrlOrData
     const data = typeof dataOrVideoId === 'object' ? dataOrVideoId : { ytUrl: String(dataOrVideoId || '') }
     ytUrl = data.ytUrl
@@ -430,6 +444,7 @@ export function saveClipYtSidecar(
     ytUrl = windowNumberOrYtUrlOrData.ytUrl
     ytVideoId = windowNumberOrYtUrlOrData.ytVideoId || ''
     ytUploadedAt = windowNumberOrYtUrlOrData.ytUploadedAt || Date.now()
+    scanIdMeta = windowNumberOrYtUrlOrData.scanId
     if (fs.existsSync(clipPathOrScanId)) {
       try {
         const st = fs.statSync(clipPathOrScanId)
@@ -466,6 +481,7 @@ export function saveClipYtSidecar(
     }
     const updated = {
       ...existing,
+      ...(scanIdMeta ? { scanId: scanIdMeta } : {}),
       ytUrl,
       ytVideoId,
       ytUploadedAt,
@@ -493,4 +509,37 @@ export function markClipYtDeleted(clipPathOrScanId: string, windowNumber?: numbe
   } catch {
     /* ignore */
   }
+}
+
+export function markAllChannelClipsYtDeleted(onlyScanId?: string): number {
+  let count = 0
+  try {
+    if (!fs.existsSync(MEDIA_DIR)) return 0
+    const scanDirs = onlyScanId
+      ? [onlyScanId]
+      : fs.readdirSync(MEDIA_DIR)
+    for (const sDir of scanDirs) {
+      const clipsDir = path.join(MEDIA_DIR, sDir, 'clips')
+      if (!fs.existsSync(clipsDir)) continue
+      const files = fs.readdirSync(clipsDir).filter((f) => f.endsWith('.json'))
+      for (const f of files) {
+        const fullPath = path.join(clipsDir, f)
+        try {
+          const existing = JSON.parse(fs.readFileSync(fullPath, 'utf8')) as Record<string, unknown>
+          if (existing && existing.ytUrl && !existing.ytDeleted) {
+            existing.ytDeleted = true
+            const tmpPath = `${fullPath}.tmp`
+            fs.writeFileSync(tmpPath, JSON.stringify(existing, null, 2), 'utf8')
+            fs.renameSync(tmpPath, fullPath)
+            count++
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return count
 }

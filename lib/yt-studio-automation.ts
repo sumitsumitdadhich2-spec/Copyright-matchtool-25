@@ -10,6 +10,8 @@ import {
 } from './studio-settings';
 import { MEDIA_DIR } from './paths';
 import {
+  markAllChannelClipsYtDeleted,
+  markClipYtDeleted,
   readClipYtSidecar,
   saveClipYtSidecar,
 } from './studio-window-clips';
@@ -1967,8 +1969,12 @@ export class YtStudioBrowserController {
       channelId: this.channelId,
       channelHandle: this.channelHandle,
     }));
-    const targetChannelId = ch.channelId || this.channelId;
-    const contentUrl = targetChannelId
+    let targetChannelId = ch.channelId || this.channelId;
+    if (!targetChannelId) {
+      const mUrl = page.url().match(/\/channel\/(UC[a-zA-Z0-9_-]+)/);
+      if (mUrl) targetChannelId = mUrl[1];
+    }
+    let contentUrl = targetChannelId
       ? `https://studio.youtube.com/channel/${targetChannelId}/videos/upload?filter=%5B%5D`
       : 'https://studio.youtube.com';
 
@@ -1981,14 +1987,25 @@ export class YtStudioBrowserController {
           timeout: 45000,
         })
         .catch(() => {});
-      await page
-        .locator('ytcp-video-row')
-        .first()
-        .waitFor({ state: 'visible', timeout: 15000 })
-        .catch(() => {});
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(2500);
 
-      if (!page.url().includes('/videos')) {
+      if (!targetChannelId) {
+        const mUrlAfter = page.url().match(/\/channel\/(UC[a-zA-Z0-9_-]+)/);
+        if (mUrlAfter) {
+          targetChannelId = mUrlAfter[1];
+          this.channelId = targetChannelId;
+          contentUrl = `https://studio.youtube.com/channel/${targetChannelId}/videos/upload?filter=%5B%5D`;
+        }
+      }
+
+      if (!page.url().includes('/videos') && targetChannelId) {
+        await page
+          .goto(contentUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 35000,
+          })
+          .catch(() => {});
+      } else if (!page.url().includes('/videos')) {
         const contentNav = page
           .locator(
             'a#menu-paper-icon-item-1, tp-yt-paper-icon-item:has-text("Content"), a[href*="/videos"]'
@@ -1996,18 +2013,19 @@ export class YtStudioBrowserController {
           .first();
         if (await contentNav.isVisible().catch(() => false)) {
           await contentNav.click({ timeout: 6000 }).catch(() => {});
-          await page
-            .locator('ytcp-video-row')
-            .first()
-            .waitFor({ state: 'visible', timeout: 15000 })
-            .catch(() => {});
-          await page.waitForTimeout(2000);
         }
       }
+
+      await page
+        .locator('ytcp-video-row, ytcp-video-section-content')
+        .first()
+        .waitFor({ state: 'visible', timeout: 15000 })
+        .catch(() => {});
+      await page.waitForTimeout(2000);
     } else {
       await this.dismissAllUploadDialogs(page).catch(() => {});
       await page
-        .locator('ytcp-video-row')
+        .locator('ytcp-video-row, ytcp-video-section-content')
         .first()
         .waitFor({ state: 'visible', timeout: 10000 })
         .catch(() => {});
@@ -2176,21 +2194,29 @@ export class YtStudioBrowserController {
       exp: { windowNumber: number; clipPath?: string; title?: string; videoId?: string },
       item: YtContentVideoItem
     ): boolean => {
+      // Strictly reject videos whose cmt-<prefix>-w<N> title belongs to a DIFFERENT scan!
+      if (
+        scanPrefix &&
+        item.scanPrefix &&
+        item.scanPrefix.toLowerCase() !== scanPrefix.toLowerCase()
+      ) {
+        return false;
+      }
       if (exp.videoId && item.videoId && exp.videoId === item.videoId) return true;
       if (exp.title && item.title && exp.title.toLowerCase() === item.title.toLowerCase()) return true;
       if (
         exp.windowNumber === item.windowNumber &&
-        (!scanPrefix || !item.scanPrefix || item.scanPrefix === scanPrefix)
+        (!scanPrefix || !item.scanPrefix || item.scanPrefix.toLowerCase() === scanPrefix.toLowerCase())
       ) {
         return true;
       }
       return false;
     };
 
-    const syncSidecarsForItems = (items: YtContentVideoItem[]) => {
+    const syncSidecarsForItems = (items: YtContentVideoItem[], tableConfirmedLoaded: boolean) => {
       for (const item of items) {
         if (!item.videoId || !item.ytUrl) continue;
-        // 1. Check explicit expectedWindows list
+        // 1. Check explicit expectedWindows list (strictly filtered by matchesExpectedWindow so cross-scan items never pollute)
         for (const exp of expectedWindows) {
           if (matchesExpectedWindow(exp, item)) {
             if (exp.clipPath && fs.existsSync(exp.clipPath)) {
@@ -2205,17 +2231,18 @@ export class YtStudioBrowserController {
             }
           }
         }
-        // 2. Also auto-match any clip file in data/media/<scanId>/clips/win-<windowNumber>-*.mp4
+        // 2. Also auto-match any clip file in the matching scan's clips folder ONLY (never write scan B's video into scan A!)
         if (item.windowNumber !== null && (item.scanPrefix || scanId)) {
           try {
             if (fs.existsSync(MEDIA_DIR)) {
               const scanDirs = fs
                 .readdirSync(MEDIA_DIR)
-                .filter(
-                  (d) =>
-                    d === scanId ||
-                    (item.scanPrefix ? d.startsWith(item.scanPrefix) : false)
-                );
+                .filter((d) => {
+                  if (item.scanPrefix) {
+                    return d.toLowerCase().startsWith(item.scanPrefix.toLowerCase());
+                  }
+                  return d === scanId;
+                });
               for (const sDir of scanDirs) {
                 const clipsFolder = path.join(MEDIA_DIR, sDir, 'clips');
                 if (!fs.existsSync(clipsFolder)) continue;
@@ -2240,18 +2267,98 @@ export class YtStudioBrowserController {
           }
         }
       }
+
+      // 3. Invalidate stale/deleted/polluted sidecars for this scan that do NOT exist on the live channel Content table
+      if (tableConfirmedLoaded && scanId && scanPrefix && items.length < 28) {
+        try {
+          const clipsFolder = path.join(MEDIA_DIR, scanId, 'clips');
+          if (fs.existsSync(clipsFolder)) {
+            const liveScanVideoIds = new Set(
+              items
+                .filter(
+                  (it) =>
+                    !it.scanPrefix || it.scanPrefix.toLowerCase() === scanPrefix.toLowerCase()
+                )
+                .map((it) => it.videoId)
+            );
+            const liveScanWindowNums = new Set(
+              items
+                .filter(
+                  (it) =>
+                    it.windowNumber !== null &&
+                    (!it.scanPrefix || it.scanPrefix.toLowerCase() === scanPrefix.toLowerCase())
+                )
+                .map((it) => it.windowNumber as number)
+            );
+            const jsonFiles = fs.readdirSync(clipsFolder).filter((f) => f.endsWith('.json'));
+            for (const jf of jsonFiles) {
+              const fullPath = path.join(clipsFolder, jf);
+              try {
+                const raw = JSON.parse(fs.readFileSync(fullPath, 'utf8')) as {
+                  windowNumber?: number;
+                  ytUrl?: string;
+                  ytVideoId?: string;
+                  ytDeleted?: boolean;
+                };
+                if (!raw || !raw.ytUrl || raw.ytDeleted) continue;
+                const mWin = jf.match(/^win-(\d+)-/);
+                const winNum = raw.windowNumber ?? (mWin ? Number(mWin[1]) : null);
+                const existsById = raw.ytVideoId ? liveScanVideoIds.has(raw.ytVideoId) : false;
+                const existsByWin = winNum !== null ? liveScanWindowNums.has(winNum) : false;
+                if (!existsById && !existsByWin) {
+                  if (winNum !== null) {
+                    markClipYtDeleted(scanId, winNum);
+                  }
+                  const updated = { ...raw, ytDeleted: true };
+                  fs.writeFileSync(fullPath, JSON.stringify(updated, null, 2), 'utf8');
+                }
+              } catch {
+                // ignore individual sidecar parse error
+              }
+            }
+          }
+        } catch {
+          // ignore stale sidecar cleanup error
+        }
+      }
     };
 
     while (true) {
-      const allItems = await readRowsFromDom();
-      syncSidecarsForItems(allItems);
+      let allItems = await readRowsFromDom();
+      let isEmptyTableConfirmed = false;
+      if (allItems.length === 0 && page.url().includes('/videos')) {
+        isEmptyTableConfirmed = await page
+          .evaluate(() => {
+            const txt = (document.body?.innerText || '').toLowerCase();
+            return txt.includes('no content available') || txt.includes('upload videos');
+          })
+          .catch(() => false);
+        if (!isEmptyTableConfirmed && refreshCycle === 0) {
+          await page.waitForTimeout(3500);
+          allItems = await readRowsFromDom();
+          if (allItems.length === 0) {
+            isEmptyTableConfirmed = await page
+              .evaluate(() => {
+                const txt = (document.body?.innerText || '').toLowerCase();
+                return txt.includes('no content available');
+              })
+              .catch(() => false);
+          }
+        }
+      }
 
-      // Filter relevant items for this scan (or all cmt-* items if no expectedWindows specified)
+      const tableConfirmedLoaded =
+        page.url().includes('/videos') && (allItems.length > 0 || isEmptyTableConfirmed);
+      syncSidecarsForItems(allItems, tableConfirmedLoaded);
+
+      // Filter relevant items strictly for this scan (never count another scan's cmt-<other>-w<N> videos!)
       const relevantItems =
         expectedWindows.length > 0
           ? allItems.filter((it) => expectedWindows.some((exp) => matchesExpectedWindow(exp, it)))
           : scanPrefix
-            ? allItems.filter((it) => !it.scanPrefix || it.scanPrefix === scanPrefix)
+            ? allItems.filter(
+                (it) => !it.scanPrefix || it.scanPrefix.toLowerCase() === scanPrefix.toLowerCase()
+              )
             : allItems;
 
       const expectedCount =
@@ -2274,7 +2381,7 @@ export class YtStudioBrowserController {
         processingCount,
         claimedCount,
         allReady,
-        items: relevantItems.length > 0 ? relevantItems : allItems,
+        items: relevantItems,
       };
 
       this.contentProgress = summary;
@@ -2291,10 +2398,17 @@ export class YtStudioBrowserController {
         allReady ? 'ok' : 'info'
       );
 
+      // Do not loop forever if 0 videos on the page are processing SD!
+      // If processingCount === 0 and tableConfirmedLoaded (or refreshCycle >= 1), all uploaded videos on the channel are already Ready,
+      // and any remaining expectedCount - uploadedCount videos are missing from the channel and need to be uploaded rather than waited on.
+      const noVideosProcessingSd =
+        processingCount === 0 && (tableConfirmedLoaded || refreshCycle >= 1);
+
       if (
         this.stopRequested ||
         !waitForSdReady ||
         allReady ||
+        noVideosProcessingSd ||
         (maxWaitMs > 0 && Date.now() - startTime >= maxWaitMs)
       ) {
         break;
@@ -2611,10 +2725,15 @@ export class YtStudioBrowserController {
         );
       }
 
+      // Mark all cached window clip YT sidecars on disk as deleted so subsequent scans don't reuse deleted links
+      const invalidatedSidecars = markAllChannelClipsYtDeleted();
+      this.uploadedVideoIdsInSession.clear();
+      this.contentProgress = null;
+
       this.status = 'ready';
       const msg = deletedBatches > 0
-        ? `Delete forever triggered for locked channel ${ch.channelHandle || ch.channelId || ''} (${rowCount} video(s))`
-        : 'Channel is already clean (0 videos found)';
+        ? `Delete forever triggered for locked channel ${ch.channelHandle || ch.channelId || ''} (${rowCount} video(s), cleared ${invalidatedSidecars} cached link(s))`
+        : `Channel is already clean (0 videos found${invalidatedSidecars > 0 ? `, cleared ${invalidatedSidecars} stale cached link(s)` : ''})`;
       this.log('cleanup done', msg, 'ok');
       return { deletedBatches, message: msg };
     });
