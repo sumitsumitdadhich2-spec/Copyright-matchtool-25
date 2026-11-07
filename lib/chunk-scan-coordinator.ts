@@ -49,6 +49,8 @@ interface GlobalCoordinatorState {
   activeKeySlotsByScanId: Map<string, number>
   activeAssignedKeysByScanId: Map<string, number[]>
   externalWindowCompletionChecker?: (scanId: string) => { done: boolean; reason?: string } | null
+  schedulerChunkChecker?: (scanId: string) => boolean
+  minuteFinderActiveChecker?: (scanId: string) => boolean
 }
 
 const gState: GlobalCoordinatorState = (() => {
@@ -76,9 +78,26 @@ export function registerParallelWindowCompletionChecker(
 }
 
 export function registerSchedulerChunkChecker(
-  _checker: (scanId: string) => boolean,
+  checker: (scanId: string) => boolean,
 ): void {
-  // Handled by strict ticket + parallel window completion checker
+  gState.schedulerChunkChecker = checker
+}
+
+export function registerMinuteFinderActiveChecker(
+  checker: (scanId: string) => boolean,
+): void {
+  gState.minuteFinderActiveChecker = checker
+}
+
+function isScanRunningInMemory(scanId: string): boolean {
+  if (!scanId) return false
+  if (gState.externalWindowCompletionChecker) {
+    const ext = gState.externalWindowCompletionChecker(scanId)
+    if (ext && ext.done === false) return true
+  }
+  if (gState.schedulerChunkChecker?.(scanId)) return true
+  if (gState.minuteFinderActiveChecker?.(scanId)) return true
+  return false
 }
 
 function isScanTerminalOnDisk(scan: Scan | null | undefined): boolean {
@@ -88,19 +107,13 @@ function isScanTerminalOnDisk(scan: Scan | null | undefined): boolean {
     if (ext && ext.done === false) {
       return false
     }
+    if (ext && ext.done === true) {
+      return true
+    }
   }
-  const hasPrescanActive = Boolean(
-    scan.geminiPrescan &&
-      (scan.geminiPrescan.status === 'preparing' ||
-        scan.geminiPrescan.status === 'uploading' ||
-        scan.geminiPrescan.status === 'scanning' ||
-        scan.geminiPrescan.status === 'backup' ||
-        scan.geminiPrescan.status === 'starting_scan'),
-  )
-  if (hasPrescanActive) return false
-  if (scan.status === 'scanning' || scan.status === 'chunking' || scan.status === 'verifying') {
-    return false
-  }
+  if (gState.schedulerChunkChecker?.(scan.id)) return false
+  if (gState.minuteFinderActiveChecker?.(scan.id)) return false
+
   if (scan.status === 'done' || scan.status === 'stopped' || scan.status === 'error') {
     return true
   }
@@ -119,38 +132,45 @@ function isScanTerminalOnDisk(scan: Scan | null | undefined): boolean {
   ) {
     return true
   }
+
+  // If the scan is NOT running in memory (nor in a fresh <=20s handoff after minute finder),
+  // and its status on disk is 'created' or stale 'scanning' from an old session before server restart,
+  // treat it as non-blocking if all registered in-memory checkers are present and say false!
+  if (
+    gState.externalWindowCompletionChecker &&
+    gState.schedulerChunkChecker &&
+    gState.minuteFinderActiveChecker &&
+    !isScanRunningInMemory(scan.id)
+  ) {
+    const prescanJustFinished = Boolean(
+      scan.geminiPrescan?.finishedAt && Date.now() - scan.geminiPrescan.finishedAt < 20_000,
+    )
+    const justCreated = Boolean(scan.createdAt && Date.now() - scan.createdAt < 60_000)
+    if (!prescanJustFinished && !justCreated) {
+      return true
+    }
+  }
+
   return false
 }
 
 function isScanActivelyInPipeline(scan: Scan | null | undefined): boolean {
   if (!scan) return false
   if (gState.skippedOrCompletedTickets.has(scan.id)) return false
-  if (gState.externalWindowCompletionChecker) {
-    const ext = gState.externalWindowCompletionChecker(scan.id)
-    if (ext && ext.done === false) return true
-  }
+  if (isScanRunningInMemory(scan.id)) return true
   if (isScanTerminalOnDisk(scan)) return false
-  const hasAssignedTicket = Boolean(
-    (scan.chunkTicket && scan.chunkTicket > 0) || gState.ticketsByScanId.has(scan.id),
+
+  const prescanJustFinished = Boolean(
+    scan.geminiPrescan?.finishedAt && Date.now() - scan.geminiPrescan.finishedAt < 20_000,
   )
-  const hasPrescanActive = Boolean(
-    scan.geminiPrescan &&
-      (scan.geminiPrescan.status === 'preparing' ||
-        scan.geminiPrescan.status === 'uploading' ||
-        scan.geminiPrescan.status === 'scanning' ||
-        scan.geminiPrescan.status === 'backup' ||
-        scan.geminiPrescan.status === 'starting_scan'),
+  const justCreated = Boolean(
+    scan.createdAt &&
+      Date.now() - scan.createdAt < 45_000 &&
+      (scan.pipelineStage === 'upload' ||
+        scan.pipelineStage === 'minute_finder' ||
+        scan.status === 'chunking'),
   )
-  const isScanning =
-    scan.status === 'chunking' || scan.status === 'scanning' || scan.status === 'verifying'
-  const hasActivePipelineStage = Boolean(
-    scan.pipelineStage &&
-      scan.pipelineStage !== 'done' &&
-      scan.pipelineStage !== 'stopped' &&
-      scan.pipelineStage !== 'error' &&
-      hasAssignedTicket,
-  )
-  return hasPrescanActive || isScanning || hasActivePipelineStage
+  return prescanJustFinished || justCreated
 }
 
 /**
@@ -732,7 +752,15 @@ class ChunkScanCoordinator {
       }
     }
 
-    if (scan.geminiPrescan?.status === 'starting_scan') {
+    if (gState.schedulerChunkChecker?.(scanId)) {
+      return { shouldRelease: false, reason: 'Scheduler chunk scan actively running' }
+    }
+
+    if (
+      gState.minuteFinderActiveChecker?.(scanId) ||
+      (scan.geminiPrescan?.status === 'starting_scan' &&
+        (!this.activeSince || Date.now() - this.activeSince < 20_000))
+    ) {
       return { shouldRelease: false, reason: 'Minute finder handing off to chunk scan' }
     }
 
@@ -741,6 +769,20 @@ class ChunkScanCoordinator {
     }
     if (scan.chunkWindowsDone) {
       return { shouldRelease: true, reason: 'All chunk windows reached terminal status' }
+    }
+
+    // Safety guard: if lock has been held for > 6 seconds and NO in-memory runner is active for this scan, release it!
+    if (
+      gState.externalWindowCompletionChecker &&
+      gState.schedulerChunkChecker &&
+      !isScanRunningInMemory(scanId) &&
+      this.activeSince &&
+      Date.now() - this.activeSince > 6_000
+    ) {
+      return {
+        shouldRelease: true,
+        reason: 'No active chunk worker running in memory for lock holder',
+      }
     }
 
     return { shouldRelease: false, reason: 'Chunks still in progress' }
@@ -755,14 +797,22 @@ class ChunkScanCoordinator {
     this.waitQueue.forEach((w, idx) => {
       const pos = idx + 1
       const blocking = this.findBlockingLowerTicketScan(w.scanId, w.ticket)
-      const activeId = blocking?.scanId || this.activeScanId
+      const activeId =
+        blocking?.scanId ||
+        (this.activeScanId && this.activeScanId !== w.scanId ? this.activeScanId : null)
+      const waitTicket =
+        blocking?.ticket ??
+        (this.activeScanTicket && this.activeScanTicket !== w.ticket
+          ? this.activeScanTicket
+          : 1)
       const activeTitle =
-        blocking?.scanTitle || this.activeScanTitle || (blocking ? `#${blocking.ticket}` : null)
-      const waitTicket = blocking?.ticket ?? this.activeScanTicket ?? 1
+        blocking?.scanTitle ||
+        (this.activeScanId && this.activeScanId !== w.scanId ? this.activeScanTitle : null) ||
+        `#${waitTicket}`
 
       if (w.onWait) {
         w.onWait(
-          `Chunk windows ke liye wait (Ticket #${w.ticket}, Scan ${activeTitle || `#${waitTicket}`} chal raha hai)`,
+          `Chunk windows ke liye wait (My Ticket #${w.ticket} — Waiting for Ticket #${waitTicket}: ${activeTitle})`,
           pos,
           w.ticket,
           activeId,
@@ -941,20 +991,23 @@ class ChunkScanCoordinator {
 
       const pos = this.waitQueue.findIndex((w) => w.scanId === scanId) + 1
       const currentBlocking = this.findBlockingLowerTicketScan(scanId, ticket)
+      const waitTicket =
+        currentBlocking?.ticket ??
+        (this.activeScanTicket && this.activeScanTicket !== ticket ? this.activeScanTicket : 1)
       const waitTitle =
         currentBlocking?.scanTitle ||
-        this.activeScanTitle ||
-        (currentBlocking ? `#${currentBlocking.ticket}` : `#${this.activeScanTicket ?? 1}`)
+        (this.activeScanId && this.activeScanId !== scanId ? this.activeScanTitle : null) ||
+        `#${waitTicket}`
       const s = getScan(scanId)
       if (s) {
         s.chunkTicket = ticket
         s.pipelineStage = 'waiting_chunk_ticket'
-        s.waitingForTicket = currentBlocking?.ticket ?? this.activeScanTicket ?? 1
+        s.waitingForTicket = waitTicket
         s.waitingForScanTitle = waitTitle
         addLog(
           s,
           'info',
-          `[Chunk Scan Queue] Chunk windows ke liye wait (Ticket #${ticket}, Queue #${pos}) — Scan "${waitTitle}" chal raha hai (1s monitor active).`,
+          `[Chunk Scan Queue] Chunk windows ke liye wait (My Ticket #${ticket}, Queue #${pos}) — Waiting for Ticket #${waitTicket} ("${waitTitle}") (1s monitor active).`,
         )
         saveScan(s)
       }

@@ -36,6 +36,7 @@ import {
   globalChunkScanCoordinator,
   ensureScanTicketAndKeyPair,
   reactivateScanTicket,
+  registerMinuteFinderActiveChecker,
   selectScanKeyPairWithFallback,
   claimReplacementKeyForScan,
   skipScanTicket,
@@ -143,8 +144,11 @@ const ctrls = new Map<string, Ctrl>()
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 export function isMinuteFinderRunning(id: string): boolean {
-  return ctrls.has(id)
+  const c = ctrls.get(id)
+  return Boolean(c && !c.stopping)
 }
+
+registerMinuteFinderActiveChecker((scanId: string) => isMinuteFinderRunning(scanId))
 
 /** Same gate as the TwelveLabs pipeline: both videos in + trim confirmed. */
 export function minuteFinderReady(scan: Scan): boolean {

@@ -463,6 +463,8 @@ export async function saveUserYtCookies(username: string, rawCookieJson: string)
   const encryptedYtCookies = encryptSecret(JSON.stringify(cookies))
   await saveStudioUserConfig(username, {
     encryptedYtCookies,
+    ytChannelId: null,
+    ytChannelHandle: null,
     ytLastLoginStatus: 'untested',
     ytLastLoginTestedAt: null,
   })

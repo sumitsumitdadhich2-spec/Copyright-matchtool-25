@@ -255,13 +255,17 @@ export function YtStudioPanel({ studio, scanId, scan, onRefresh }: YtStudioPanel
   )
 
   const queueWaitReason = useMemo(() => {
-    if (scan?.waitingForTicket) {
-      return `Chunk windows ke liye wait (Ticket #${scan.waitingForTicket}${
-        scan.waitingForScanTitle ? `, Scan ${scan.waitingForScanTitle} chal raha hai` : ''
+    if (
+      scan?.pipelineStage === 'waiting_chunk_ticket' &&
+      scan?.waitingForTicket &&
+      scan.waitingForTicket !== scan.chunkTicket
+    ) {
+      return `Chunk windows ke liye wait (My Ticket #${scan.chunkTicket ?? '?'} — Waiting for Ticket #${scan.waitingForTicket}${
+        scan.waitingForScanTitle ? `: ${scan.waitingForScanTitle}` : ''
       })`
     }
     return null
-  }, [scan?.waitingForTicket, scan?.waitingForScanTitle])
+  }, [scan?.pipelineStage, scan?.chunkTicket, scan?.waitingForTicket, scan?.waitingForScanTitle])
 
   const uploadStats = useMemo(() => {
     let ready = 0

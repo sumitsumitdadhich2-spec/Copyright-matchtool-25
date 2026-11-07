@@ -59,7 +59,10 @@ export function deriveScanStageInfo(scan: Scan | ScanSummary): ScanStageInfo {
   const fullScan = 'geminiPrescan' in scan ? scan : null
   const prescanStatus = fullScan ? fullScan.geminiPrescan?.status : (scan as ScanSummary).geminiPrescanStatus
   const ticket = scan.chunkTicket
-  const waitTicket = scan.waitingForTicket ?? fullScan?.chunkQueue?.ticket
+  const waitTicket =
+    scan.waitingForTicket && scan.waitingForTicket !== ticket
+      ? scan.waitingForTicket
+      : null
   const waitTitle =
     scan.waitingForScanTitle ||
     fullScan?.chunkQueue?.activeScanTitle ||
@@ -72,7 +75,7 @@ export function deriveScanStageInfo(scan: Scan | ScanSummary): ScanStageInfo {
     stage = 'done'
   } else if (
     scan.pipelineStage === 'waiting_chunk_ticket' ||
-    Boolean(scan.waitingForScanTitle || scan.waitingForTicket || fullScan?.chunkQueue)
+    Boolean(waitTicket || fullScan?.chunkQueue)
   ) {
     stage = 'waiting_chunk_ticket'
   } else if (scan.pipelineStage === 'clips_extract') {
@@ -103,7 +106,7 @@ export function deriveScanStageInfo(scan: Scan | ScanSummary): ScanStageInfo {
     stage = 'upload'
   }
 
-  const waitLabel = `Chunk windows ke liye wait (Ticket #${ticket ?? '?'}, Scan ${waitTitle} chal raha hai)`
+  const waitLabel = `Chunk windows ke liye wait (My Ticket #${ticket ?? '?'} — Waiting for Ticket #${waitTicket ?? 1}: ${waitTitle})`
 
   const orderedKeys: Array<{ key: ScanStageInfo['stage']; label: string }> = [
     { key: 'upload', label: 'Upload' },

@@ -3072,7 +3072,7 @@ export class StudioParallelManager {
       // Finalize scan record (status='done', report built, verifier OFF, key pair released)
       this.finalizeScanRecordOnCompletion()
 
-      // Immediately release chunk scan lock when all windows are completed so the next ticket in queue starts with zero delay!
+      // Immediately release chunk scan lock when worker pool exits so the next ticket in queue starts with zero delay!
       if (releaseChunkLock) {
         try {
           releaseChunkLock()
@@ -3083,11 +3083,13 @@ export class StudioParallelManager {
       if (this.scanId && this.scanId !== 'default') {
         if (this.stoppingAll) {
           skipScanTicket(this.scanId, 'Parallel scan stopped by user')
-        } else if (allWindowsCompleted) {
+        } else {
           globalChunkScanCoordinator.releaseChunkScanLock(
             this.scanId,
             true,
-            `All ${this.windows.length} Studio parallel windows completed`,
+            allWindowsCompleted
+              ? `All ${this.windows.length} Studio parallel windows completed`
+              : `Parallel worker pool finished (${doneCount}/${this.windows.length} DONE, ${failedCount} FAILED)`,
           )
         }
       }
@@ -4847,7 +4849,7 @@ registerParallelWindowCompletionChecker((scanId: string) => {
   const isActive = (mgr as unknown as { active: boolean }).active
   const isStarting = (mgr as unknown as { starting: boolean }).starting
   if (isActive || isStarting) {
-    return { done: false }
+    return { done: false, reason: 'Studio parallel scan is actively running' }
   }
   if (!Array.isArray(snapWins) || snapWins.length === 0) {
     return null
@@ -4865,10 +4867,15 @@ registerParallelWindowCompletionChecker((scanId: string) => {
         w.status === 'SKIPPED' ||
         w.status === 'STOPPED',
     )
-  return {
-    done: allTerminal,
-    reason: allTerminal ? 'All parallel windows and YT cleanup reached terminal state' : undefined,
+  if (allTerminal) {
+    return {
+      done: true,
+      reason: 'All parallel windows and YT cleanup reached terminal state',
+    }
   }
+  // When !isActive && !isStarting and windows are merely QUEUED (e.g. from previewPlan or after stop),
+  // return null so idle/previewed managers NEVER pretend to be actively running!
+  return null
 })
 
 

@@ -459,14 +459,123 @@ export class YtStudioBrowserController {
     if (!this.context) return 0;
     const cookies = await loadDecryptedPlaywrightYtCookies(username);
     if (!cookies.length) return 0;
+
+    // Normalize cookies for Chromium/Playwright:
+    // 1. __Host- cookies MUST use `url` (without `domain`) and `path: '/'` + `secure: true`,
+    //    otherwise Chromium rejects the entire addCookies batch!
+    // 2. Mirror core Google/YouTube auth cookies across .youtube.com and .google.com if only present on one.
+    type AddCookieParam = Parameters<BrowserContext['addCookies']>[0][number];
+    const normalized: AddCookieParam[] = [];
+    const seenKeys = new Set<string>();
+
+    const pushNormalized = (c: {
+      name: string;
+      value: string;
+      domain: string;
+      path?: string;
+      expires?: number;
+      httpOnly?: boolean;
+      secure?: boolean;
+      sameSite?: 'Strict' | 'Lax' | 'None';
+    }) => {
+      const cleanDomain = (c.domain || '').trim();
+      if (!c.name || !cleanDomain) return;
+      const isHostPrefix = c.name.startsWith('__Host-');
+      const isSecurePrefix = c.name.startsWith('__Secure-') || isHostPrefix;
+      const secure = isSecurePrefix ? true : Boolean(c.secure ?? true);
+      const sameSite = c.sameSite === 'None' && !secure ? 'Lax' : c.sameSite;
+      const validExpires =
+        typeof c.expires === 'number' && Number.isFinite(c.expires) && c.expires > 0
+          ? c.expires
+          : undefined;
+
+      if (isHostPrefix) {
+        const hostOnly = cleanDomain.replace(/^\./, '');
+        const url = `https://${hostOnly}/`;
+        const key = `${c.name}|url:${url}`;
+        if (seenKeys.has(key)) return;
+        seenKeys.add(key);
+        normalized.push({
+          name: c.name,
+          value: c.value,
+          url,
+          secure: true,
+          httpOnly: Boolean(c.httpOnly),
+          ...(validExpires ? { expires: validExpires } : {}),
+          ...(sameSite ? { sameSite } : {}),
+        });
+      } else {
+        const cookiePath = c.path || '/';
+        const key = `${c.name}|dom:${cleanDomain}|path:${cookiePath}`;
+        if (seenKeys.has(key)) return;
+        seenKeys.add(key);
+        normalized.push({
+          name: c.name,
+          value: c.value,
+          domain: cleanDomain,
+          path: cookiePath,
+          secure,
+          httpOnly: Boolean(c.httpOnly),
+          ...(validExpires ? { expires: validExpires } : {}),
+          ...(sameSite ? { sameSite } : {}),
+        });
+      }
+    };
+
+    const MIRROR_AUTH_COOKIES = new Set([
+      'SID',
+      'HSID',
+      'SSID',
+      'APISID',
+      'SAPISID',
+      '__Secure-1PSID',
+      '__Secure-3PSID',
+      '__Secure-1PAPISID',
+      '__Secure-3PAPISID',
+      '__Secure-1PSIDTS',
+      '__Secure-3PSIDTS',
+      '__Secure-1PSIDCC',
+      '__Secure-3PSIDCC',
+      'SIDCC',
+      'LOGIN_INFO',
+    ]);
+
+    for (const c of cookies) {
+      pushNormalized(c);
+      if (MIRROR_AUTH_COOKIES.has(c.name)) {
+        if (c.domain.includes('google.com')) {
+          pushNormalized({ ...c, domain: '.youtube.com', path: '/' });
+        } else if (c.domain.includes('youtube.com')) {
+          pushNormalized({ ...c, domain: '.google.com', path: '/' });
+        }
+      }
+    }
+
     try {
-      await this.context.addCookies(cookies);
-      this.log('cookies', `Applied ${cookies.length} saved YouTube/Google cookies`, 'ok');
-      return cookies.length;
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.log('cookies', `Cookie injection warning: ${msg}`, 'warn');
-      return 0;
+      await this.context.addCookies(normalized);
+      this.log('cookies', `Applied ${normalized.length} saved YouTube/Google cookies`, 'ok');
+      return normalized.length;
+    } catch {
+      // Fallback: add cookies individually so one rejected cookie never blocks all other valid cookies
+      let applied = 0;
+      for (const singleCookie of normalized) {
+        try {
+          await this.context.addCookies([singleCookie]);
+          applied++;
+        } catch {
+          // skip single invalid cookie
+        }
+      }
+      if (applied > 0) {
+        this.log(
+          'cookies',
+          `Applied ${applied}/${normalized.length} saved YouTube/Google cookies (per-cookie fallback)`,
+          'ok'
+        );
+      } else {
+        this.log('cookies', 'Could not apply saved YouTube cookies (0 valid cookies accepted)', 'warn');
+      }
+      return applied;
     }
   }
 
@@ -578,13 +687,22 @@ export class YtStudioBrowserController {
     const detected = await this.detectCurrentChannel(page);
     const cfg = await loadStudioUserConfig(username);
 
-    if (cfg.ytChannelId && detected.channelId && cfg.ytChannelId !== detected.channelId) {
-      const msg = `Channel safety lock mismatch! Expected channel ID ${cfg.ytChannelId} (${cfg.ytChannelHandle || 'locked'}), but browser is on ${detected.channelId} (${detected.channelHandle || 'unknown'}). Aborting operation.`;
-      this.log('channel lock', msg, 'error');
-      throw new Error(msg);
-    }
-
-    if (!cfg.ytChannelId && (detected.channelId || detected.channelHandle)) {
+    if (
+      detected.channelId &&
+      (cfg.ytChannelId !== detected.channelId || (detected.channelHandle && cfg.ytChannelHandle !== detected.channelHandle))
+    ) {
+      await saveStudioUserConfig(username, {
+        ytChannelId: detected.channelId,
+        ytChannelHandle: detected.channelHandle || cfg.ytChannelHandle || null,
+        ytLastLoginStatus: 'logged_in',
+        ytLastLoginTestedAt: Date.now(),
+      });
+      this.log(
+        'channel lock',
+        `Locked YT Studio channel to ${detected.channelHandle || detected.channelId}`,
+        'ok'
+      );
+    } else if (!cfg.ytChannelId && (detected.channelId || detected.channelHandle)) {
       await saveStudioUserConfig(username, {
         ytChannelId: detected.channelId || cfg.ytChannelId,
         ytChannelHandle: detected.channelHandle || cfg.ytChannelHandle,
@@ -623,60 +741,110 @@ export class YtStudioBrowserController {
     channelHandle: string | null;
     message: string;
   }> {
-    return this.withLock(async () => {
-      const page = await this.ensurePage(username);
-      await this.applySavedCookiesToContext(username);
+    const page = await this.ensurePage(username);
+    await this.applySavedCookiesToContext(username);
 
+    const curUrl = page.url();
+    const alreadyOnStudioChannel =
+      curUrl.startsWith('https://studio.youtube.com/channel/UC') &&
+      !curUrl.includes('accounts.google.com');
+
+    if (!alreadyOnStudioChannel) {
       this.log('test login', 'Navigating to https://studio.youtube.com ...', 'info');
-      await page.goto('https://studio.youtube.com', {
-        waitUntil: 'domcontentloaded',
-        timeout: 45000,
-      });
-      await page.waitForTimeout(3500);
+      await page
+        .goto('https://studio.youtube.com', {
+          waitUntil: 'domcontentloaded',
+          timeout: 45000,
+        })
+        .catch(() => {});
+    }
 
-      const url = page.url();
-      const isAuthWall =
-        url.includes('accounts.google.com') ||
-        url.includes('ServiceLogin') ||
-        url.includes('signin');
-
-      if (isAuthWall) {
-        await saveStudioUserConfig(username, {
-          ytLastLoginStatus: 'logged_out',
-          ytLastLoginTestedAt: Date.now(),
-        });
-        this.log('test login', `Redirected to Google Sign-In (${url})`, 'error');
-        return {
-          loggedIn: false,
-          url,
-          channelId: null,
-          channelHandle: null,
-          message: 'Not logged in — redirected to Google Sign-In. Use Login Assist or paste fresh cookies.',
-        };
+    // Wait up to 12 seconds for passive redirects (CheckCookie / AccountChooser / studio.youtube.com/channel/UC...)
+    const waitDeadline = Date.now() + 12_000;
+    while (Date.now() < waitDeadline) {
+      const u = page.url();
+      if (u.startsWith('https://studio.youtube.com/channel/UC')) {
+        break;
       }
+      // If on Google AccountChooser with an already signed-in account row (not signed out), click it automatically
+      if (u.includes('accounts.google.com') && (u.includes('AccountChooser') || u.includes('signin/v2/identifier') === false)) {
+        const clickedChooser = await page
+          .evaluate(() => {
+            const rows = Array.from(
+              document.querySelectorAll('div[data-identifier], li [data-identifier]')
+            ) as HTMLElement[];
+            for (const r of rows) {
+              const txt = (r.innerText || r.textContent || '').toLowerCase();
+              if (!txt.includes('signed out') && !txt.includes('use another account')) {
+                r.click();
+                return true;
+              }
+            }
+            return false;
+          })
+          .catch(() => false);
+        if (clickedChooser) {
+          this.log('test login', 'Clicked signed-in Google account in AccountChooser...', 'info');
+          await page.waitForTimeout(2500);
+          continue;
+        }
+      }
+      if (u.startsWith('https://studio.youtube.com') && !u.includes('accounts.google.com')) {
+        const hasStudioUi = await page
+          .locator('#create-icon, ytcp-entity-snapshot, a#menu-paper-icon-item-1, ytcp-video-row')
+          .first()
+          .isVisible()
+          .catch(() => false);
+        if (hasStudioUi) break;
+      }
+      await page.waitForTimeout(1000);
+    }
 
-      const ch = await this.verifyOrLockChannel(page, username);
+    const url = page.url();
+    const isAuthWall =
+      url.includes('accounts.google.com') ||
+      url.includes('ServiceLogin') ||
+      url.includes('/signin');
+
+    if (isAuthWall) {
       await saveStudioUserConfig(username, {
-        ytLastLoginStatus: 'logged_in',
+        ytLastLoginStatus: 'logged_out',
         ytLastLoginTestedAt: Date.now(),
-        ytChannelId: ch.channelId,
-        ytChannelHandle: ch.channelHandle,
       });
-
-      this.log(
-        'test login',
-        `Logged in to YouTube Studio (${ch.channelHandle || ch.channelId || url})`,
-        'ok'
-      );
-
+      this.log('test login', `Redirected to Google Sign-In (${url})`, 'error');
       return {
-        loggedIn: true,
+        loggedIn: false,
         url,
-        channelId: ch.channelId,
-        channelHandle: ch.channelHandle,
-        message: `Logged in to YouTube Studio${ch.channelHandle ? ` as ${ch.channelHandle}` : ''}${ch.channelId ? ` (${ch.channelId})` : ''}`,
+        channelId: null,
+        channelHandle: null,
+        message: 'Not logged in — redirected to Google Sign-In. Use Login Assist or paste fresh cookies.',
       };
+    }
+
+    const ch = await this.verifyOrLockChannel(page, username);
+    // Also persist live session cookies back to store so any refreshed SIDCC / PSIDTS tokens are saved
+    await this.saveSessionFromContext(username).catch(() => {});
+
+    await saveStudioUserConfig(username, {
+      ytLastLoginStatus: 'logged_in',
+      ytLastLoginTestedAt: Date.now(),
+      ytChannelId: ch.channelId,
+      ytChannelHandle: ch.channelHandle,
     });
+
+    this.log(
+      'test login',
+      `Logged in to YouTube Studio (${ch.channelHandle || ch.channelId || url})`,
+      'ok'
+    );
+
+    return {
+      loggedIn: true,
+      url,
+      channelId: ch.channelId,
+      channelHandle: ch.channelHandle,
+      message: `Logged in to YouTube Studio${ch.channelHandle ? ` as ${ch.channelHandle}` : ''}${ch.channelId ? ` (${ch.channelId})` : ''}`,
+    };
   }
 
   /**
@@ -1079,19 +1247,33 @@ export class YtStudioBrowserController {
 
           await this.verifyOrLockChannel(uploadPage, username);
 
-          // If a previous upload's Visibility/Save modal is still sitting open on screen, click Save on it first, then dismiss all dialogs
-          const strayDoneBtn = uploadPage
-            .locator('ytcp-uploads-dialog #done-button, #done-button')
-            .first();
-          if (await strayDoneBtn.isVisible().catch(() => false)) {
-            await uploadPage
-              .evaluate(() => {
-                const dBtn = document.querySelector(
-                  'ytcp-uploads-dialog #done-button button, ytcp-uploads-dialog #done-button, #done-button button, #done-button'
-                ) as HTMLElement | null;
-                if (dBtn) dBtn.click();
-              })
-              .catch(() => {});
+          // If any previous upload's ytcp-uploads-dialog is still open on screen, click its visible Save button first, then dismiss all dialogs
+          const hadVisibleUploadModal = await uploadPage
+            .evaluate(() => {
+              const isVis = (el: Element | null): el is HTMLElement => {
+                if (!el || !(el instanceof HTMLElement)) return false;
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return r.width > 4 && r.height > 4 && s.display !== 'none' && s.visibility !== 'hidden';
+              };
+              const dlgs = Array.from(document.querySelectorAll('ytcp-uploads-dialog'));
+              for (const dlg of dlgs) {
+                if (!isVis(dlg)) continue;
+                const doneBtns = Array.from(
+                  dlg.querySelectorAll('#done-button button, #done-button, ytcp-button#done-button')
+                );
+                for (const b of doneBtns) {
+                  if (isVis(b)) {
+                    b.click();
+                  }
+                }
+                return true;
+              }
+              return false;
+            })
+            .catch(() => false);
+
+          if (hadVisibleUploadModal) {
             await uploadPage.waitForTimeout(2000);
           }
 
@@ -1099,13 +1281,24 @@ export class YtStudioBrowserController {
           await this.dismissAllUploadDialogs(uploadPage);
           await uploadPage.waitForTimeout(2000);
 
-          // If ytcp-uploads-dialog is STILL stuck open on a previous video's metadata/visibility step, reload clean Content page
-          const stuckMetadataModal = await uploadPage
-            .locator('ytcp-uploads-dialog #title-textarea, ytcp-uploads-dialog #done-button')
-            .first()
-            .isVisible()
+          // Check if ANY ytcp-uploads-dialog is STILL visibly open on a previous video's metadata/visibility step; if so, reload clean Content page
+          const stillHasStuckUploadModal = await uploadPage
+            .evaluate(() => {
+              const isVis = (el: Element | null): boolean => {
+                if (!el || !(el instanceof HTMLElement)) return false;
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return r.width > 20 && r.height > 20 && s.display !== 'none' && s.visibility !== 'hidden';
+              };
+              return Array.from(
+                document.querySelectorAll(
+                  'ytcp-uploads-dialog #title-textarea, ytcp-uploads-dialog #done-button, ytcp-uploads-dialog #next-button'
+                )
+              ).some((el) => isVis(el));
+            })
             .catch(() => false);
-          if (stuckMetadataModal) {
+
+          if (stillHasStuckUploadModal) {
             const cleanUrl = this.channelId
               ? `https://studio.youtube.com/channel/${this.channelId}/videos/upload?filter=%5B%5D`
               : 'https://studio.youtube.com';
@@ -1127,7 +1320,7 @@ export class YtStudioBrowserController {
             'info'
           );
 
-          // Step 1: Click Create -> Upload videos (with 2s waits after each click)
+          // Step 1: Click Create -> Upload videos (using visible element matching, with 2s waits after each click)
           let fileInput = uploadPage
             .locator('ytcp-uploads-file-picker input[type="file"], input[type="file"][name="Filedata"]')
             .first();
@@ -1142,23 +1335,30 @@ export class YtStudioBrowserController {
             ];
             let clickedCreate = false;
             for (const sel of createSelectors) {
-              const loc = uploadPage.locator(sel).first();
-              if (await loc.isVisible().catch(() => false)) {
-                await loc.click({ timeout: 8000 }).catch(() => {});
-                clickedCreate = true;
-                break;
+              const allLocs = await uploadPage.locator(sel).all().catch(() => []);
+              for (const loc of allLocs) {
+                if (await loc.isVisible().catch(() => false)) {
+                  await loc.click({ timeout: 8000 }).catch(() => {});
+                  clickedCreate = true;
+                  break;
+                }
               }
+              if (clickedCreate) break;
             }
             // Wait 2 seconds after clicking Create
             await uploadPage.waitForTimeout(2000);
 
             if (!clickedCreate) {
-              const directUploadBtn = uploadPage
+              const directUploadBtns = await uploadPage
                 .locator('#upload-icon, ytcp-button#upload-icon, button[aria-label="Upload videos"]')
-                .first();
-              if (await directUploadBtn.isVisible().catch(() => false)) {
-                await directUploadBtn.click({ timeout: 8000 }).catch(() => {});
-                await uploadPage.waitForTimeout(2000);
+                .all()
+                .catch(() => []);
+              for (const btn of directUploadBtns) {
+                if (await btn.isVisible().catch(() => false)) {
+                  await btn.click({ timeout: 8000 }).catch(() => {});
+                  await uploadPage.waitForTimeout(2000);
+                  break;
+                }
               }
             } else {
               const uploadMenuSelectors = [
@@ -1167,16 +1367,37 @@ export class YtStudioBrowserController {
                 'ytcp-ve:has-text("Upload videos")',
                 '[role="menuitem"]:has-text("Upload videos")',
               ];
+              let clickedMenu = false;
               for (const sel of uploadMenuSelectors) {
-                const item = uploadPage.locator(sel).first();
-                if (await item.isVisible().catch(() => false)) {
-                  await item.click({ timeout: 8000 }).catch(() => {});
-                  break;
+                const items = await uploadPage.locator(sel).all().catch(() => []);
+                for (const item of items) {
+                  if (await item.isVisible().catch(() => false)) {
+                    await item.click({ timeout: 8000 }).catch(() => {});
+                    clickedMenu = true;
+                    break;
+                  }
                 }
+                if (clickedMenu) break;
               }
               // Wait 2 seconds after clicking "Upload videos"
               await uploadPage.waitForTimeout(2000);
             }
+
+            // Check if "Verify it's you" dialog popped up when clicking Upload videos
+            const verifyPopupVisible = await uploadPage
+              .locator('tp-yt-paper-dialog:has-text("Verify it\'s you"), ytcp-verify-user-dialog')
+              .first()
+              .isVisible()
+              .catch(() => false);
+            if (verifyPopupVisible) {
+              this.log(
+                'verify required',
+                'YouTube Studio displayed "Verify it\'s you" dialog — clicking Next and switching to verification popup...',
+                'warn'
+              );
+              await this.clickVerifyNext(username).catch(() => {});
+            }
+
             fileInput = uploadPage
               .locator('input[type="file"][name="Filedata"], ytcp-uploads-file-picker input[type="file"], input[type="file"]')
               .first();
@@ -1203,162 +1424,298 @@ export class YtStudioBrowserController {
           await fileInput.setInputFiles(clipPath);
           this.log('upload file', `Attached ${path.basename(clipPath)} to YT Studio file picker`, 'info');
 
-          // Wait 2 seconds after attaching file so upload dialog & details form can load
-          await uploadPage.waitForTimeout(2000);
+          // Wait 2.5 seconds after attaching file so upload dialog & default filename initialization complete
+          await uploadPage.waitForTimeout(2500);
 
-          // Wait for the upload details modal (#title-textarea #textbox)
-          const titleBoxSelectors = [
-            'ytcp-social-suggestions-textbox#title-textarea #textbox',
-            '#title-textarea #textbox',
-            'div#textbox[aria-label*="Add a title"]',
-            'div#textbox[contenteditable="true"]',
-          ];
-          const titleBox = uploadPage.locator(titleBoxSelectors.join(', ')).first();
+          // Wait for a VISIBLE title textbox inside ytcp-uploads-dialog (never rely on .first() which can match a hidden element!)
           let titleVisible = false;
-          const titleWaitDeadline = Date.now() + 30_000;
+          const titleWaitDeadline = Date.now() + 35_000;
           while (Date.now() < titleWaitDeadline) {
-            if (await titleBox.isVisible().catch(() => false)) {
-              titleVisible = true;
-              break;
-            }
+            titleVisible = await uploadPage
+              .evaluate(() => {
+                const isVis = (el: Element | null): boolean => {
+                  if (!el || !(el instanceof HTMLElement)) return false;
+                  const r = el.getBoundingClientRect();
+                  const s = window.getComputedStyle(el);
+                  return r.width > 20 && r.height > 15 && s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const candidates = Array.from(
+                  document.querySelectorAll(
+                    'ytcp-uploads-dialog #title-textarea #textbox, ytcp-social-suggestions-textbox#title-textarea #textbox, #title-textarea #textbox, ytcp-uploads-dialog div#textbox[aria-label*="Add a title"]'
+                  )
+                );
+                return candidates.some((el) => isVis(el));
+              })
+              .catch(() => false);
+            if (titleVisible) break;
             await uploadPage.waitForTimeout(1000);
           }
 
           if (!titleVisible) {
-            throw new Error('Timed out waiting for YouTube Studio title textbox (#title-textarea #textbox)');
+            throw new Error('Timed out waiting for visible YouTube Studio title textbox (#title-textarea #textbox)');
           }
 
-          // Wait 2 seconds after details modal opens
+          // Wait 2 seconds after details modal opens so YouTube Studio's default filename write finishes before we overwrite it
           await uploadPage.waitForTimeout(2000);
 
-          // Step 2: Set title reliably via Playwright + DOM execCommand so it never stays as default filename
-          await titleBox.click({ timeout: 5000 }).catch(() => {});
-          await uploadPage.waitForTimeout(400);
-          await uploadPage.keyboard.press('Control+A').catch(() => {});
-          await uploadPage.keyboard.press('Backspace').catch(() => {});
-          await titleBox.fill(title).catch(async () => {
-            await uploadPage.keyboard.type(title, { delay: 15 });
-          });
-          await uploadPage
-            .evaluate((newTitle: string) => {
-              const tb = document.querySelector(
-                'ytcp-social-suggestions-textbox#title-textarea #textbox, #title-textarea #textbox, div#textbox[aria-label*="Add a title"]'
-              ) as HTMLElement | null;
-              if (tb && (tb.textContent || '').trim() !== newTitle) {
-                tb.focus();
-                document.execCommand('selectAll', false, undefined);
-                document.execCommand('insertText', false, newTitle);
-                if ((tb.textContent || '').trim() !== newTitle) {
-                  tb.textContent = newTitle;
+          // Step 2: Set title on the VISIBLE #title-textarea #textbox and verify it equals `title` (up to 4 retries)
+          for (let titleTry = 1; titleTry <= 4; titleTry++) {
+            const boxCoords = await uploadPage
+              .evaluate(() => {
+                const isVis = (el: Element | null): el is HTMLElement => {
+                  if (!el || !(el instanceof HTMLElement)) return false;
+                  const r = el.getBoundingClientRect();
+                  const s = window.getComputedStyle(el);
+                  return r.width > 20 && r.height > 15 && s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const tbs = Array.from(
+                  document.querySelectorAll(
+                    'ytcp-uploads-dialog #title-textarea #textbox, ytcp-social-suggestions-textbox#title-textarea #textbox, #title-textarea #textbox, ytcp-uploads-dialog div#textbox[aria-label*="Add a title"]'
+                  )
+                );
+                const visTb = tbs.find((el) => isVis(el)) as HTMLElement | undefined;
+                if (!visTb) return null;
+                visTb.scrollIntoView({ block: 'center' });
+                const r = visTb.getBoundingClientRect();
+                return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+              })
+              .catch(() => null);
+
+            if (boxCoords) {
+              await uploadPage.mouse.click(boxCoords.x, boxCoords.y).catch(() => {});
+              await uploadPage.waitForTimeout(250);
+              await uploadPage.keyboard.press('Control+A').catch(() => {});
+              await uploadPage.keyboard.press('Backspace').catch(() => {});
+              await uploadPage.keyboard.type(title, { delay: 12 }).catch(() => {});
+            }
+
+            const titleVerified = await uploadPage
+              .evaluate((newTitle: string) => {
+                const isVis = (el: Element | null): el is HTMLElement => {
+                  if (!el || !(el instanceof HTMLElement)) return false;
+                  const r = el.getBoundingClientRect();
+                  const s = window.getComputedStyle(el);
+                  return r.width > 20 && r.height > 15 && s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const tbs = Array.from(
+                  document.querySelectorAll(
+                    'ytcp-uploads-dialog #title-textarea #textbox, ytcp-social-suggestions-textbox#title-textarea #textbox, #title-textarea #textbox, ytcp-uploads-dialog div#textbox[aria-label*="Add a title"]'
+                  )
+                );
+                const visTb = tbs.find((el) => isVis(el)) as HTMLElement | undefined;
+                if (!visTb) return false;
+                if ((visTb.textContent || '').trim() !== newTitle) {
+                  visTb.focus();
+                  document.execCommand('selectAll', false, undefined);
+                  document.execCommand('insertText', false, newTitle);
+                  if ((visTb.textContent || '').trim() !== newTitle) {
+                    visTb.textContent = newTitle;
+                  }
+                  visTb.dispatchEvent(new InputEvent('input', { bubbles: true, data: newTitle }));
+                  visTb.dispatchEvent(new Event('change', { bubbles: true }));
+                  visTb.blur();
                 }
-                tb.dispatchEvent(new Event('input', { bubbles: true }));
-                tb.dispatchEvent(new Event('change', { bubbles: true }));
-              }
-            }, title)
-            .catch(() => {});
+                return (visTb.textContent || '').trim() === newTitle;
+              }, title)
+              .catch(() => false);
+
+            if (titleVerified) break;
+            await uploadPage.waitForTimeout(700);
+          }
+
           // Wait 2 seconds after setting title
           await uploadPage.waitForTimeout(2000);
 
-          // Step 3: Select "No, it's not made for kids" (scroll inside modal & verify aria-checked="true" so Next is never blocked!)
-          const notMfkSelectors = [
-            'tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]',
-            '#audience tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]',
-            'tp-yt-paper-radio-button:has-text("No, it\'s not made for kids")',
-            'tp-yt-paper-radio-button:has-text("not made for kids")',
-          ];
-          await uploadPage
-            .evaluate(() => {
-              const mfk = document.querySelector(
-                'tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"], #audience tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]'
-              ) as HTMLElement | null;
-              if (mfk) {
-                mfk.scrollIntoView({ block: 'center' });
-                mfk.click();
-                const inner = mfk.querySelector('#radioContainer, #offRadio') as HTMLElement | null;
-                if (inner) inner.click();
+          // Step 3: Select "No, it's not made for kids" on the VISIBLE radio button and verify aria-checked="true"
+          const ensureNotMadeForKidsChecked = async (): Promise<boolean> => {
+            for (let mfkTry = 1; mfkTry <= 3; mfkTry++) {
+              const mfkInfo = await uploadPage
+                .evaluate(() => {
+                  const isVis = (el: Element | null): el is HTMLElement => {
+                    if (!el || !(el instanceof HTMLElement)) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 8 && r.height > 8 && s.display !== 'none' && s.visibility !== 'hidden';
+                  };
+                  const radios = Array.from(
+                    document.querySelectorAll(
+                      'ytcp-uploads-dialog tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"], tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"], #audience tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]'
+                    )
+                  );
+                  const target = (radios.find((el) => isVis(el)) || radios[0]) as HTMLElement | undefined;
+                  if (!target) return null;
+                  target.scrollIntoView({ block: 'center' });
+                  target.click();
+                  const inner = target.querySelector('#radioContainer, #offRadio') as HTMLElement | null;
+                  if (inner) inner.click();
+                  const r = target.getBoundingClientRect();
+                  return {
+                    checked: target.getAttribute('aria-checked') === 'true',
+                    x: Math.round(r.left + Math.min(24, r.width / 2)),
+                    y: Math.round(r.top + r.height / 2),
+                    w: r.width,
+                    h: r.height,
+                  };
+                })
+                .catch(() => null);
+
+              if (mfkInfo?.checked) return true;
+              if (mfkInfo && mfkInfo.w > 4 && mfkInfo.h > 4) {
+                await uploadPage.mouse.click(mfkInfo.x, mfkInfo.y).catch(() => {});
+                await uploadPage.waitForTimeout(400);
               }
-            })
-            .catch(() => {});
-          for (const sel of notMfkSelectors) {
-            const radio = uploadPage.locator(sel).first();
-            if (await radio.isVisible().catch(() => false)) {
-              await radio.scrollIntoViewIfNeeded().catch(() => {});
-              const isChecked = await radio.getAttribute('aria-checked').catch(() => null);
-              if (isChecked !== 'true') {
-                await radio.click({ timeout: 5000 }).catch(() => {});
-              }
-              break;
+              const nowChecked = await uploadPage
+                .evaluate(() => {
+                  const radios = Array.from(
+                    document.querySelectorAll(
+                      'ytcp-uploads-dialog tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"], tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]'
+                    )
+                  );
+                  return radios.some((r) => r.getAttribute('aria-checked') === 'true');
+                })
+                .catch(() => false);
+              if (nowChecked) return true;
             }
-          }
+            return false;
+          };
+
+          await ensureNotMadeForKidsChecked();
           // Wait 2 seconds after clicking "Not made for kids"
           await uploadPage.waitForTimeout(2000);
 
           let shareUrl = await this.extractShareUrlFromUploadModal(uploadPage, ignoreVideoIds);
 
-          // Step 4: Advance to Visibility step (click Visibility step badge or Next button once per 2s step)
+          // Step 4: Advance to Visibility step (check if VISIBLE Unlisted/Private radio is on screen; if not, click Next or #step-badge-3)
           const targetRadioName = visibility === 'private' ? 'PRIVATE' : 'UNLISTED';
-          const visRadioLocator = uploadPage
-            .locator(
-              `tp-yt-paper-radio-button[name="${targetRadioName}"], #privacy-radios tp-yt-paper-radio-button[name="${targetRadioName}"]`
-            )
-            .first();
-          const nextBtn = uploadPage
-            .locator('ytcp-uploads-dialog #next-button, #next-button, ytcp-button#next-button, button:has-text("Next")')
-            .first();
+          const isVisibilityRadioVisibleOnScreen = async (): Promise<boolean> => {
+            return uploadPage
+              .evaluate((rName: string) => {
+                const isVis = (el: Element | null): boolean => {
+                  if (!el || !(el instanceof HTMLElement)) return false;
+                  const r = el.getBoundingClientRect();
+                  const s = window.getComputedStyle(el);
+                  return r.width > 10 && r.height > 10 && s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const radios = Array.from(
+                  document.querySelectorAll(
+                    `ytcp-uploads-dialog tp-yt-paper-radio-button[name="${rName}"], #privacy-radios tp-yt-paper-radio-button[name="${rName}"], tp-yt-paper-radio-button[name="${rName}"]`
+                  )
+                );
+                return radios.some((el) => isVis(el));
+              }, targetRadioName)
+              .catch(() => false);
+          };
 
-          for (let stepIdx = 0; stepIdx < 5; stepIdx++) {
+          for (let stepIdx = 0; stepIdx < 6; stepIdx++) {
             if (!shareUrl) {
               shareUrl = await this.extractShareUrlFromUploadModal(uploadPage, ignoreVideoIds);
             }
-            if (await visRadioLocator.isVisible().catch(() => false)) {
+            if (await isVisibilityRadioVisibleOnScreen()) {
               break;
             }
-            if (await nextBtn.isVisible().catch(() => false)) {
-              await nextBtn.click({ timeout: 8000 }).catch(async () => {
-                await uploadPage
-                  .evaluate(() => {
-                    const nBtn = document.querySelector(
-                      'ytcp-uploads-dialog #next-button button, #next-button button, ytcp-uploads-dialog #next-button'
-                    ) as HTMLElement | null;
-                    if (nBtn) nBtn.click();
-                  })
-                  .catch(() => {});
-              });
+            // Re-ensure "Not made for kids" is checked in case Details validation blocked Next
+            if (stepIdx > 0) {
+              await ensureNotMadeForKidsChecked();
+            }
+
+            // Click the visible Next button (or Visibility stepper badge #step-badge-3 on later tries)
+            const nextClickCoords = await uploadPage
+              .evaluate((tryStepperDirect: boolean) => {
+                const isVis = (el: Element | null): el is HTMLElement => {
+                  if (!el || !(el instanceof HTMLElement)) return false;
+                  const r = el.getBoundingClientRect();
+                  const s = window.getComputedStyle(el);
+                  return r.width > 10 && r.height > 10 && s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                if (tryStepperDirect) {
+                  const stepBadges = Array.from(
+                    document.querySelectorAll(
+                      'ytcp-uploads-dialog #step-badge-3, ytcp-uploads-dialog [test-id="REVIEW"], #step-badge-3'
+                    )
+                  );
+                  const visBadge = stepBadges.find((el) => isVis(el));
+                  if (visBadge) {
+                    visBadge.click();
+                    const r = visBadge.getBoundingClientRect();
+                    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+                  }
+                }
+                const nextBtns = Array.from(
+                  document.querySelectorAll(
+                    'ytcp-uploads-dialog #next-button button, ytcp-uploads-dialog #next-button, #next-button button, ytcp-button#next-button'
+                  )
+                );
+                const visNext = nextBtns.find((el) => isVis(el));
+                if (visNext) {
+                  visNext.click();
+                  const r = visNext.getBoundingClientRect();
+                  return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+                }
+                return null;
+              }, stepIdx >= 3)
+              .catch(() => null);
+
+            if (nextClickCoords) {
+              await uploadPage.mouse.click(nextClickCoords.x, nextClickCoords.y).catch(() => {});
             }
             // Wait 2 seconds after each Next click so the next tab step loads completely
             await uploadPage.waitForTimeout(2000);
           }
 
-          // Step 5: Select Unlisted (or Private) radio button and verify it is checked
-          const visSelectors = [
-            `tp-yt-paper-radio-button[name="${targetRadioName}"]`,
-            `#privacy-radios tp-yt-paper-radio-button[name="${targetRadioName}"]`,
-            `tp-yt-paper-radio-button:has-text("${visibility === 'private' ? 'Private' : 'Unlisted'}")`,
-          ];
-          for (const sel of visSelectors) {
-            const r = uploadPage.locator(sel).first();
-            if (await r.isVisible().catch(() => false)) {
-              await r.scrollIntoViewIfNeeded().catch(() => {});
-              await r.click({ timeout: 5000 }).catch(() => {});
-              break;
-            }
-          }
-          await uploadPage
-            .evaluate((rName: string) => {
-              const radio = document.querySelector(
-                `tp-yt-paper-radio-button[name="${rName}"], #privacy-radios tp-yt-paper-radio-button[name="${rName}"]`
-              ) as HTMLElement | null;
-              if (radio && radio.getAttribute('aria-checked') !== 'true') {
-                radio.click();
-                const inner = radio.querySelector('#radioContainer, #offRadio') as HTMLElement | null;
+          // Step 5: Select Unlisted (or Private) radio button on the VISIBLE Visibility step and verify aria-checked="true"
+          for (let visTry = 1; visTry <= 4; visTry++) {
+            const visCoords = await uploadPage
+              .evaluate((rName: string) => {
+                const isVis = (el: Element | null): el is HTMLElement => {
+                  if (!el || !(el instanceof HTMLElement)) return false;
+                  const r = el.getBoundingClientRect();
+                  const s = window.getComputedStyle(el);
+                  return r.width > 10 && r.height > 10 && s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const radios = Array.from(
+                  document.querySelectorAll(
+                    `ytcp-uploads-dialog tp-yt-paper-radio-button[name="${rName}"], #privacy-radios tp-yt-paper-radio-button[name="${rName}"], tp-yt-paper-radio-button[name="${rName}"]`
+                  )
+                );
+                const target = (radios.find((el) => isVis(el)) || radios[0]) as HTMLElement | undefined;
+                if (!target) return null;
+                target.scrollIntoView({ block: 'center' });
+                target.click();
+                const inner = target.querySelector('#radioContainer, #offRadio') as HTMLElement | null;
                 if (inner) inner.click();
-              }
-            }, targetRadioName)
-            .catch(() => {});
+                const r = target.getBoundingClientRect();
+                return {
+                  checked: target.getAttribute('aria-checked') === 'true',
+                  x: Math.round(r.left + Math.min(24, r.width / 2)),
+                  y: Math.round(r.top + r.height / 2),
+                  w: r.width,
+                  h: r.height,
+                };
+              }, targetRadioName)
+              .catch(() => null);
+
+            if (visCoords?.checked) break;
+            if (visCoords && visCoords.w > 4 && visCoords.h > 4) {
+              await uploadPage.mouse.click(visCoords.x, visCoords.y).catch(() => {});
+              await uploadPage.waitForTimeout(500);
+            }
+            const verifiedChecked = await uploadPage
+              .evaluate((rName: string) => {
+                const radios = Array.from(
+                  document.querySelectorAll(
+                    `ytcp-uploads-dialog tp-yt-paper-radio-button[name="${rName}"], #privacy-radios tp-yt-paper-radio-button[name="${rName}"], tp-yt-paper-radio-button[name="${rName}"]`
+                  )
+                );
+                return radios.some((r) => r.getAttribute('aria-checked') === 'true');
+              }, targetRadioName)
+              .catch(() => false);
+            if (verifiedChecked) break;
+          }
+
           // Wait 2 seconds after selecting Unlisted / Private
           await uploadPage.waitForTimeout(2000);
 
-          // Step 6: Wait until file byte upload finishes (Uploading X% done & Save button enabled),
+          // Step 6: Wait until file byte upload finishes (Uploading X% done & visible Save button enabled),
           // then click Save (#done-button) and VERIFY the Visibility step actually closes!
           const deadline = Date.now() + 150_000;
           while (Date.now() < deadline) {
@@ -1367,9 +1724,16 @@ export class YtStudioBrowserController {
             }
             const readyToSave = await uploadPage
               .evaluate(() => {
-                const host = document.querySelector(
-                  'ytcp-uploads-dialog #done-button, ytcp-button#done-button, #done-button'
-                ) as HTMLElement | null;
+                const isVis = (el: Element | null): el is HTMLElement => {
+                  if (!el || !(el instanceof HTMLElement)) return false;
+                  const r = el.getBoundingClientRect();
+                  const s = window.getComputedStyle(el);
+                  return r.width > 10 && r.height > 10 && s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const hosts = Array.from(
+                  document.querySelectorAll('ytcp-uploads-dialog #done-button, ytcp-button#done-button, #done-button')
+                );
+                const host = (hosts.find((el) => isVis(el)) || hosts[0]) as HTMLElement | undefined;
                 const innerBtn = host?.querySelector('button') as HTMLButtonElement | null;
                 const progEl = document.querySelector(
                   'ytcp-uploads-dialog ytcp-video-upload-progress, ytcp-video-upload-progress, .progress-label'
@@ -1400,27 +1764,35 @@ export class YtStudioBrowserController {
             shareUrl = await this.extractShareUrlFromUploadModal(uploadPage, ignoreVideoIds);
           }
 
-          // Click Save / Done button and verify the Visibility dialog closes (retry up to 6 times if Save didn't register)
+          // Click the VISIBLE Save / Done button and verify the Visibility dialog closes (retry up to 6 times)
           for (let saveTry = 1; saveTry <= 6; saveTry++) {
-            const doneBtn = uploadPage
-              .locator(
-                'ytcp-uploads-dialog #done-button button, ytcp-uploads-dialog #done-button, #done-button button, ytcp-button#done-button, button:has-text("Save")'
-              )
-              .first();
-            if (await doneBtn.isVisible().catch(() => false)) {
-              await doneBtn.scrollIntoViewIfNeeded().catch(() => {});
-              await doneBtn.click({ timeout: 8000, force: true }).catch(() => {});
-            }
-            await uploadPage
+            const doneCoords = await uploadPage
               .evaluate(() => {
-                const host = document.querySelector(
-                  'ytcp-uploads-dialog #done-button, ytcp-button#done-button, #done-button'
-                ) as HTMLElement | null;
-                const innerBtn = host?.querySelector('button') as HTMLElement | null;
-                if (innerBtn) innerBtn.click();
-                else if (host) host.click();
+                const isVis = (el: Element | null): el is HTMLElement => {
+                  if (!el || !(el instanceof HTMLElement)) return false;
+                  const r = el.getBoundingClientRect();
+                  const s = window.getComputedStyle(el);
+                  return r.width > 10 && r.height > 10 && s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const candidates = Array.from(
+                  document.querySelectorAll(
+                    'ytcp-uploads-dialog #done-button button, ytcp-uploads-dialog #done-button, #done-button button, ytcp-button#done-button'
+                  )
+                );
+                const visDone = candidates.find((el) => isVis(el));
+                if (!visDone) return null;
+                visDone.scrollIntoView({ block: 'center' });
+                visDone.click();
+                const inner = visDone.querySelector('button') as HTMLElement | null;
+                if (inner) inner.click();
+                const r = visDone.getBoundingClientRect();
+                return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
               })
-              .catch(() => {});
+              .catch(() => null);
+
+            if (doneCoords) {
+              await uploadPage.mouse.click(doneCoords.x, doneCoords.y).catch(() => {});
+            }
 
             // Wait 2.5 seconds after clicking Save
             await uploadPage.waitForTimeout(2500);
@@ -1429,18 +1801,30 @@ export class YtStudioBrowserController {
               shareUrl = await this.extractShareUrlFromUploadModal(uploadPage, ignoreVideoIds);
             }
 
-            // Check if the Visibility step (#done-button) has closed or transitioned to post-upload dialog
-            const doneStillVisible = await uploadPage
-              .locator('ytcp-uploads-dialog #done-button')
-              .first()
-              .isVisible()
+            // Check if ANY visible #done-button or visibility radio inside ytcp-uploads-dialog is still on screen
+            const modalStillOnEditOrVisibility = await uploadPage
+              .evaluate((rName: string) => {
+                const isVis = (el: Element | null): boolean => {
+                  if (!el || !(el instanceof HTMLElement)) return false;
+                  const r = el.getBoundingClientRect();
+                  const s = window.getComputedStyle(el);
+                  return r.width > 10 && r.height > 10 && s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const postSaveOpen = Array.from(
+                  document.querySelectorAll('ytcp-uploads-still-processing-dialog, ytcp-video-share-dialog')
+                ).some((el) => isVis(el));
+                if (postSaveOpen) return false;
+
+                const editOrVisOpen = Array.from(
+                  document.querySelectorAll(
+                    `ytcp-uploads-dialog #done-button, ytcp-uploads-dialog tp-yt-paper-radio-button[name="${rName}"], ytcp-uploads-dialog #title-textarea`
+                  )
+                ).some((el) => isVis(el));
+                return editOrVisOpen;
+              }, targetRadioName)
               .catch(() => false);
-            const postSavePopupVisible = await uploadPage
-              .locator('ytcp-uploads-still-processing-dialog, ytcp-video-share-dialog')
-              .first()
-              .isVisible()
-              .catch(() => false);
-            if (!doneStillVisible || postSavePopupVisible) {
+
+            if (!modalStillOnEditOrVisibility) {
               break;
             }
           }
@@ -1453,7 +1837,7 @@ export class YtStudioBrowserController {
           await this.dismissAllUploadDialogs(uploadPage);
           await uploadPage.waitForTimeout(2000);
 
-          // If shareUrl was not captured inside the dialog, read it from the Content table row by exact title
+          // If shareUrl was not captured inside the dialog, read it from the Content table row by exact title or windowNumber
           if (!shareUrl) {
             const contentSummary = await this.checkAndVerifyContentPage({
               scanId,
@@ -2236,6 +2620,7 @@ export class YtStudioBrowserController {
     if (this.assistMode) {
       this.status = 'assist';
       const page = await this.ensurePage(username);
+      await this.applySavedCookiesToContext(username).catch(() => {});
       if (page.url() === 'about:blank') {
         await page.goto('https://studio.youtube.com', {
           waitUntil: 'domcontentloaded',
@@ -2245,7 +2630,10 @@ export class YtStudioBrowserController {
       this.log('assist mode', 'Interactive Login Assist enabled for YouTube Studio', 'info');
     } else {
       this.status = 'ready';
-      this.log('assist mode', 'Interactive Login Assist disabled', 'info');
+      if (this.page && !this.page.isClosed() && this.page.url().startsWith('https://studio.youtube.com')) {
+        await this.saveSessionFromContext(username).catch(() => {});
+      }
+      this.log('assist mode', 'Interactive Login Assist disabled (session saved)', 'info');
     }
     return this.assistMode;
   }
