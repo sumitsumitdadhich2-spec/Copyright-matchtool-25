@@ -221,30 +221,39 @@ function recordKey(username: string): string {
 
 export async function loadStudioUserConfig(username: string): Promise<StudioUserConfig> {
   let raw = await readJSONRecord<Partial<StudioUserConfig>>(recordKey(username))
-  if (!raw?.encryptedYtCookies || !raw?.encryptedCookies) {
-    for (const altUser of ['shiva', 'admin']) {
-      if (altUser === (username || 'admin').toLowerCase()) continue
-      const altRaw = await readJSONRecord<Partial<StudioUserConfig>>(recordKey(altUser))
-      if (altRaw) {
-        raw = {
-          ...altRaw,
-          ...(raw || {}),
-          encryptedCookies: raw?.encryptedCookies || altRaw.encryptedCookies,
-          lastLoginEmail: raw?.lastLoginEmail || altRaw.lastLoginEmail,
-          lastLoginStatus:
-            raw?.lastLoginStatus && raw.lastLoginStatus !== 'untested'
-              ? raw.lastLoginStatus
-              : altRaw.lastLoginStatus,
-          lastLoginTestedAt: raw?.lastLoginTestedAt ?? altRaw.lastLoginTestedAt,
-          encryptedYtCookies: raw?.encryptedYtCookies || altRaw.encryptedYtCookies,
-          ytChannelId: raw?.ytChannelId || altRaw.ytChannelId,
-          ytChannelHandle: raw?.ytChannelHandle || altRaw.ytChannelHandle,
-          ytLastLoginStatus:
-            raw?.ytLastLoginStatus && raw.ytLastLoginStatus !== 'untested'
-              ? raw.ytLastLoginStatus
-              : altRaw.ytLastLoginStatus,
-          ytLastLoginTestedAt: raw?.ytLastLoginTestedAt ?? altRaw.ytLastLoginTestedAt,
-        }
+  for (const altUser of ['shiva', 'admin']) {
+    if (altUser === (username || 'admin').toLowerCase()) continue
+    const altRaw = await readJSONRecord<Partial<StudioUserConfig>>(recordKey(altUser))
+    if (altRaw) {
+      const preferAltYtStatus =
+        altRaw.ytLastLoginStatus === 'logged_in' ||
+        (!raw?.ytLastLoginStatus || raw.ytLastLoginStatus === 'untested')
+      const preferAltStudioStatus =
+        altRaw.lastLoginStatus === 'logged_in' ||
+        (!raw?.lastLoginStatus || raw.lastLoginStatus === 'untested')
+
+      raw = {
+        ...altRaw,
+        ...(raw || {}),
+        encryptedCookies: raw?.encryptedCookies || altRaw.encryptedCookies,
+        lastLoginEmail: raw?.lastLoginEmail || altRaw.lastLoginEmail,
+        lastLoginStatus: preferAltStudioStatus
+          ? altRaw.lastLoginStatus || raw?.lastLoginStatus
+          : raw?.lastLoginStatus,
+        lastLoginTestedAt: Math.max(
+          raw?.lastLoginTestedAt || 0,
+          altRaw.lastLoginTestedAt || 0,
+        ) || null,
+        encryptedYtCookies: raw?.encryptedYtCookies || altRaw.encryptedYtCookies,
+        ytChannelId: raw?.ytChannelId || altRaw.ytChannelId,
+        ytChannelHandle: raw?.ytChannelHandle || altRaw.ytChannelHandle,
+        ytLastLoginStatus: preferAltYtStatus
+          ? altRaw.ytLastLoginStatus || raw?.ytLastLoginStatus
+          : raw?.ytLastLoginStatus,
+        ytLastLoginTestedAt: Math.max(
+          raw?.ytLastLoginTestedAt || 0,
+          altRaw.ytLastLoginTestedAt || 0,
+        ) || null,
       }
     }
   }

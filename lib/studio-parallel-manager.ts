@@ -1916,7 +1916,17 @@ export class StudioParallelManager {
         throw new Error('Pehle window scan poora chalao (Minutes found khali hai)')
       }
 
-      if (!cfg.encryptedYtCookies || cfg.ytLastLoginStatus === 'logged_out') {
+      const hasAnySidecarForScan = this.windows.some((w) => {
+        const sc = readClipYtSidecar(this.scanId, w.windowNumber)
+        return Boolean((!sc?.ytDeleted && sc?.ytUrl) || w.ytUrl)
+      })
+      const hasYtSessionOrCookies =
+        Boolean(cfg.encryptedYtCookies) ||
+        Boolean(cfg.ytChannelId || cfg.ytChannelHandle) ||
+        globalYtStudioController.isSessionActiveOrLocked() ||
+        hasAnySidecarForScan
+
+      if (!hasYtSessionOrCookies) {
         throw new Error(
           'YT Studio login required: Please save YT Studio cookies and pass Test Login before starting scan.',
         )

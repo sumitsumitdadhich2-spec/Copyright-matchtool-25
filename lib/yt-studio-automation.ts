@@ -748,13 +748,30 @@ export class YtStudioBrowserController {
     return { channelId, channelHandle };
   }
 
+  public isSessionActiveOrLocked(): boolean {
+    if (this.channelId || this.channelHandle) return true;
+    if (this.page && !this.page.isClosed()) {
+      const u = this.page.url();
+      if (u.startsWith('https://studio.youtube.com') && !u.includes('accounts.google.com')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   async verifyOrLockChannel(page: Page, username = 'admin'): Promise<{ channelId: string | null; channelHandle: string | null }> {
     const detected = await this.detectCurrentChannel(page);
     const cfg = await loadStudioUserConfig(username);
+    const onAuthenticatedStudio =
+      page.url().startsWith('https://studio.youtube.com') &&
+      !page.url().includes('accounts.google.com') &&
+      Boolean(detected.channelId || detected.channelHandle);
 
     if (
       detected.channelId &&
-      (cfg.ytChannelId !== detected.channelId || (detected.channelHandle && cfg.ytChannelHandle !== detected.channelHandle))
+      (cfg.ytChannelId !== detected.channelId ||
+        (detected.channelHandle && cfg.ytChannelHandle !== detected.channelHandle) ||
+        cfg.ytLastLoginStatus !== 'logged_in')
     ) {
       await saveStudioUserConfig(username, {
         ytChannelId: detected.channelId,
@@ -767,16 +784,22 @@ export class YtStudioBrowserController {
         `Locked YT Studio channel to ${detected.channelHandle || detected.channelId}`,
         'ok'
       );
-    } else if (!cfg.ytChannelId && (detected.channelId || detected.channelHandle)) {
+    } else if ((!cfg.ytChannelId || cfg.ytLastLoginStatus !== 'logged_in') && (detected.channelId || detected.channelHandle)) {
       await saveStudioUserConfig(username, {
-        ytChannelId: detected.channelId || cfg.ytChannelId,
-        ytChannelHandle: detected.channelHandle || cfg.ytChannelHandle,
+        ytChannelId: detected.channelId || cfg.ytChannelId || null,
+        ytChannelHandle: detected.channelHandle || cfg.ytChannelHandle || null,
+        ytLastLoginStatus: 'logged_in',
+        ytLastLoginTestedAt: Date.now(),
       });
       this.log(
         'channel lock',
         `Locked YT Studio channel to ${detected.channelHandle || detected.channelId}`,
         'ok'
       );
+    }
+
+    if (onAuthenticatedStudio && !cfg.encryptedYtCookies && this.context) {
+      await this.saveLiveSessionToSettings(username).catch(() => {});
     }
 
     return {
@@ -1253,15 +1276,17 @@ export class YtStudioBrowserController {
       onProgress,
     } = opts;
 
+    const scanPrefix = scanId ? scanId.slice(0, 8) : '';
+    const scanPrefixLower = scanPrefix.toLowerCase();
+
     if (!forceUpload) {
-      const scanPrefix = scanId ? scanId.slice(0, 8).toLowerCase() : '';
       const existing =
         readClipYtSidecar(clipPath) ||
         readClipYtSidecar(scanId, windowNumber);
       const contentMatch = this.contentProgress?.items?.find(
         (it) =>
           it.windowNumber === windowNumber &&
-          (!it.scanPrefix || !scanPrefix || it.scanPrefix.toLowerCase() === scanPrefix)
+          (!it.scanPrefix || !scanPrefixLower || it.scanPrefix.toLowerCase() === scanPrefixLower)
       );
       const cachedUrl = existing?.ytUrl || contentMatch?.ytUrl;
       const cachedId = existing?.ytVideoId || contentMatch?.videoId;
@@ -1302,7 +1327,7 @@ export class YtStudioBrowserController {
         throw new Error(`Clip file not found at ${clipPath}`);
       }
 
-      const title = `cmt-${scanId.slice(0, 8)}-w${windowNumber}`;
+      const title = `cmt-${scanPrefix}-w${windowNumber}`;
       let lastErr: Error | null = null;
 
       for (let attempt = 1; attempt <= 2; attempt++) {
