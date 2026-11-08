@@ -998,6 +998,8 @@ export class StudioParallelManager {
   private clipsExtracting = false
   private clipExtractActiveCount = 0
   private clipExtractWaitQueue: Array<() => void> = []
+  private ytBatchPrepInProgress = false
+  private ytInitialContentSyncDone = false
 
   constructor(scanId: string) {
     killAllLeftoverChromeProcessesOnceOnStartup()
@@ -2459,9 +2461,124 @@ export class StudioParallelManager {
    * `status = 'ASSIGNED'` and `workerId = laneClaimTag` in the same synchronous turn so two
    * worker lanes can NEVER claim the same window (e.g. Window #13).
    */
+  public syncFromYtContentProgress(
+    prog: {
+      uploadedCount: number
+      expectedCount: number
+      readyCount: number
+      processingCount: number
+      claimedCount: number
+      allReady: boolean
+      items: Array<{
+        windowNumber: number | null
+        videoId: string
+        ytUrl: string
+        visibility: string
+        isReady: boolean
+      }>
+    },
+    autoStartWorkersIfReady = false,
+    username = 'admin',
+  ) {
+    let anyNewlyReady = false
+    for (const item of prog.items) {
+      if (item.windowNumber === null || item.windowNumber === undefined) continue
+      const matchWin = this.windows.find((winItem) => winItem.windowNumber === item.windowNumber)
+      if (!matchWin || !item.ytUrl) continue
+
+      const isDraftOrPrivate = /\b(draft|private)\b/i.test(item.visibility || '')
+      const isConfirmedReadyUnlisted = item.isReady && !isDraftOrPrivate
+
+      matchWin.ytUrl = item.ytUrl
+      matchWin.ytVideoId = item.videoId || matchWin.ytVideoId || null
+      matchWin.ytVisibility = item.visibility || 'Unlisted'
+      matchWin.ytUploadStatus = isConfirmedReadyUnlisted ? 'READY' : 'UPLOADING'
+      matchWin.ytStageText = `${matchWin.ytVisibility} · ${item.ytUrl}`
+      matchWin.ytError = null
+
+      if (matchWin.status === 'QUEUED') {
+        if (isConfirmedReadyUnlisted) {
+          if (matchWin.stage !== 'link ready') anyNewlyReady = true
+          matchWin.stage = 'link ready'
+          matchWin.summaryText = `YT ${item.visibility}: ${item.ytUrl}`
+        } else {
+          matchWin.stage = isDraftOrPrivate ? 'converting Draft -> Unlisted...' : 'YT SD processing...'
+          matchWin.summaryText = `YT ${item.visibility}: ${item.ytUrl}`
+        }
+      }
+    }
+    this.ytInitialContentSyncDone = true
+    this.persistStateToDisk()
+
+    // If user converted Draft -> Unlisted from the YT Studio panel and there are unfinished windows with ready Unlisted links,
+    // automatically start the parallel scan workers on the ready windows!
+    if (
+      autoStartWorkersIfReady &&
+      !this.active &&
+      !this.starting &&
+      !this.stoppingAll &&
+      this.scanId &&
+      this.scanId !== 'default'
+    ) {
+      const hasReadyUnfinishedWin = this.windows.some(
+        (w) =>
+          (w.status === 'QUEUED' ||
+            (w.status === 'FAILED' &&
+              /windowNumber is not defined|private|draft/i.test(w.error || ''))) &&
+          Boolean(w.ytUrl) &&
+          w.ytUploadStatus === 'READY' &&
+          !/\b(draft|private)\b/i.test(w.ytVisibility || ''),
+      )
+      if (hasReadyUnfinishedWin || anyNewlyReady) {
+        for (const w of this.windows) {
+          if (
+            w.status === 'FAILED' &&
+            /windowNumber is not defined|private|draft/i.test(w.error || '')
+          ) {
+            w.status = 'QUEUED'
+            w.workerId = null
+            w.error = null
+            w.stage = w.ytUrl ? 'link ready' : 'queued'
+            w.summaryText = w.ytUrl ? `YT link ready (${w.ytUrl})` : 'Queued'
+          }
+        }
+        this.persistStateToDisk()
+        void this.startParallelScan({
+          username: username || this.username || 'admin',
+          scanId: this.scanId,
+          minuteInput: this.minuteInput,
+          concurrency: this.concurrency,
+          resumeExisting: true,
+        }).catch(() => {})
+      }
+    }
+  }
+
+  /**
+   * 5. Atomic, synchronous window claim:
+   * Picks the next highest-priority QUEUED / WAITING_FOR_WORKER window and immediately marks
+   * `status = 'ASSIGNED'` and `workerId = laneClaimTag` in the same synchronous turn so two
+   * worker lanes can NEVER claim the same window (e.g. Window #13).
+   * When YouTube batch upload / Draft->Unlisted conversion is running (`ytBatchPrepInProgress`),
+   * strictly claims windows whose YouTube video is already confirmed READY & Unlisted so AI Studio
+   * workers start immediately on ready windows and pick up each Draft window the instant it becomes Unlisted!
+   */
   private claimNextQueuedWindow(laneClaimTag: string): ParallelWindowState | null {
     if (this.stoppingAll) return null
-    const candidates = this.windows
+    if (this.usingOriginalMovieClips && this.ytBatchPrepInProgress && !this.ytInitialContentSyncDone) {
+      return null
+    }
+
+    const isWindowYtUnlistedReady = (w: ParallelWindowState): boolean => {
+      if (!this.usingOriginalMovieClips) return true
+      return (
+        Boolean(w.ytUrl) &&
+        w.ytUploadStatus === 'READY' &&
+        !/\b(draft|private)\b/i.test(w.ytVisibility || '')
+      )
+    }
+
+    const allEligible = this.windows
       .filter(
         (w) =>
           (w.status === 'QUEUED' || w.status === 'WAITING_FOR_WORKER') &&
@@ -2469,6 +2586,13 @@ export class StudioParallelManager {
           !this.stoppedWindowIds.has(w.id),
       )
       .sort((a, b) => a.priorityRank - b.priorityRank || a.windowNumber - b.windowNumber)
+
+    const readyCandidates = allEligible.filter((w) => isWindowYtUnlistedReady(w))
+    const candidates = this.ytBatchPrepInProgress
+      ? readyCandidates
+      : readyCandidates.length > 0
+        ? readyCandidates
+        : allEligible
 
     const chosen = candidates[0] || null
     if (!chosen) return null
@@ -2836,8 +2960,15 @@ export class StudioParallelManager {
         }
       }
 
-      // 3. When using YouTube Studio window clips: upload all clips sequentially with 2s step waits,
-      // verify uploaded clips on the Content page, and immediately start AI Studio workers on all clips!
+      // 3. When using YouTube Studio window clips: run YouTube Content verification (Draft -> Unlisted conversion)
+      // and missing clip uploads CONCURRENTLY with AI Studio worker lanes so that:
+      // - Windows that are already Unlisted start scanning in AI Studio immediately!
+      // - Each Draft window starts scanning in AI Studio the exact moment its Draft -> Unlisted conversion finishes!
+      // - Newly uploaded windows start scanning in AI Studio as soon as each upload finishes!
+      const workerCount = this.concurrency
+      const workerPromises: Promise<void>[] = []
+
+      let ytPrepPromise: Promise<void> = Promise.resolve()
       if (this.usingOriginalMovieClips && !this.stoppingAll) {
         globalYtStudioController.resetDailyUploadLimitFlag()
         const pendingWins = this.windows
@@ -2845,173 +2976,218 @@ export class StudioParallelManager {
           .sort((a, b) => a.priorityRank - b.priorityRank || a.windowNumber - b.windowNumber)
 
         if (pendingWins.length > 0) {
-          this.appendCombinedLog({
-            workerId: 'SYS',
-            level: 'INFO',
-            step: 'YT batch upload phase',
-            message: `Checking / uploading ${pendingWins.length} remaining window clip(s) to YouTube Studio (already uploaded clips will be skipped)...`,
-          })
+          this.ytBatchPrepInProgress = true
+          this.ytInitialContentSyncDone = false
 
-          const cfg = await loadStudioUserConfig(this.username || 'admin')
-          const expectedForContent: Array<{
-            windowNumber: number
-            clipPath?: string
-            title: string
-            videoId?: string
-          }> = []
-
-          for (const w of pendingWins) {
-            if (this.stoppingAll || this.stoppedWindowIds.has(w.id)) break
-            const winRange = `${w.startFormatted}-${w.endFormatted}`
-            const clipTask =
-              this.windowClipPromises.get(w.id) ||
-              (this.startWindowClipTask ? this.startWindowClipTask(w) : null)
-            const clipRes = clipTask ? await clipTask.catch(() => null) : null
-            if (!clipRes?.clipPath) continue
-
-            const existingYt =
-              readClipYtSidecar(clipRes.clipPath) ||
-              readClipYtSidecar(this.scanId, w.windowNumber)
-            const knownUrl =
-              (!existingYt?.ytDeleted && (existingYt?.ytUrl || w.ytUrl)) || null
-            const knownVideoId =
-              (!existingYt?.ytDeleted && (existingYt?.ytVideoId || w.ytVideoId)) || null
-            if (knownUrl && knownVideoId) {
-              w.ytUrl = knownUrl
-              w.ytVideoId = knownVideoId
-              w.ytVisibility = w.ytVisibility || 'Unlisted'
-              w.ytUploadStatus = 'READY'
-              w.stage = 'link ready'
-              w.summaryText = `YT link ready (${knownUrl})`
-              this.persistStateToDisk()
-              expectedForContent.push({
-                windowNumber: w.windowNumber,
-                clipPath: clipRes.clipPath,
-                title: `cmt-${this.scanId.slice(0, 8)}-w${w.windowNumber}`,
-                videoId: knownVideoId,
-              })
-              continue
-            }
-
-            const releaseYt = await globalYtStudioUploadGate.acquire()
+          ytPrepPromise = (async () => {
             try {
-              if (this.stoppingAll || this.stoppedWindowIds.has(w.id)) break
-              w.stage = 'uploading to YT'
-              w.summaryText = 'Uploading window clip to YouTube Studio...'
-              this.persistStateToDisk()
+              const cfg = await loadStudioUserConfig(this.username || 'admin')
+              const scanPrefixShort = this.scanId.slice(0, 8)
 
-              const ytRes = await globalYtStudioController.uploadWindowClip({
-                clipPath: clipRes.clipPath,
-                scanId: this.scanId,
-                windowNumber: w.windowNumber,
-                visibility: cfg.ytVisibility === 'private' ? 'private' : 'unlisted',
-                username: this.username || 'admin',
-                onProgress: (stg) => {
-                  if (w.status === 'QUEUED') {
-                    w.stage = stg
+              // Step 3A: First check YouTube Studio Content page so any already-uploaded Unlisted windows
+              // unlock for AI Studio workers immediately, and any Draft / Draft (Blocked) rows convert to
+              // Unlisted one-by-one (unlocking each window for AI Studio workers the instant it converts!).
+              const initialExpected = pendingWins.map((w) => {
+                const existingYt = readClipYtSidecar(this.scanId, w.windowNumber)
+                const knownVideoId =
+                  (!existingYt?.ytDeleted && (existingYt?.ytVideoId || w.ytVideoId)) || undefined
+                return {
+                  windowNumber: w.windowNumber,
+                  title: `cmt-${scanPrefixShort}-w${w.windowNumber}`,
+                  videoId: knownVideoId,
+                }
+              })
+
+              try {
+                await globalYtStudioController.checkAndVerifyContentPage({
+                  scanId: this.scanId,
+                  expectedWindows: initialExpected,
+                  waitForSdReady: false,
+                  maxWaitMs: 25_000,
+                  username: this.username || 'admin',
+                  onProgress: (prog) => {
+                    this.syncFromYtContentProgress(prog, false, this.username || 'admin')
+                    this.appendCombinedLog({
+                      workerId: 'SYS',
+                      level: prog.allReady ? 'SUCCESS' : 'INFO',
+                      step: 'YT content progress',
+                      message: `YT Content: ${prog.uploadedCount}/${prog.expectedCount} uploaded · ${prog.readyCount}/${prog.expectedCount} SD ready (Unlisted)${prog.processingCount > 0 ? ` · ${prog.processingCount} processing/converting` : ''}${prog.claimedCount > 0 ? ` · ${prog.claimedCount} claimed (link OK)` : ''}`,
+                    })
+                  },
+                })
+              } catch {
+                // Allow fallback to sidecars if initial content check fails
+                this.ytInitialContentSyncDone = true
+              }
+
+              this.ytInitialContentSyncDone = true
+
+              // Step 3B: Upload any remaining QUEUED windows that still don't have a ready Unlisted YouTube link
+              const winsNeedingUpload = pendingWins.filter(
+                (w) =>
+                  w.status === 'QUEUED' &&
+                  !this.stoppedWindowIds.has(w.id) &&
+                  (!w.ytUrl ||
+                    w.ytUploadStatus !== 'READY' ||
+                    /\b(draft|private)\b/i.test(w.ytVisibility || '')),
+              )
+
+              if (winsNeedingUpload.length > 0 && !this.stoppingAll) {
+                this.appendCombinedLog({
+                  workerId: 'SYS',
+                  level: 'INFO',
+                  step: 'YT batch upload phase',
+                  message: `Uploading ${winsNeedingUpload.length} remaining window clip(s) to YouTube Studio (ready Unlisted windows are already scanning in parallel)...`,
+                })
+
+                const newlyUploadedExpected: Array<{
+                  windowNumber: number
+                  clipPath?: string
+                  title: string
+                  videoId?: string
+                }> = []
+
+                for (const w of winsNeedingUpload) {
+                  if (this.stoppingAll || this.stoppedWindowIds.has(w.id)) break
+                  if (w.status !== 'QUEUED') continue
+                  const winRange = `${w.startFormatted}-${w.endFormatted}`
+                  const clipTask =
+                    this.windowClipPromises.get(w.id) ||
+                    (this.startWindowClipTask ? this.startWindowClipTask(w) : null)
+                  const clipRes = clipTask ? await clipTask.catch(() => null) : null
+                  if (!clipRes?.clipPath) continue
+
+                  // Re-check if sidecar + Unlisted status became ready while waiting for clip extraction
+                  const existingYt =
+                    readClipYtSidecar(clipRes.clipPath) ||
+                    readClipYtSidecar(this.scanId, w.windowNumber)
+                  const knownUrl =
+                    (!existingYt?.ytDeleted && (existingYt?.ytUrl || w.ytUrl)) || null
+                  const knownVideoId =
+                    (!existingYt?.ytDeleted && (existingYt?.ytVideoId || w.ytVideoId)) || null
+                  if (
+                    knownUrl &&
+                    knownVideoId &&
+                    w.ytUploadStatus === 'READY' &&
+                    !/\b(draft|private)\b/i.test(w.ytVisibility || '')
+                  ) {
+                    w.ytUrl = knownUrl
+                    w.ytVideoId = knownVideoId
+                    w.stage = 'link ready'
+                    w.summaryText = `YT link ready (${knownUrl})`
                     this.persistStateToDisk()
+                    continue
                   }
-                },
-              })
 
-              w.stage = 'link ready'
-              w.summaryText = `YT link ready (${ytRes.ytUrl})`
-              expectedForContent.push({
-                windowNumber: w.windowNumber,
-                clipPath: clipRes.clipPath,
-                title: `cmt-${this.scanId.slice(0, 8)}-w${w.windowNumber}`,
-                videoId: ytRes.ytVideoId,
-              })
-              this.appendCombinedLog({
-                workerId: 'SYS',
-                windowId: w.id,
-                windowNumber: w.windowNumber,
-                windowRange: winRange,
-                level: 'INFO',
-                step: ytRes.reused ? 'YT link reused' : 'YT uploaded (popup closed)',
-                message: `Window #${w.windowNumber} (${winRange}) uploaded to YouTube -> ${ytRes.ytUrl}`,
-              })
-              this.persistStateToDisk()
-            } catch (ytErr: unknown) {
-              const ytMsg = ytErr instanceof Error ? ytErr.message : String(ytErr)
-              this.appendCombinedLog({
-                workerId: 'SYS',
-                windowId: w.id,
-                windowNumber: w.windowNumber,
-                windowRange: winRange,
-                level: 'RETRY',
-                step: 'YT pre-upload warning',
-                message: `Window #${w.windowNumber} (${winRange}) YT upload warning (will retry on worker slot): ${ytMsg}`,
-              })
+                  const releaseYt = await globalYtStudioUploadGate.acquire()
+                  try {
+                    if (this.stoppingAll || this.stoppedWindowIds.has(w.id)) break
+                    if (w.status !== 'QUEUED') continue
+                    w.stage = 'uploading to YT'
+                    w.summaryText = 'Uploading window clip to YouTube Studio...'
+                    this.persistStateToDisk()
+
+                    const ytRes = await globalYtStudioController.uploadWindowClip({
+                      clipPath: clipRes.clipPath,
+                      scanId: this.scanId,
+                      windowNumber: w.windowNumber,
+                      visibility: cfg.ytVisibility === 'private' ? 'private' : 'unlisted',
+                      username: this.username || 'admin',
+                      onProgress: (stg) => {
+                        if (w.status === 'QUEUED') {
+                          w.stage = stg
+                          this.persistStateToDisk()
+                        }
+                      },
+                    })
+
+                    w.ytUrl = ytRes.ytUrl
+                    w.ytVideoId = ytRes.ytVideoId
+                    w.ytVisibility = 'Unlisted'
+                    w.ytUploadStatus = 'READY'
+                    w.stage = 'link ready'
+                    w.summaryText = `YT link ready (${ytRes.ytUrl})`
+                    newlyUploadedExpected.push({
+                      windowNumber: w.windowNumber,
+                      clipPath: clipRes.clipPath,
+                      title: `cmt-${scanPrefixShort}-w${w.windowNumber}`,
+                      videoId: ytRes.ytVideoId,
+                    })
+                    this.appendCombinedLog({
+                      workerId: 'SYS',
+                      windowId: w.id,
+                      windowNumber: w.windowNumber,
+                      windowRange: winRange,
+                      level: 'INFO',
+                      step: ytRes.reused ? 'YT link reused' : 'YT uploaded (popup closed)',
+                      message: `Window #${w.windowNumber} (${winRange}) ready on YouTube -> ${ytRes.ytUrl}`,
+                    })
+                    this.persistStateToDisk()
+                  } catch (ytErr: unknown) {
+                    const ytMsg = ytErr instanceof Error ? ytErr.message : String(ytErr)
+                    this.appendCombinedLog({
+                      workerId: 'SYS',
+                      windowId: w.id,
+                      windowNumber: w.windowNumber,
+                      windowRange: winRange,
+                      level: 'RETRY',
+                      step: 'YT pre-upload warning',
+                      message: `Window #${w.windowNumber} (${winRange}) YT upload warning (will retry on worker slot): ${ytMsg}`,
+                    })
+                  } finally {
+                    releaseYt()
+                  }
+                }
+
+                if (!this.stoppingAll && newlyUploadedExpected.length > 0) {
+                  try {
+                    const contentSummary =
+                      await globalYtStudioController.checkAndVerifyContentPage({
+                        scanId: this.scanId,
+                        expectedWindows: newlyUploadedExpected,
+                        waitForSdReady: true,
+                        maxWaitMs: 30_000,
+                        username: this.username || 'admin',
+                        onProgress: (prog) => {
+                          this.syncFromYtContentProgress(prog, false, this.username || 'admin')
+                        },
+                      })
+                    this.appendCombinedLog({
+                      workerId: 'SYS',
+                      level: 'SUCCESS',
+                      step: 'YT content verified',
+                      message: `YouTube Studio Content check complete: ${contentSummary.uploadedCount}/${contentSummary.expectedCount} uploaded, ${contentSummary.readyCount} ready (Unlisted)!`,
+                    })
+                  } catch (contentErr: unknown) {
+                    const cMsg =
+                      contentErr instanceof Error ? contentErr.message : String(contentErr)
+                    this.appendCombinedLog({
+                      workerId: 'SYS',
+                      level: 'RETRY',
+                      step: 'YT content check warning',
+                      message: `Content page check warning (continuing with saved sidecar links): ${cMsg}`,
+                    })
+                  }
+                }
+              }
             } finally {
-              releaseYt()
+              this.ytInitialContentSyncDone = true
+              this.ytBatchPrepInProgress = false
             }
-          }
-
-          if (!this.stoppingAll && expectedForContent.length > 0) {
-            this.appendCombinedLog({
-              workerId: 'SYS',
-              level: 'INFO',
-              step: 'YT content check start',
-              message: `${expectedForContent.length} clip(s) uploaded -> opening YouTube Studio Content page to check upload & SD processing progress...`,
-            })
-
-            try {
-              const contentSummary = await globalYtStudioController.checkAndVerifyContentPage({
-                scanId: this.scanId,
-                expectedWindows: expectedForContent,
-                waitForSdReady: true,
-                maxWaitMs: 0,
-                username: this.username || 'admin',
-                onProgress: (prog) => {
-                  this.appendCombinedLog({
-                    workerId: 'SYS',
-                    level: prog.allReady ? 'SUCCESS' : 'INFO',
-                    step: 'YT content progress',
-                    message: `YT Content: ${prog.uploadedCount}/${prog.expectedCount} uploaded · ${prog.readyCount}/${prog.expectedCount} SD ready (Unlisted)${prog.processingCount > 0 ? ` · ${prog.processingCount} processing SD` : ''}${prog.claimedCount > 0 ? ` · ${prog.claimedCount} claimed (link OK)` : ''}`,
-                  })
-                  for (const item of prog.items) {
-                    const matchWin = this.windows.find(
-                      (winItem) => winItem.windowNumber === item.windowNumber,
-                    )
-                    if (matchWin && matchWin.status === 'QUEUED' && item.ytUrl) {
-                      matchWin.stage = item.isReady ? 'link ready' : 'YT SD processing...'
-                      matchWin.summaryText = `YT ${item.visibility}: ${item.ytUrl}`
-                    }
-                  }
-                  this.persistStateToDisk()
-                },
-              })
-
-              this.appendCombinedLog({
-                workerId: 'SYS',
-                level: 'SUCCESS',
-                step: 'YT content verified',
-                message: `YouTube Studio Content check complete: ${contentSummary.uploadedCount}/${contentSummary.expectedCount} uploaded, ${contentSummary.readyCount} ready (Unlisted) — launching AI Studio workers!`,
-              })
-            } catch (contentErr: unknown) {
-              const cMsg = contentErr instanceof Error ? contentErr.message : String(contentErr)
-              this.appendCombinedLog({
-                workerId: 'SYS',
-                level: 'RETRY',
-                step: 'YT content check warning',
-                message: `Content page check warning (continuing with saved sidecar links): ${cMsg}`,
-              })
-            }
-          }
+          })()
         }
       }
 
-      if (this.stoppingAll) return
-
-      const workerCount = this.concurrency
-      const workerPromises: Promise<void>[] = []
+      if (this.stoppingAll) {
+        this.ytBatchPrepInProgress = false
+        return
+      }
 
       for (let laneIdx = 1; laneIdx <= workerCount; laneIdx++) {
         workerPromises.push(this.runSingleWorkerLane(laneIdx))
       }
 
-      await Promise.allSettled(workerPromises)
+      await Promise.allSettled([ytPrepPromise, ...workerPromises])
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       if (!this.stoppingAll) {
@@ -3224,11 +3400,11 @@ export class StudioParallelManager {
         const anyQueued = this.windows.some(
           (w) => w.status === 'QUEUED' && !this.stoppedWindowIds.has(w.id),
         )
-        if (!anyQueued && !anyInFlight) {
+        if (!anyQueued && !anyInFlight && !this.ytBatchPrepInProgress) {
           break
         }
-        if (!anyQueued && anyInFlight) {
-          await new Promise((r) => setTimeout(r, 1500))
+        if (anyQueued || anyInFlight || this.ytBatchPrepInProgress) {
+          await new Promise((r) => setTimeout(r, 1000))
           continue
         }
         break

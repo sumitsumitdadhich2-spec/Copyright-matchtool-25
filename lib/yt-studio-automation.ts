@@ -2346,7 +2346,231 @@ export class YtStudioBrowserController {
       await this.dismissAllUploadDialogs(page).catch(() => {});
       await page.waitForSelector('ytcp-video-row', { timeout: 12000 }).catch(() => {});
 
-      const inspectTargetRowOnTable = async () => {
+      const scrollTableBy = async (deltaY: number) => {
+        await page
+          .evaluate((dy: number) => {
+            const scrollers = [
+              document.querySelector('ytcp-video-section-content'),
+              document.querySelector('#video-list'),
+              document.querySelector('ytcp-table-body'),
+              document.scrollingElement,
+              document.documentElement,
+            ].filter(Boolean) as HTMLElement[];
+            for (const s of scrollers) {
+              if (s.scrollHeight > s.clientHeight + 10) {
+                s.scrollTop = Math.max(0, s.scrollTop + dy);
+              }
+            }
+            window.scrollBy(0, dy);
+          }, deltaY)
+          .catch(() => {});
+        await page.waitForTimeout(350).catch(() => {});
+      };
+
+      const inspectTargetRowOnTable = async (preferTaggedRow = false) => {
+        const findAndScrollRow = async () =>
+          await page
+            .evaluate(
+              (args: {
+                t: { videoId?: string; title?: string; windowNumber?: number; scanPrefix?: string };
+                preferTagged: boolean;
+              }) => {
+                const { t, preferTagged } = args;
+                const isVis = (el: Element | null): el is HTMLElement => {
+                  if (!el || !(el instanceof HTMLElement)) return false;
+                  const r = el.getBoundingClientRect();
+                  const s = window.getComputedStyle(el);
+                  return r.width > 4 && r.height > 4 && s.display !== 'none' && s.visibility !== 'hidden';
+                };
+
+                const rows = Array.from(document.querySelectorAll('ytcp-video-row')) as HTMLElement[];
+                const parseRow = (row: HTMLElement) => {
+                  const titleEl = row.querySelector(
+                    '#video-title, a#video-title, .video-title-wrapper'
+                  ) as HTMLElement | null;
+                  const rawTitle = (titleEl?.innerText || titleEl?.textContent || '')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+
+                  let vid = '';
+                  const anchors = Array.from(row.querySelectorAll('a[href]')) as HTMLAnchorElement[];
+                  for (const a of anchors) {
+                    const href = a.getAttribute('href') || a.href || '';
+                    const mEdit = href.match(/\/video\/([a-zA-Z0-9_-]{11})/);
+                    if (mEdit) {
+                      vid = mEdit[1];
+                      break;
+                    }
+                    const mShort =
+                      href.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/) ||
+                      href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+                    if (mShort) {
+                      vid = mShort[1];
+                      break;
+                    }
+                  }
+                  if (!vid) {
+                    const imgs = Array.from(row.querySelectorAll('img[src]')) as HTMLImageElement[];
+                    for (const img of imgs) {
+                      const src = img.getAttribute('src') || img.src || '';
+                      const mThumb = src.match(/\/vi(?:_webp)?\/([a-zA-Z0-9_-]{11})\//);
+                      if (mThumb) {
+                        vid = mThumb[1];
+                        break;
+                      }
+                    }
+                  }
+                  if (!vid) {
+                    const html = row.outerHTML || '';
+                    const mHtml =
+                      html.match(/\/video\/([a-zA-Z0-9_-]{11})/) ||
+                      html.match(/\/vi(?:_webp)?\/([a-zA-Z0-9_-]{11})\//);
+                    if (mHtml) vid = mHtml[1];
+                  }
+
+                  const visCell = row.querySelector(
+                    'ytcp-video-list-cell-visibility, .cell-body.tablecell-visibility, .tablecell-visibility, #visibility-label'
+                  ) as HTMLElement | null;
+                  const visLabelEl = row.querySelector(
+                    '#visibility-label, ytcp-video-list-cell-visibility #visibility-label'
+                  ) as HTMLElement | null;
+                  const rawVisText = (
+                    visLabelEl?.innerText ||
+                    visCell?.innerText ||
+                    visLabelEl?.textContent ||
+                    visCell?.textContent ||
+                    ''
+                  )
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                  const visLower = rawVisText.toLowerCase();
+
+                  const hasEditDraftBtn = Array.from(
+                    row.querySelectorAll('ytcp-button, button, a, [role="button"]')
+                  ).some((el) => {
+                    if (!isVis(el)) return false;
+                    return ((el as HTMLElement).innerText || el.textContent || '')
+                      .trim()
+                      .toLowerCase()
+                      .includes('edit draft');
+                  });
+
+                  const isExplicitUnlisted = /\bunlisted\b/i.test(visLower);
+                  const isDraft =
+                    !isExplicitUnlisted && (hasEditDraftBtn || /\bdraft\b/i.test(visLower));
+                  const isPrivate = !isDraft && !isExplicitUnlisted && /\bprivate\b/i.test(visLower);
+                  const isUnlisted = isExplicitUnlisted && !isDraft && !isPrivate;
+
+                  return {
+                    row,
+                    vid,
+                    rawTitle,
+                    rawVisText,
+                    isDraft,
+                    isPrivate,
+                    isUnlisted,
+                    hasEditDraftBtn,
+                    isTagged: row.getAttribute('data-cmt-target-unlisted-row') === 'true',
+                  };
+                };
+
+                const matched: Array<ReturnType<typeof parseRow>> = [];
+                for (const row of rows) {
+                  const parsed = parseRow(row);
+                  if (preferTagged && parsed.isTagged) {
+                    matched.push(parsed);
+                    continue;
+                  }
+                  let matches = false;
+                  if (t.videoId && parsed.vid && parsed.vid === t.videoId) {
+                    matches = true;
+                  } else if (t.title && parsed.rawTitle.toLowerCase() === t.title.toLowerCase()) {
+                    matches = true;
+                  } else if (
+                    t.windowNumber !== undefined &&
+                    t.scanPrefix &&
+                    parsed.rawTitle.toLowerCase() === `${t.scanPrefix.toLowerCase()}-w${t.windowNumber}`
+                  ) {
+                    matches = true;
+                  } else if (
+                    t.windowNumber !== undefined &&
+                    new RegExp(`^cmt-[a-z0-9_-]+-w${t.windowNumber}\\b`, 'i').test(parsed.rawTitle) &&
+                    (!t.scanPrefix ||
+                      parsed.rawTitle.toLowerCase().startsWith(`cmt-${t.scanPrefix.toLowerCase()}-`))
+                  ) {
+                    matches = true;
+                  } else if (
+                    t.windowNumber !== undefined &&
+                    !t.scanPrefix &&
+                    new RegExp(`-w${t.windowNumber}\\b`, 'i').test(parsed.rawTitle)
+                  ) {
+                    matches = true;
+                  }
+                  if (matches) matched.push(parsed);
+                }
+
+                if (matched.length === 0) return false;
+
+                // Pick best matching row:
+                // 1. If verifying the row we just edited (preferTagged), pick the tagged row or exact videoId match.
+                // 2. Otherwise, if converting Draft/Private -> Unlisted, prefer a matching row that is still Draft/Private
+                //    (unless an exact videoId was requested).
+                let chosen = matched[0];
+                if (preferTagged) {
+                  chosen =
+                    matched.find((m) => m.isTagged) ||
+                    (t.videoId ? matched.find((m) => m.vid === t.videoId) : undefined) ||
+                    matched[0];
+                } else {
+                  chosen =
+                    (t.videoId
+                      ? matched.find((m) => m.vid === t.videoId && (m.isDraft || m.isPrivate))
+                      : undefined) ||
+                    matched.find((m) => m.isDraft || m.isPrivate) ||
+                    (t.videoId ? matched.find((m) => m.vid === t.videoId) : undefined) ||
+                    matched[0];
+                }
+
+                rows.forEach((r) => r.removeAttribute('data-cmt-target-unlisted-row'));
+                chosen.row.setAttribute('data-cmt-target-unlisted-row', 'true');
+                chosen.row.scrollIntoView({ block: 'center', behavior: 'instant' as ScrollBehavior });
+                return true;
+              },
+              { t: target, preferTagged: preferTaggedRow }
+            )
+            .catch(() => false);
+
+        let foundRow = await findAndScrollRow();
+        if (!foundRow) {
+          // Scroll table from top to bottom in steps in case the row is below the fold
+          await scrollTableBy(-2000);
+          for (let sStep = 0; sStep < 5; sStep++) {
+            foundRow = await findAndScrollRow();
+            if (foundRow) break;
+            await scrollTableBy(520);
+          }
+        }
+
+        if (!foundRow) {
+          return {
+            found: false,
+            videoId: '',
+            title: '',
+            rawVisText: '',
+            isDraft: false,
+            isPrivate: false,
+            isUnlisted: false,
+            hasEditDraftBtn: false,
+            rowCenterX: 0,
+            rowCenterY: 0,
+            draftClickX: 0,
+            draftClickY: 0,
+          };
+        }
+
+        // Wait 350ms after scrollIntoView so layout & viewport coordinates settle before reading bounding rects!
+        await page.waitForTimeout(350).catch(() => {});
+
         return await page
           .evaluate(
             (t: { videoId?: string; title?: string; windowNumber?: number; scanPrefix?: string }) => {
@@ -2357,149 +2581,108 @@ export class YtStudioBrowserController {
                 return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden';
               };
 
-              const rows = Array.from(document.querySelectorAll('ytcp-video-row')) as HTMLElement[];
-              for (let idx = 0; idx < rows.length; idx++) {
-                const row = rows[idx];
-                const rowText = (row.innerText || row.textContent || '').replace(/\s+/g, ' ').trim();
-                const rowLower = rowText.toLowerCase();
-
-                const titleEl = row.querySelector(
-                  '#video-title, a#video-title, .video-title-wrapper'
-                ) as HTMLElement | null;
-                const rawTitle = (titleEl?.innerText || titleEl?.textContent || '')
-                  .replace(/\s+/g, ' ')
-                  .trim();
-
-                let vid = '';
-                const anchors = Array.from(row.querySelectorAll('a[href]')) as HTMLAnchorElement[];
-                for (const a of anchors) {
-                  const href = a.getAttribute('href') || a.href || '';
-                  const mEdit = href.match(/\/video\/([a-zA-Z0-9_-]{11})/);
-                  if (mEdit) {
-                    vid = mEdit[1];
-                    break;
-                  }
-                  const mShort =
-                    href.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/) ||
-                    href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
-                  if (mShort) {
-                    vid = mShort[1];
-                    break;
-                  }
-                }
-                if (!vid) {
-                  const imgs = Array.from(row.querySelectorAll('img[src]')) as HTMLImageElement[];
-                  for (const img of imgs) {
-                    const src = img.getAttribute('src') || img.src || '';
-                    const mThumb = src.match(/\/vi(?:_webp)?\/([a-zA-Z0-9_-]{11})\//);
-                    if (mThumb) {
-                      vid = mThumb[1];
-                      break;
-                    }
-                  }
-                }
-                if (!vid) {
-                  const html = row.outerHTML || '';
-                  const mHtml =
-                    html.match(/\/video\/([a-zA-Z0-9_-]{11})/) ||
-                    html.match(/\/vi(?:_webp)?\/([a-zA-Z0-9_-]{11})\//);
-                  if (mHtml) vid = mHtml[1];
-                }
-
-                let matches = false;
-                if (t.videoId && vid && vid === t.videoId) {
-                  matches = true;
-                } else if (t.title && rawTitle.toLowerCase() === t.title.toLowerCase()) {
-                  matches = true;
-                } else if (
-                  t.windowNumber !== undefined &&
-                  t.scanPrefix &&
-                  rawTitle.toLowerCase() === `${t.scanPrefix.toLowerCase()}-w${t.windowNumber}`
-                ) {
-                  matches = true;
-                } else if (
-                  t.windowNumber !== undefined &&
-                  new RegExp(`^cmt-[a-z0-9_-]+-w${t.windowNumber}\\b`, 'i').test(rawTitle) &&
-                  (!t.scanPrefix || rawTitle.toLowerCase().startsWith(`cmt-${t.scanPrefix.toLowerCase()}-`))
-                ) {
-                  matches = true;
-                } else if (
-                  t.windowNumber !== undefined &&
-                  !t.scanPrefix &&
-                  new RegExp(`-w${t.windowNumber}\\b`, 'i').test(rawTitle)
-                ) {
-                  matches = true;
-                }
-
-                if (!matches) continue;
-
-                const visCell = row.querySelector(
-                  'ytcp-video-list-cell-visibility, .cell-body.tablecell-visibility, .tablecell-visibility, #visibility-label'
-                ) as HTMLElement | null;
-                const visLabelEl = row.querySelector(
-                  '#visibility-label, ytcp-video-list-cell-visibility #visibility-label'
-                ) as HTMLElement | null;
-                const rawVisText = (
-                  visLabelEl?.innerText ||
-                  visCell?.innerText ||
-                  visLabelEl?.textContent ||
-                  visCell?.textContent ||
-                  ''
-                )
-                  .replace(/\s+/g, ' ')
-                  .trim();
-                const visLower = rawVisText.toLowerCase();
-
-                const hasEditDraftBtn = Array.from(
-                  row.querySelectorAll('ytcp-button, button, a, [role="button"]')
-                ).some((el) =>
-                  ((el as HTMLElement).innerText || el.textContent || '')
-                    .trim()
-                    .toLowerCase()
-                    .includes('edit draft')
-                );
-
-                const isDraft =
-                  hasEditDraftBtn || /\bdraft\b/i.test(visLower) || /\bedit\s+draft\b/i.test(rowLower);
-                const isPrivate = !isDraft && /\bprivate\b/i.test(visLower);
-                const isUnlisted = /\bunlisted\b/i.test(visLower) && !isDraft && !isPrivate;
-
-                rows.forEach((r) => r.removeAttribute('data-cmt-target-unlisted-row'));
-                row.setAttribute('data-cmt-target-unlisted-row', 'true');
-                row.scrollIntoView({ block: 'center' });
-
-                const rowRect = row.getBoundingClientRect();
-                const draftTarget = (visLabelEl && isVis(visLabelEl) ? visLabelEl : visCell) || row;
-                const draftRect = draftTarget.getBoundingClientRect();
-
+              const row = document.querySelector(
+                'ytcp-video-row[data-cmt-target-unlisted-row="true"]'
+              ) as HTMLElement | null;
+              if (!row) {
                 return {
-                  found: true,
-                  videoId: vid,
-                  title: rawTitle || t.title || '',
-                  rawVisText: rawVisText || (isDraft ? 'Draft' : isPrivate ? 'Private' : 'Unlisted'),
-                  isDraft,
-                  isPrivate,
-                  isUnlisted,
-                  hasEditDraftBtn,
-                  rowCenterX: Math.round(rowRect.left + Math.min(220, rowRect.width / 3)),
-                  rowCenterY: Math.round(rowRect.top + rowRect.height / 2),
-                  draftClickX: Math.round(draftRect.left + draftRect.width / 2),
-                  draftClickY: Math.round(draftRect.top + draftRect.height / 2),
+                  found: false,
+                  videoId: '',
+                  title: '',
+                  rawVisText: '',
+                  isDraft: false,
+                  isPrivate: false,
+                  isUnlisted: false,
+                  hasEditDraftBtn: false,
+                  rowCenterX: 0,
+                  rowCenterY: 0,
+                  draftClickX: 0,
+                  draftClickY: 0,
                 };
               }
+
+              const titleEl = row.querySelector(
+                '#video-title, a#video-title, .video-title-wrapper'
+              ) as HTMLElement | null;
+              const rawTitle = (titleEl?.innerText || titleEl?.textContent || '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+              let vid = '';
+              const anchors = Array.from(row.querySelectorAll('a[href]')) as HTMLAnchorElement[];
+              for (const a of anchors) {
+                const href = a.getAttribute('href') || a.href || '';
+                const mEdit = href.match(/\/video\/([a-zA-Z0-9_-]{11})/);
+                if (mEdit) {
+                  vid = mEdit[1];
+                  break;
+                }
+                const mShort =
+                  href.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/) ||
+                  href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+                if (mShort) {
+                  vid = mShort[1];
+                  break;
+                }
+              }
+              if (!vid) {
+                const html = row.outerHTML || '';
+                const mHtml =
+                  html.match(/\/video\/([a-zA-Z0-9_-]{11})/) ||
+                  html.match(/\/vi(?:_webp)?\/([a-zA-Z0-9_-]{11})\//);
+                if (mHtml) vid = mHtml[1];
+              }
+
+              const visCell = row.querySelector(
+                'ytcp-video-list-cell-visibility, .cell-body.tablecell-visibility, .tablecell-visibility, #visibility-label'
+              ) as HTMLElement | null;
+              const visLabelEl = row.querySelector(
+                '#visibility-label, ytcp-video-list-cell-visibility #visibility-label'
+              ) as HTMLElement | null;
+              const rawVisText = (
+                visLabelEl?.innerText ||
+                visCell?.innerText ||
+                visLabelEl?.textContent ||
+                visCell?.textContent ||
+                ''
+              )
+                .replace(/\s+/g, ' ')
+                .trim();
+              const visLower = rawVisText.toLowerCase();
+
+              const hasEditDraftBtn = Array.from(
+                row.querySelectorAll('ytcp-button, button, a, [role="button"]')
+              ).some((el) => {
+                if (!isVis(el)) return false;
+                return ((el as HTMLElement).innerText || el.textContent || '')
+                  .trim()
+                  .toLowerCase()
+                  .includes('edit draft');
+              });
+
+              const isExplicitUnlisted = /\bunlisted\b/i.test(visLower);
+              const isDraft =
+                !isExplicitUnlisted && (hasEditDraftBtn || /\bdraft\b/i.test(visLower));
+              const isPrivate = !isDraft && !isExplicitUnlisted && /\bprivate\b/i.test(visLower);
+              const isUnlisted = isExplicitUnlisted && !isDraft && !isPrivate;
+
+              const rowRect = row.getBoundingClientRect();
+              const draftTarget = (visLabelEl && isVis(visLabelEl) ? visLabelEl : visCell) || row;
+              const draftRect = draftTarget.getBoundingClientRect();
+
               return {
-                found: false,
-                videoId: '',
-                title: '',
-                rawVisText: '',
-                isDraft: false,
-                isPrivate: false,
-                isUnlisted: false,
-                hasEditDraftBtn: false,
-                rowCenterX: 0,
-                rowCenterY: 0,
-                draftClickX: 0,
-                draftClickY: 0,
+                found: true,
+                videoId: vid,
+                title: rawTitle || t.title || '',
+                rawVisText: rawVisText || (isDraft ? 'Draft' : isPrivate ? 'Private' : 'Unlisted'),
+                isDraft,
+                isPrivate,
+                isUnlisted,
+                hasEditDraftBtn,
+                rowCenterX: Math.round(rowRect.left + Math.min(220, rowRect.width / 3)),
+                rowCenterY: Math.round(rowRect.top + rowRect.height / 2),
+                draftClickX: Math.round(draftRect.left + draftRect.width / 2),
+                draftClickY: Math.round(draftRect.top + draftRect.height / 2),
               };
             },
             target
@@ -2520,7 +2703,7 @@ export class YtStudioBrowserController {
           }));
       };
 
-      const initialCheck = await inspectTargetRowOnTable();
+      const initialCheck = await inspectTargetRowOnTable(false);
       if (!initialCheck.found) {
         this.log(
           'draft->unlisted',
@@ -2542,7 +2725,7 @@ export class YtStudioBrowserController {
       // Retry up to 3 times until "Draft" is confirmed changed to "Unlisted" on the Channel Content row
       for (let attempt = 1; attempt <= 3; attempt++) {
         await this.dismissAllUploadDialogs(page).catch(() => {});
-        const rowInfo = attempt === 1 ? initialCheck : await inspectTargetRowOnTable();
+        const rowInfo = attempt === 1 ? initialCheck : await inspectTargetRowOnTable(true);
         if (!rowInfo.found) break;
 
         if (rowInfo.isUnlisted) {
@@ -2560,7 +2743,19 @@ export class YtStudioBrowserController {
           'info'
         );
 
-        // Step 1: Click on "Draft" in the row's Visibility column and hover the row so the Pencil icon appears
+        // Step 1: Click on "Draft" in the row's Visibility column (both DOM click and mouse coordinates) and hover the row so the Pencil icon appears
+        await page
+          .evaluate(() => {
+            const row = document.querySelector(
+              'ytcp-video-row[data-cmt-target-unlisted-row="true"]'
+            ) as HTMLElement | null;
+            if (!row) return;
+            const visEl = row.querySelector(
+              '#visibility-label, ytcp-video-list-cell-visibility, .tablecell-visibility'
+            ) as HTMLElement | null;
+            if (visEl) visEl.click();
+          })
+          .catch(() => {});
         if (rowInfo.draftClickX > 0 && rowInfo.draftClickY > 0) {
           await page.mouse.move(rowInfo.draftClickX, rowInfo.draftClickY).catch(() => {});
           await page.mouse.click(rowInfo.draftClickX, rowInfo.draftClickY).catch(() => {});
@@ -2897,13 +3092,13 @@ export class YtStudioBrowserController {
 
         // Step 7: Confirm on the Channel Content table that "Draft" has changed to "Unlisted"!
         // ("or fir draft confirm kro draft ki jagah unlisted aya he ya nhi nhi to fir se kro")
-        let verifyRow = await inspectTargetRowOnTable();
+        let verifyRow = await inspectTargetRowOnTable(true);
         if (verifyRow.found && !verifyRow.isUnlisted && attempt >= 2) {
           // Reload Content table once to be 100% sure DOM isn't showing stale Draft badge
           await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
           await page.waitForSelector('ytcp-video-row', { timeout: 12000 }).catch(() => {});
           await page.waitForTimeout(1500).catch(() => {});
-          verifyRow = await inspectTargetRowOnTable();
+          verifyRow = await inspectTargetRowOnTable(false);
         }
 
         if (verifyRow.found && verifyRow.isUnlisted) {
@@ -3137,9 +3332,16 @@ export class YtStudioBrowserController {
     const startTime = Date.now();
     let refreshCycle = 0;
 
-    const readRowsFromDom = async (): Promise<YtContentVideoItem[]> => {
+    const readRowsInCurrentViewport = async (): Promise<YtContentVideoItem[]> => {
       return page
         .evaluate(() => {
+          const isVis = (el: Element | null): el is HTMLElement => {
+            if (!el || !(el instanceof HTMLElement)) return false;
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width > 4 && r.height > 4 && s.display !== 'none' && s.visibility !== 'hidden';
+          };
+
           const rows = Array.from(document.querySelectorAll('ytcp-video-row'));
           const extracted: Array<{
             title: string;
@@ -3246,14 +3448,28 @@ export class YtStudioBrowserController {
                   ? 'Checking...'
                   : 'None');
 
+            // Strictly check if an "Edit draft" button is actually visible on this row!
+            // Never test `rowText` for "edit draft" because Polymer keeps hidden "Edit draft" template text inside Unlisted rows!
+            const hasVisibleEditDraftBtn = Array.from(
+              row.querySelectorAll('ytcp-button, button, a, [role="button"]')
+            ).some((el) => {
+              if (!isVis(el)) return false;
+              return ((el as HTMLElement).innerText || el.textContent || '')
+                .trim()
+                .toLowerCase()
+                .includes('edit draft');
+            });
+
             // User rules:
             // 1. Unlisted video works even when Blocked -> "Unlisted (Blocked)" is ready!
             // 2. Draft video works ONLY while not blocked; if Draft is Blocked ("Draft (Blocked)") or if video is Private ("Private"),
             //    AI Studio shows "This video is private" unless we convert it to Unlisted!
             const isBlocked = /\bblocked\b/i.test(`${rawVisText} ${restrictions} ${rowText}`);
             const isChecking = /\bchecking\b/i.test(`${restrictions} ${rawVisText} ${dateText} ${rowText}`);
-            const isDraft = /\b(draft|edit\s+draft)\b/i.test(`${rawVisText} ${rowText}`);
-            const isPrivate = !isDraft && /\bprivate\b/i.test(rawVisText);
+            const isExplicitUnlisted = /\bunlisted\b/i.test(rawVisText);
+            const isDraft =
+              !isExplicitUnlisted && (/\bdraft\b/i.test(rawVisText) || hasVisibleEditDraftBtn);
+            const isPrivate = !isDraft && !isExplicitUnlisted && /\bprivate\b/i.test(rawVisText);
             const hasExplicitReadyVisibility = /\b(unlisted|private|public|draft)\b/i.test(rawVisText);
 
             // A video is ONLY still uploading/processing SD if it is actively uploading bytes ("Uploading X%")
@@ -3281,7 +3497,7 @@ export class YtStudioBrowserController {
                   : 'Private'
                 : isBlocked
                   ? 'Unlisted (Blocked)'
-                  : /unlisted/i.test(rawVisText) || /unlisted/i.test(rowText)
+                  : isExplicitUnlisted || /unlisted/i.test(rowText)
                     ? isChecking
                       ? 'Unlisted (Checking)'
                       : 'Unlisted'
@@ -3317,6 +3533,68 @@ export class YtStudioBrowserController {
         .catch(() => []);
     };
 
+    const readRowsFromDom = async (): Promise<YtContentVideoItem[]> => {
+      const mergedByKey = new Map<string, YtContentVideoItem>();
+      const addItems = (items: YtContentVideoItem[]) => {
+        for (const it of items) {
+          const key = it.videoId
+            ? `vid:${it.videoId}`
+            : `title:${it.title}:${it.visibility}`;
+          const prev = mergedByKey.get(key);
+          if (!prev || (!prev.videoId && it.videoId) || (!prev.isReady && it.isReady)) {
+            mergedByKey.set(key, it);
+          }
+        }
+      };
+
+      const firstPass = await readRowsInCurrentViewport();
+      addItems(firstPass);
+
+      // If table is scrollable or has below-the-fold rows, scroll down and back up to capture all rows
+      const canScrollMore = await page
+        .evaluate(() => {
+          const scrollers = [
+            document.querySelector('ytcp-video-section-content'),
+            document.querySelector('#video-list'),
+            document.querySelector('ytcp-table-body'),
+            document.scrollingElement,
+            document.documentElement,
+          ].filter(Boolean) as HTMLElement[];
+          let scrolled = false;
+          for (const s of scrollers) {
+            if (s.scrollHeight > s.clientHeight + 60) {
+              s.scrollTop = s.scrollHeight;
+              scrolled = true;
+            }
+          }
+          return scrolled;
+        })
+        .catch(() => false);
+
+      if (canScrollMore) {
+        await page.waitForTimeout(350).catch(() => {});
+        const bottomPass = await readRowsInCurrentViewport();
+        addItems(bottomPass);
+        await page
+          .evaluate(() => {
+            const scrollers = [
+              document.querySelector('ytcp-video-section-content'),
+              document.querySelector('#video-list'),
+              document.querySelector('ytcp-table-body'),
+              document.scrollingElement,
+              document.documentElement,
+            ].filter(Boolean) as HTMLElement[];
+            for (const s of scrollers) {
+              s.scrollTop = 0;
+            }
+          })
+          .catch(() => {});
+        await page.waitForTimeout(200).catch(() => {});
+      }
+
+      return Array.from(mergedByKey.values());
+    };
+
     const matchesExpectedWindow = (
       exp: { windowNumber: number; clipPath?: string; title?: string; videoId?: string },
       item: YtContentVideoItem
@@ -3340,8 +3618,49 @@ export class YtStudioBrowserController {
       return false;
     };
 
-    const syncSidecarsForItems = (items: YtContentVideoItem[]) => {
-      for (const item of items) {
+    const scoreContentItem = (it: YtContentVideoItem): number => {
+      let score = 0;
+      if (it.videoId && it.ytUrl) score += 10;
+      if (/^unlisted/i.test(it.visibility)) score += 40;
+      if (it.isReady) score += 25;
+      if (!/\b(draft|private)\b/i.test(it.visibility)) score += 15;
+      return score;
+    };
+
+    // Deduplicate scan items by windowNumber so duplicate uploads (e.g. 1 Unlisted + 1 old Draft for w8)
+    // always resolve to the single best video per window!
+    const getDeduplicatedRelevantItems = (allItems: YtContentVideoItem[]): YtContentVideoItem[] => {
+      const rawRelevant =
+        expectedWindows.length > 0
+          ? allItems.filter((it) => expectedWindows.some((exp) => matchesExpectedWindow(exp, it)))
+          : scanPrefix
+            ? allItems.filter(
+                (it) => !it.scanPrefix || it.scanPrefix.toLowerCase() === scanPrefix.toLowerCase()
+              )
+            : allItems;
+
+      const byWin = new Map<number, YtContentVideoItem>();
+      const withoutWin: YtContentVideoItem[] = [];
+      for (const it of rawRelevant) {
+        if (it.windowNumber === null || it.windowNumber === undefined) {
+          withoutWin.push(it);
+          continue;
+        }
+        const prev = byWin.get(it.windowNumber);
+        if (!prev || scoreContentItem(it) > scoreContentItem(prev)) {
+          byWin.set(it.windowNumber, it);
+        }
+      }
+      const deduped = [
+        ...Array.from(byWin.values()).sort((a, b) => (a.windowNumber || 0) - (b.windowNumber || 0)),
+        ...withoutWin,
+      ];
+      return deduped;
+    };
+
+    const syncSidecarsForItems = (allItems: YtContentVideoItem[]) => {
+      const bestItems = getDeduplicatedRelevantItems(allItems);
+      for (const item of bestItems) {
         if (!item.videoId || !item.ytUrl) continue;
         // 1. Check explicit expectedWindows list (strictly filtered by matchesExpectedWindow so cross-scan items never pollute)
         for (const exp of expectedWindows) {
@@ -3396,55 +3715,8 @@ export class YtStudioBrowserController {
       }
     };
 
-    while (true) {
-      let allItems = await readRowsFromDom();
-      if (allItems.length === 0 && refreshCycle === 0 && page.url().includes('/videos')) {
-        await page.waitForTimeout(3000);
-        allItems = await readRowsFromDom();
-      }
-
-      // Auto-convert any Draft (especially Draft Blocked / Draft) or Private rows belonging to this scan into Unlisted!
-      const draftOrPrivateRows = allItems.filter((it) => {
-        const belongsToScan =
-          expectedWindows.length > 0
-            ? expectedWindows.some((exp) => matchesExpectedWindow(exp, it))
-            : scanPrefix
-              ? !it.scanPrefix || it.scanPrefix.toLowerCase() === scanPrefix.toLowerCase()
-              : true;
-        if (!belongsToScan) return false;
-        return /\b(draft|private)\b/i.test(it.visibility);
-      });
-
-      if (draftOrPrivateRows.length > 0 && !this.stopRequested) {
-        for (const dpItem of draftOrPrivateRows) {
-          if (this.stopRequested) break;
-          this.log(
-            'auto-unlist draft/private',
-            `Converting "${dpItem.title}" (${dpItem.visibility}) -> Unlisted on Channel Content...`,
-            'warn'
-          );
-          await this.convertVideoRowToUnlistedOnContentPage(page, {
-            videoId: dpItem.videoId,
-            title: dpItem.title,
-            windowNumber: dpItem.windowNumber ?? undefined,
-            scanPrefix: dpItem.scanPrefix || scanPrefix || undefined,
-          }).catch(() => {});
-        }
-        allItems = await readRowsFromDom();
-      }
-
-      syncSidecarsForItems(allItems);
-
-      // Filter relevant items strictly for this scan (never count another scan's cmt-<other>-w<N> videos!)
-      const relevantItems =
-        expectedWindows.length > 0
-          ? allItems.filter((it) => expectedWindows.some((exp) => matchesExpectedWindow(exp, it)))
-          : scanPrefix
-            ? allItems.filter(
-                (it) => !it.scanPrefix || it.scanPrefix.toLowerCase() === scanPrefix.toLowerCase()
-              )
-            : allItems;
-
+    const buildProgressSummary = (allItems: YtContentVideoItem[]): YtContentProgressSummary => {
+      const relevantItems = getDeduplicatedRelevantItems(allItems);
       const expectedCount =
         expectedWindows.length > 0 ? expectedWindows.length : relevantItems.length;
       const uploadedCount = relevantItems.length;
@@ -3456,7 +3728,7 @@ export class YtStudioBrowserController {
           ? uploadedCount >= expectedCount && readyCount >= expectedCount && processingCount === 0
           : uploadedCount > 0 && processingCount === 0;
 
-      const summary: YtContentProgressSummary = {
+      return {
         checkedAt: Date.now(),
         totalInContent: allItems.length,
         expectedCount,
@@ -3467,6 +3739,89 @@ export class YtStudioBrowserController {
         allReady,
         items: relevantItems,
       };
+    };
+
+    while (true) {
+      let allItems = await readRowsFromDom();
+      if (allItems.length === 0 && refreshCycle === 0 && page.url().includes('/videos')) {
+        await page.waitForTimeout(3000);
+        allItems = await readRowsFromDom();
+      }
+
+      // Immediately sync sidecars and notify onProgress for any videos that are ALREADY Unlisted/Ready
+      // BEFORE starting Draft->Unlisted conversions, so AI Studio workers start immediately on ready videos!
+      syncSidecarsForItems(allItems);
+      const preConvertSummary = buildProgressSummary(allItems);
+      this.contentProgress = preConvertSummary;
+      onProgress?.(preConvertSummary);
+
+      // Auto-convert any Draft (especially Draft Blocked / Draft) or Private rows belonging to this scan into Unlisted!
+      // Skip converting a duplicate Draft row if that windowNumber ALREADY has a confirmed Unlisted row with a valid videoId!
+      const draftOrPrivateRows = allItems.filter((it) => {
+        const belongsToScan =
+          expectedWindows.length > 0
+            ? expectedWindows.some((exp) => matchesExpectedWindow(exp, it))
+            : scanPrefix
+              ? !it.scanPrefix || it.scanPrefix.toLowerCase() === scanPrefix.toLowerCase()
+              : true;
+        if (!belongsToScan) return false;
+        if (!/\b(draft|private)\b/i.test(it.visibility)) return false;
+
+        if (it.windowNumber !== null) {
+          const alreadyHasUnlistedForWindow = allItems.some(
+            (other) =>
+              other !== it &&
+              other.windowNumber === it.windowNumber &&
+              (!scanPrefix ||
+                !other.scanPrefix ||
+                other.scanPrefix.toLowerCase() === scanPrefix.toLowerCase()) &&
+              Boolean(other.videoId) &&
+              /^unlisted/i.test(other.visibility) &&
+              other.isReady
+          );
+          if (alreadyHasUnlistedForWindow) return false;
+        }
+        return true;
+      });
+
+      if (draftOrPrivateRows.length > 0 && !this.stopRequested) {
+        for (const dpItem of draftOrPrivateRows) {
+          if (this.stopRequested) break;
+          this.log(
+            'auto-unlist draft/private',
+            `Converting "${dpItem.title}" (${dpItem.visibility}) -> Unlisted on Channel Content...`,
+            'warn'
+          );
+          const converted = await this.convertVideoRowToUnlistedOnContentPage(page, {
+            videoId: dpItem.videoId,
+            title: dpItem.title,
+            windowNumber: dpItem.windowNumber ?? undefined,
+            scanPrefix: dpItem.scanPrefix || scanPrefix || undefined,
+          }).catch(() => false);
+
+          // Immediately after each single video converts from Draft -> Unlisted, re-read DOM, sync sidecar,
+          // and fire onProgress so an AI Studio worker immediately starts scanning this newly-Unlisted window!
+          if (converted && !this.stopRequested) {
+            allItems = await readRowsFromDom();
+            syncSidecarsForItems(allItems);
+            const midSummary = buildProgressSummary(allItems);
+            this.contentProgress = midSummary;
+            onProgress?.(midSummary);
+          }
+        }
+        allItems = await readRowsFromDom();
+      }
+
+      syncSidecarsForItems(allItems);
+      const summary = buildProgressSummary(allItems);
+      const {
+        expectedCount,
+        uploadedCount,
+        readyCount,
+        processingCount,
+        claimedCount,
+        allReady,
+      } = summary;
 
       this.contentProgress = summary;
       onProgress?.(summary);

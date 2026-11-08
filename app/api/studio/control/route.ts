@@ -12,7 +12,7 @@ import {
   resolveScanMovieDurationSec,
 } from '@/lib/studio-parallel-manager'
 import { prepareStudioMovie360pAndDrive, ensureStudioShortReady } from '@/lib/media'
-import { getScan, saveScan } from '@/lib/store'
+import { getScan, listScans, saveScan } from '@/lib/store'
 import { MEDIA_DIR } from '@/lib/paths'
 import {
   clearUserYtCookies,
@@ -913,12 +913,34 @@ export async function POST(req: NextRequest) {
         })
       }
       case 'yt_check_content': {
-        const targetScanId = (body.scanId || '').trim() || undefined
+        let targetScanId = (body.scanId || '').trim() || undefined
         const contentSummary = await globalYtStudioController.checkAndVerifyContentPage({
           scanId: targetScanId,
           waitForSdReady: Boolean(body.waitForSdReady),
           maxWaitMs: 45_000,
           username,
+          onProgress: (prog) => {
+            let resolvedScanId = targetScanId
+            if (!resolvedScanId || resolvedScanId === 'default') {
+              const firstPrefix = prog.items.find((it) => it.scanPrefix)?.scanPrefix
+              if (firstPrefix) {
+                const matchedScan = listScans().find((s) =>
+                  s.id.toLowerCase().startsWith(firstPrefix.toLowerCase()),
+                )
+                if (matchedScan) {
+                  resolvedScanId = matchedScan.id
+                  targetScanId = matchedScan.id
+                }
+              }
+            }
+            if (resolvedScanId && resolvedScanId !== 'default') {
+              getStudioParallelManager(resolvedScanId).syncFromYtContentProgress(
+                prog,
+                true,
+                username,
+              )
+            }
+          },
         })
         const firstLink = contentSummary.items[0]?.ytUrl || null
         const parallelSnapshot =
