@@ -113,7 +113,13 @@ export function YtStudioPanel({ studio, scanId, scan, onRefresh }: YtStudioPanel
       try {
         const parsed = JSON.parse(ev.data)
         if (parsed?.ytSnapshot) {
-          setSnap(parsed.ytSnapshot)
+          setSnap((prev) => {
+            const next = parsed.ytSnapshot as YtControllerSnapshot
+            if (!next.screenshotBase64 && prev?.screenshotBase64 && next.status !== 'idle') {
+              return { ...next, screenshotBase64: prev.screenshotBase64 }
+            }
+            return next
+          })
           if (parsed.ytSnapshot.currentUrl) {
             setNavUrl(parsed.ytSnapshot.currentUrl)
           }
@@ -150,7 +156,19 @@ export function YtStudioPanel({ studio, scanId, scan, onRefresh }: YtStudioPanel
         return null
       }
       if (data.ytSnapshot) {
-        setSnap(data.ytSnapshot)
+        setSnap((prev) => {
+          const next = data.ytSnapshot as YtControllerSnapshot
+          if (
+            !next.screenshotBase64 &&
+            prev?.screenshotBase64 &&
+            next.status !== 'idle' &&
+            payload.action !== 'yt_stop' &&
+            payload.action !== 'yt_clear_cookies'
+          ) {
+            return { ...next, screenshotBase64: prev.screenshotBase64 }
+          }
+          return next
+        })
       }
       if (data.parallelSnapshot) {
         setParallelSnap(data.parallelSnapshot)
@@ -815,6 +833,18 @@ export function YtStudioPanel({ studio, scanId, scan, onRefresh }: YtStudioPanel
               alt="YouTube Studio Live Browser"
               className="w-full h-full object-fill select-none"
             />
+          ) : snap?.status && snap.status !== 'idle' ? (
+            <div className="text-center space-y-1.5 p-6">
+              <Loader2 className="size-6 animate-spin text-rose-400 mx-auto" />
+              <p className="text-xs text-zinc-300 font-medium">
+                YouTube Studio browser is active ({snap.status})...
+              </p>
+              {snap.currentStep ? (
+                <p className="text-[11px] text-zinc-500 max-w-md mx-auto truncate">
+                  {snap.currentStep}
+                </p>
+              ) : null}
+            </div>
           ) : (
             <div className="text-center space-y-1 p-6">
               {busyAction ? (

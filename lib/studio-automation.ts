@@ -166,6 +166,8 @@ export function inspectChromeProcesses(): ChromeProcessInspection {
           // Match google-chrome / chromium processes (exclude pgrep/pkill/node)
           if (!/google-chrome|chromium|chrome-linux|chrome\b/i.test(cmd)) continue
           if (/^\s*(node|sh\s+-c|pkill|pgrep)\b/i.test(cmd)) continue
+          // Never include YouTube Studio browser processes in AI Studio worker inspection/cleanup
+          if (/yt-studio-chrome-profile/i.test(cmd)) continue
 
           totalCount += 1
           allChromePids.push(pid)
@@ -180,13 +182,13 @@ export function inspectChromeProcesses(): ChromeProcessInspection {
           }
           const rssMb = rssKb / 1024
 
-          const profMatch = cmd.match(/studio-chrome-profile(?:-w(\d+))?/i)
+          const profMatch = cmd.match(/(?:^|[\/=])(studio-chrome-profile(?:-w(\d+))?)(?:$|\s|\/)/i)
           if (profMatch) {
-            const profName = profMatch[0]
+            const profName = profMatch[1]
             if (!pidsByProfileDir[profName]) pidsByProfileDir[profName] = []
             pidsByProfileDir[profName].push(pid)
-            const workerKey = profMatch[1]
-              ? `W${String(Number(profMatch[1])).padStart(2, '0')}`
+            const workerKey = profMatch[2]
+              ? `W${String(Number(profMatch[2])).padStart(2, '0')}`
               : 'MAIN'
             perWorkerCount[workerKey] = (perWorkerCount[workerKey] || 0) + 1
             perWorkerRssMb[workerKey] = Math.round(((perWorkerRssMb[workerKey] || 0) + rssMb) * 10) / 10
@@ -222,17 +224,18 @@ export function inspectChromeProcesses(): ChromeProcessInspection {
       if (pid === process.pid) continue
       if (!/google-chrome|chromium|chrome-linux|chrome\b/i.test(cmd)) continue
       if (/^\s*(node|sh\s+-c|pkill|pgrep|ps)\b/i.test(cmd)) continue
+      if (/yt-studio-chrome-profile/i.test(cmd)) continue
 
       totalCount += 1
       allChromePids.push(pid)
       const rssMb = rssKb / 1024
-      const profMatch = cmd.match(/studio-chrome-profile(?:-w(\d+))?/i)
+      const profMatch = cmd.match(/(?:^|[\/=])(studio-chrome-profile(?:-w(\d+))?)(?:$|\s|\/)/i)
       if (profMatch) {
-        const profName = profMatch[0]
+        const profName = profMatch[1]
         if (!pidsByProfileDir[profName]) pidsByProfileDir[profName] = []
         pidsByProfileDir[profName].push(pid)
-        const workerKey = profMatch[1]
-          ? `W${String(Number(profMatch[1])).padStart(2, '0')}`
+        const workerKey = profMatch[2]
+          ? `W${String(Number(profMatch[2])).padStart(2, '0')}`
           : 'MAIN'
         perWorkerCount[workerKey] = (perWorkerCount[workerKey] || 0) + 1
         perWorkerRssMb[workerKey] = Math.round(((perWorkerRssMb[workerKey] || 0) + rssMb) * 10) / 10
@@ -257,7 +260,7 @@ export function getWorkerChromeStats(profileDirName: string): {
   pids: number[]
 } {
   const snap = inspectChromeProcesses()
-  const profMatch = profileDirName.match(/studio-chrome-profile(?:-w(\d+))?/i)
+  const profMatch = profileDirName.match(/^studio-chrome-profile(?:-w(\d+))?$/i)
   const workerKey = profMatch
     ? profMatch[1]
       ? `W${String(Number(profMatch[1])).padStart(2, '0')}`
@@ -277,6 +280,10 @@ export function getWorkerChromeStats(profileDirName: string): {
 export async function killWorkerChromeProcessesByProfileDir(
   profileDirName: string,
 ): Promise<{ sigtermCount: number; sigkillCount: number }> {
+  // Never allow AI Studio worker cleanup to touch YouTube Studio's persistent profile
+  if (/yt-studio-chrome-profile/i.test(profileDirName)) {
+    return { sigtermCount: 0, sigkillCount: 0 }
+  }
   const profileDir = path.join(DATA_DIR, profileDirName)
   const getMatchingPids = (): number[] => {
     const snap = inspectChromeProcesses()
@@ -293,11 +300,6 @@ export async function killWorkerChromeProcessesByProfileDir(
       } catch {
         /* already exited */
       }
-    }
-    try {
-      execFileSync('pkill', ['-TERM', '-f', profileDirName], { stdio: 'ignore' })
-    } catch {
-      /* ignore */
     }
 
     const waitDeadline = Date.now() + 3000
@@ -318,11 +320,6 @@ export async function killWorkerChromeProcessesByProfileDir(
         /* already exited */
       }
     }
-    try {
-      execFileSync('pkill', ['-KILL', '-f', profileDirName], { stdio: 'ignore' })
-    } catch {
-      /* ignore */
-    }
     await new Promise((r) => setTimeout(r, 200))
   }
 
@@ -342,11 +339,20 @@ const globalForStartupChromeCleanup = globalThis as unknown as {
 }
 
 /**
- * Requirement 1: On app start, kill all leftover google-chrome / chromium processes once.
+ * Requirement 1: On app start, kill all leftover AI Studio google-chrome / chromium processes once.
+ * Never kills yt-studio-chrome-profile or re-runs across Next.js route bundle evaluations in the same process.
  */
 export function killAllLeftoverChromeProcessesOnceOnStartup(): void {
   if (globalForStartupChromeCleanup.__cmtStartupChromeCleanedUp) return
   globalForStartupChromeCleanup.__cmtStartupChromeCleanedUp = true
+
+  const pidMarkerFile = `/tmp/.cmt-chrome-startup-cleaned-${process.pid}`
+  try {
+    if (fs.existsSync(pidMarkerFile)) return
+    fs.writeFileSync(pidMarkerFile, String(Date.now()), 'utf8')
+  } catch {
+    /* ignore marker error */
+  }
 
   try {
     const snap = inspectChromeProcesses()
@@ -358,12 +364,7 @@ export function killAllLeftoverChromeProcessesOnceOnStartup(): void {
           /* ignore */
         }
       }
-      try {
-        execFileSync('pkill', ['-TERM', '-f', 'google-chrome|chromium'], { stdio: 'ignore' })
-      } catch {
-        /* ignore */
-      }
-      // Brief synchronous wait up to 1.5s then SIGKILL any remaining orphan processes
+      // Brief synchronous wait up to 1.5s then SIGKILL any remaining orphan AI Studio processes
       const deadline = Date.now() + 1500
       while (Date.now() < deadline) {
         const check = inspectChromeProcesses()
@@ -382,14 +383,9 @@ export function killAllLeftoverChromeProcessesOnceOnStartup(): void {
           /* ignore */
         }
       }
-      try {
-        execFileSync('pkill', ['-KILL', '-f', 'google-chrome|chromium'], { stdio: 'ignore' })
-      } catch {
-        /* ignore */
-      }
     }
 
-    // Clean stale SingletonLocks across all studio-chrome-profile* dirs
+    // Clean stale SingletonLocks across all studio-chrome-profile* dirs (excluding yt-studio-chrome-profile)
     if (fs.existsSync(DATA_DIR)) {
       for (const entry of fs.readdirSync(DATA_DIR)) {
         if (entry.startsWith('studio-chrome-profile')) {

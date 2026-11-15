@@ -195,6 +195,9 @@ export class YtStudioBrowserController {
   private uploadedVideoIdsInSession: Set<string> = new Set();
   private unlistedFixQueue: Promise<void> = Promise.resolve();
   private unlistedFixQueuePending = 0;
+  private lastScreenshotBase64: string | null = null;
+  private lastScreenshotAt = 0;
+  private screenshotInFlight: Promise<void> | null = null;
 
   private ensureInternalCollections(): void {
     if (!this.inFlightClipUploads) {
@@ -217,6 +220,39 @@ export class YtStudioBrowserController {
     }
     if (typeof this.unlistedFixQueuePending !== 'number') {
       this.unlistedFixQueuePending = 0;
+    }
+    if (this.lastScreenshotBase64 === undefined) {
+      this.lastScreenshotBase64 = null;
+    }
+    if (typeof this.lastScreenshotAt !== 'number') {
+      this.lastScreenshotAt = 0;
+    }
+    if (this.screenshotInFlight === undefined) {
+      this.screenshotInFlight = null;
+    }
+  }
+
+  private getPersistedLiveStatePath(): string {
+    return path.join(DATA_DIR, 'yt-studio-live-state.json');
+  }
+
+  private persistLiveStateToDisk(): void {
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      const payload = {
+        updatedAt: Date.now(),
+        status: this.status,
+        assistMode: this.assistMode,
+        currentStep: this.currentStep,
+        currentUrl: this.page && !this.page.isClosed() ? this.page.url() : '',
+        channelId: this.channelId,
+        channelHandle: this.channelHandle,
+        lastError: this.lastError,
+        screenshotBase64: this.lastScreenshotBase64,
+      };
+      fs.writeFileSync(this.getPersistedLiveStatePath(), JSON.stringify(payload), 'utf8');
+    } catch {
+      // ignore disk write errors
     }
   }
 
@@ -371,6 +407,16 @@ export class YtStudioBrowserController {
     if (this.boundContext === context) return;
     this.boundContext = context;
 
+    context.on('close', () => {
+      if (this.context === context) {
+        this.context = null;
+        this.page = null;
+        if (this.status !== 'idle') {
+          this.status = 'idle';
+        }
+      }
+    });
+
     const attachPageCloseListener = (p: Page) => {
       p.on('close', () => {
         if (!this.context) return;
@@ -414,35 +460,53 @@ export class YtStudioBrowserController {
 
   private syncActivePopupPageIfNeeded(): void {
     if (!this.context) return;
-    this.bindContextPopupListeners(this.context);
-    const openPages = this.context.pages().filter((p) => !p.isClosed());
-    if (openPages.length === 0) return;
+    try {
+      this.bindContextPopupListeners(this.context);
+      const openPages = this.context.pages().filter((p) => !p.isClosed());
+      if (openPages.length === 0) return;
 
-    // If current page was closed or not in openPages, pick the latest open page
-    if (!this.page || this.page.isClosed() || !openPages.includes(this.page)) {
-      this.page = openPages[openPages.length - 1];
-      return;
-    }
-
-    // If a Google verification / sign-in popup opened as a second tab and we haven't manually switched away,
-    // automatically focus the latest popup tab so the user sees "Verify it's you" / Google login immediately!
-    if (!this.manualTabSelection && openPages.length > 1) {
-      const latestPage = openPages[openPages.length - 1];
-      if (latestPage !== this.page) {
-        this.page = latestPage;
-        this.log(
-          'popup active',
-          `Focused popup window (${ openPages.length } tabs open): ${latestPage.url() || 'loading...'}`,
-          'ok'
-        );
+      // If current page was closed or not in openPages, pick the latest open page
+      if (!this.page || this.page.isClosed() || !openPages.includes(this.page)) {
+        this.page = openPages[openPages.length - 1];
+        return;
       }
+
+      // If a Google verification / sign-in popup opened as a second tab and we haven't manually switched away,
+      // automatically focus the latest popup tab so the user sees "Verify it's you" / Google login immediately!
+      if (!this.manualTabSelection && openPages.length > 1) {
+        const latestPage = openPages[openPages.length - 1];
+        const latestUrl = latestPage.url() || '';
+        const isAuthOrVerifyPopup =
+          this.assistMode ||
+          /accounts\.google\.com|youtube\.com\/signin|challenge|CheckCookie/i.test(latestUrl);
+        if (latestPage !== this.page && isAuthOrVerifyPopup) {
+          this.page = latestPage;
+          this.log(
+            'popup active',
+            `Focused popup window (${openPages.length} tabs open): ${latestUrl || 'loading...'}`,
+            'ok'
+          );
+        }
+      }
+    } catch {
+      // Context may have disconnected
     }
   }
 
   async ensurePage(username = 'admin'): Promise<Page> {
     if (this.context && this.page && !this.page.isClosed()) {
-      this.syncActivePopupPageIfNeeded();
-      return this.page;
+      try {
+        const openPages = this.context.pages().filter((p) => !p.isClosed());
+        if (openPages.length > 0) {
+          this.syncActivePopupPageIfNeeded();
+          if (this.page && !this.page.isClosed()) {
+            return this.page;
+          }
+        }
+      } catch {
+        this.context = null;
+        this.page = null;
+      }
     }
     if (this.launchPromise) {
       return this.launchPromise;
@@ -493,13 +557,19 @@ export class YtStudioBrowserController {
       this.context = context;
       this.bindContextPopupListeners(context);
       const pages = context.pages().filter((p) => !p.isClosed());
-      const page = pages.length > 0 ? pages[pages.length - 1] : await context.newPage();
+      const page = pages.length > 0 ? pages[0] : await context.newPage();
+      if (pages.length > 1) {
+        for (let i = pages.length - 1; i >= 1; i--) {
+          await pages[i].close().catch(() => {});
+        }
+      }
       await page.setViewportSize(this.viewport).catch(() => {});
       this.page = page;
 
       await this.applySavedCookiesToContext(username);
 
       this.status = this.assistMode ? 'assist' : 'ready';
+      this.persistLiveStateToDisk();
       this.log(
         'browser launched',
         `channel=chrome · mode=headed · profile=yt-studio-chrome-profile · path=${executablePath || '/usr/bin/google-chrome'} · display=${displayEnv}`,
@@ -4243,6 +4313,8 @@ export class YtStudioBrowserController {
     this.paused = false;
     this.assistMode = false;
     this.status = 'idle';
+    this.lastScreenshotBase64 = null;
+    this.lastScreenshotAt = 0;
     this.log('control', 'Stopping and closing YouTube Studio browser...', 'warn');
     await this.close();
   }
@@ -4256,6 +4328,9 @@ export class YtStudioBrowserController {
       this.context = null;
       this.page = null;
       this.status = 'idle';
+      this.lastScreenshotBase64 = null;
+      this.lastScreenshotAt = 0;
+      this.persistLiveStateToDisk();
     }
   }
 
@@ -4409,43 +4484,114 @@ export class YtStudioBrowserController {
     this.syncActivePopupPageIfNeeded();
     if (!this.page || this.page.isClosed()) return null;
     try {
-      return await this.page.screenshot({ type: 'jpeg', quality: 65 });
+      return await this.page.screenshot({
+        type: 'jpeg',
+        quality: 65,
+        timeout: 2500,
+        animations: 'disabled',
+      });
     } catch {
       return null;
     }
   }
 
   async getSnapshot(includeScreenshot = false): Promise<YtControllerSnapshot> {
+    this.ensureInternalCollections();
     this.syncActivePopupPageIfNeeded();
-    let screenshotBase64: string | null = null;
-    if (includeScreenshot && this.page && !this.page.isClosed()) {
-      const buf = await this.getScreenshotJpeg();
-      if (buf) {
-        screenshotBase64 = `data:image/jpeg;base64,${buf.toString('base64')}`;
+
+    const hasLivePage = Boolean(this.context && this.page && !this.page.isClosed());
+    if (includeScreenshot && hasLivePage) {
+      const now = Date.now();
+      if (!this.lastScreenshotAt || now - this.lastScreenshotAt >= 900) {
+        if (!this.screenshotInFlight) {
+          this.screenshotInFlight = (async () => {
+            try {
+              const buf = await this.getScreenshotJpeg();
+              if (buf) {
+                this.lastScreenshotBase64 = `data:image/jpeg;base64,${buf.toString('base64')}`;
+                this.lastScreenshotAt = Date.now();
+                this.persistLiveStateToDisk();
+              }
+            } catch {
+              // Keep lastScreenshotBase64 when page is mid-navigation or busy
+            } finally {
+              this.screenshotInFlight = null;
+            }
+          })();
+        }
+        await this.screenshotInFlight;
       }
     }
-    const openTabs: YtOpenTabInfo[] = this.context
-      ? this.context
+
+    let openTabs: YtOpenTabInfo[] = [];
+    if (this.context) {
+      try {
+        openTabs = this.context
           .pages()
           .filter((p) => !p.isClosed())
           .map((p, idx) => ({
             index: idx,
             url: p.url() || 'about:blank',
             active: p === this.page,
-          }))
-      : [];
+          }));
+      } catch {
+        openTabs = [];
+      }
+    }
 
     this.syncLogsFromDiskIfNeeded();
+
+    // If this route worker has no local page in memory, check if another worker bundle persisted an active live state
+    if (!hasLivePage && !this.lastScreenshotBase64) {
+      try {
+        const statePath = this.getPersistedLiveStatePath();
+        if (fs.existsSync(statePath)) {
+          const diskState = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+          if (
+            diskState &&
+            diskState.status &&
+            diskState.status !== 'idle' &&
+            typeof diskState.updatedAt === 'number' &&
+            Date.now() - diskState.updatedAt < 120_000
+          ) {
+            return {
+              status: diskState.status,
+              assistMode: Boolean(diskState.assistMode),
+              currentStep: diskState.currentStep || this.currentStep,
+              currentUrl: diskState.currentUrl || '',
+              channelId: diskState.channelId || this.channelId,
+              channelHandle: diskState.channelHandle || this.channelHandle,
+              logs: this.logs.slice(0, 500),
+              lastError: diskState.lastError ?? this.lastError,
+              screenshotBase64: diskState.screenshotBase64 || null,
+              viewport: this.viewport,
+              openTabs,
+              contentProgress: this.contentProgress || null,
+            };
+          }
+        }
+      } catch {
+        // ignore disk state read errors
+      }
+    }
+
+    const effectiveStatus =
+      hasLivePage && this.status === 'idle'
+        ? this.assistMode
+          ? 'assist'
+          : 'ready'
+        : this.status;
+
     return {
-      status: this.status,
+      status: effectiveStatus,
       assistMode: this.assistMode,
       currentStep: this.currentStep,
-      currentUrl: this.page && !this.page.isClosed() ? this.page.url() : '',
+      currentUrl: hasLivePage && this.page ? this.page.url() : '',
       channelId: this.channelId,
       channelHandle: this.channelHandle,
       logs: this.logs.slice(0, 500),
       lastError: this.lastError,
-      screenshotBase64,
+      screenshotBase64: hasLivePage ? this.lastScreenshotBase64 : null,
       viewport: this.viewport,
       openTabs,
       contentProgress: this.contentProgress || null,

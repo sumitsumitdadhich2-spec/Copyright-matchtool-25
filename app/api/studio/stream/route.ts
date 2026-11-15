@@ -50,14 +50,19 @@ export async function GET(req: NextRequest) {
 
   const stream = new ReadableStream({
     async start(controller) {
+      let inFlight = false
       const send = async () => {
-        if (closed) return
+        if (closed || inFlight) return
+        inFlight = true
         try {
           const data = await getSnapshotsForRequest()
+          if (closed) return
           const payload = `data: ${JSON.stringify(data)}\n\n`
           controller.enqueue(encoder.encode(payload))
         } catch {
           /* ignore */
+        } finally {
+          inFlight = false
         }
       }
 
