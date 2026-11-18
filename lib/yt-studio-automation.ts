@@ -792,16 +792,19 @@ export class YtStudioBrowserController {
           }
         }
 
-        if (!handle) {
-          const textBody = document.body?.innerText || '';
-          const hm2 = textBody.match(/(@[a-zA-Z0-9_.-]{3,35})/);
-          if (hm2) handle = hm2[1];
-        }
-
         const nameEl = document.querySelector('#entity-name, ytcp-entity-snapshot #entity-name, #channel-title');
         const entityName = nameEl?.textContent?.trim() || null;
-        if (!handle && entityName) {
+        if (entityName) {
           handle = entityName;
+        }
+
+        if (!handle) {
+          const labelEl = document.querySelector('#entity-label, ytcp-entity-snapshot #entity-label');
+          const labelTxt = labelEl?.textContent?.trim() || '';
+          const hm2 = labelTxt.match(/(@[a-zA-Z0-9_.-]{3,35})/);
+          if (hm2 && hm2[1].toLowerCase() !== '@mrbeast') {
+            handle = hm2[1];
+          }
         }
 
         return { cid, handle };
@@ -2257,14 +2260,8 @@ export class YtStudioBrowserController {
         return false;
       }
 
-      this.log(
-        'checking popup',
-        'Detected "We\'re still checking your content" popup -> clicking top-right × (cross) button, re-selecting Unlisted, and saving...',
-        'info'
-      );
-
-      // Step 1: Click the top-right × (cross) button on the "We're still checking your content" popup
-      const clickedCross = await page
+      // Step 1: Check if there is a top-right × (cross) button on the "We're still checking your content" popup
+      const crossCoords = await page
         .evaluate(() => {
           const dialogs = Array.from(
             document.querySelectorAll(
@@ -2296,15 +2293,24 @@ export class YtStudioBrowserController {
               const btn = d.querySelector(sel) as HTMLElement | null;
               if (btn && (btn.offsetWidth > 0 || btn.offsetHeight > 0)) {
                 btn.click();
-                return true;
+                const inner = btn.querySelector('button') as HTMLElement | null;
+                if (inner) inner.click();
+                const r = btn.getBoundingClientRect();
+                return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
               }
             }
           }
-          return false;
+          return null;
         })
-        .catch(() => false);
+        .catch(() => null);
 
-      if (clickedCross) {
+      if (crossCoords) {
+        this.log(
+          'checking popup',
+          'Detected "We\'re still checking your content" popup -> clicking top-right × (cross) button, re-selecting Unlisted, and saving...',
+          'info'
+        );
+        await page.mouse.click(crossCoords.x, crossCoords.y).catch(() => {});
         await page.waitForTimeout(700).catch(() => {});
         // Re-select Unlisted radio button inside the Visibility step
         await page
@@ -2321,65 +2327,94 @@ export class YtStudioBrowserController {
         await page.waitForTimeout(450).catch(() => {});
 
         // Click Save (#done-button) again
-        const doneBtn = page.locator('#done-button').first();
-        if (await doneBtn.isVisible().catch(() => false)) {
-          await doneBtn.click({ force: true, timeout: 4000 }).catch(() => {});
-        } else {
-          await page
-            .evaluate(() => {
-              const b = document.querySelector('#done-button') as HTMLElement | null;
-              if (b) b.click();
-            })
-            .catch(() => {});
+        const doneCoords = await page
+          .evaluate(() => {
+            const b = document.querySelector('ytcp-uploads-dialog #done-button, #done-button') as HTMLElement | null;
+            if (!b) return null;
+            b.scrollIntoView({ block: 'center' });
+            b.click();
+            const inner = b.querySelector('button') as HTMLElement | null;
+            if (inner) inner.click();
+            const r = b.getBoundingClientRect();
+            return r.width > 0 && r.height > 0
+              ? { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+              : null;
+          })
+          .catch(() => null);
+        if (doneCoords) {
+          await page.mouse.click(doneCoords.x, doneCoords.y).catch(() => {});
         }
         await page.waitForTimeout(1500).catch(() => {});
       }
 
-      // Step 2: If "We're still checking your content" is still visible (or popped up again on Save),
-      // click "Publish anyway" (or confirm button) so YouTube commits Unlisted instead of Draft.
+      // Step 2: If "We're still checking your content" is visible (either no × button or re-appeared on Save),
+      // click "Publish anyway" / #confirm-button using both DOM click + real mouse coordinates so YouTube commits Unlisted immediately.
       if (await detectCheckingDialog()) {
         this.log(
           'checking popup',
-          '"We\'re still checking your content" popup re-appeared on Save -> clicking "Publish anyway" to force Unlisted',
+          crossCoords
+            ? '"We\'re still checking your content" popup re-appeared on Save -> clicking "Publish anyway" to force Unlisted'
+            : 'Detected "We\'re still checking your content" popup -> clicking "Publish anyway" to force Unlisted',
           'info'
         );
-        const publishAnywayClicked = await page
-          .evaluate(() => {
-            const dialogs = Array.from(
-              document.querySelectorAll(
-                'tp-yt-paper-dialog, ytcp-confirmation-dialog, ytcp-dialog, [role="dialog"]'
-              )
-            ) as HTMLElement[];
-            for (const d of dialogs) {
-              if (d.offsetWidth === 0 && d.offsetHeight === 0) continue;
-              const txt = (d.innerText || d.textContent || '').toLowerCase();
-              if (
-                !txt.includes('still checking your content') &&
-                !txt.includes('publish anyway')
-              ) {
-                continue;
-              }
-              const buttons = Array.from(
-                d.querySelectorAll('ytcp-button, button, [role="button"], #confirm-button')
+
+        for (let pubAttempt = 0; pubAttempt < 3; pubAttempt++) {
+          const publishCoords = await page
+            .evaluate(() => {
+              const dialogs = Array.from(
+                document.querySelectorAll(
+                  'tp-yt-paper-dialog, ytcp-confirmation-dialog, ytcp-dialog, [role="dialog"]'
+                )
               ) as HTMLElement[];
-              for (const b of buttons) {
-                const bTxt = (b.innerText || b.textContent || '').trim().toLowerCase();
+              for (const d of dialogs) {
+                if (d.offsetWidth === 0 && d.offsetHeight === 0) continue;
+                const txt = (d.innerText || d.textContent || '').toLowerCase();
                 if (
-                  bTxt.includes('publish anyway') ||
-                  bTxt.includes('change visibility') ||
-                  b.id === 'confirm-button'
+                  !txt.includes('still checking your content') &&
+                  !txt.includes('keeping your content private until checks complete') &&
+                  !txt.includes('publish anyway')
                 ) {
-                  b.click();
-                  return true;
+                  continue;
+                }
+                const buttons = Array.from(
+                  d.querySelectorAll(
+                    'ytcp-button#confirm-button, #confirm-button, ytcp-button, button, [role="button"]'
+                  )
+                ) as HTMLElement[];
+                for (const b of buttons) {
+                  if (b.offsetWidth === 0 && b.offsetHeight === 0) continue;
+                  const bTxt = (b.innerText || b.textContent || '').trim().toLowerCase();
+                  const aria = (b.getAttribute('aria-label') || '').trim().toLowerCase();
+                  if (
+                    bTxt.includes('publish anyway') ||
+                    bTxt.includes('change visibility') ||
+                    aria.includes('publish anyway') ||
+                    b.id === 'confirm-button'
+                  ) {
+                    b.scrollIntoView({ block: 'center' });
+                    b.click();
+                    const inner = b.querySelector('button, tp-yt-paper-button') as HTMLElement | null;
+                    if (inner) inner.click();
+                    const r = (inner || b).getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) {
+                      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+                    }
+                    return { x: 0, y: 0 };
+                  }
                 }
               }
-            }
-            return false;
-          })
-          .catch(() => false);
+              return null;
+            })
+            .catch(() => null);
 
-        if (publishAnywayClicked) {
-          await page.waitForTimeout(1800).catch(() => {});
+          if (publishCoords && publishCoords.x > 0 && publishCoords.y > 0) {
+            await page.mouse.click(publishCoords.x, publishCoords.y).catch(() => {});
+          }
+
+          await page.waitForTimeout(1200).catch(() => {});
+          if (!(await detectCheckingDialog())) {
+            break;
+          }
         }
       }
 

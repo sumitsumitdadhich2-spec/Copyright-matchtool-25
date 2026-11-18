@@ -3,7 +3,7 @@ import 'server-only'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { GoogleGenAI } from '@google/genai'
-import { getScan, saveScan, addLog, scanMediaDir, apiKeyHash, getModelUsage, incrementModelUsage, setModelExhausted, checkDailyReset, geminiUsageDay } from './store'
+import { getScan, saveScan, addLog, scanMediaDir, listScans, apiKeyHash, getModelUsage, incrementModelUsage, setModelExhausted, checkDailyReset, geminiUsageDay } from './store'
 import { ensureLocalMedia, localMediaPath, findAndReusePrescanMovie, findReusableGeminiMovieUpload } from './media'
 import { preparePrescanMovieCopy, buildBackupClip, sanitizeVideoMute, PRESCAN_MAX_BYTES } from './ffmpeg'
 import { CHUNK_MODEL_POOL, MODEL_MIN_INTERVAL_MS, type ModelSpec } from './models'
@@ -148,6 +148,91 @@ export function isMinuteFinderRunning(id: string): boolean {
   return Boolean(c && !c.stopping)
 }
 
+export function isMinuteFinderRunningForSameTrim(id: string): boolean {
+  const c = ctrls.get(id)
+  if (!c || c.stopping) return false
+  const s = getScan(id)
+  if (!s) return false
+  const { trimStart, trimEnd } = trimRange(s)
+  if (!c.state.movieCopy) return true
+  return (
+    Math.abs(c.state.movieCopy.trimStart - trimStart) < 0.5 &&
+    Math.abs(c.state.movieCopy.trimEnd - trimEnd) < 0.5
+  )
+}
+
+/**
+ * Look for an earlier scan with the SAME short video + SAME movie video + SAME trim range.
+ * - If that scan already finished finding minutes (`minuteSuggestions` or `approvedMinutes`),
+ *   returns it as `completeScan` so we can skip Minute Finder + Backup Finder and start Chunk Scan directly!
+ * - If that scan has partially completed 20-minute windows (`w.status === 'done'`),
+ *   returns it as `partialScan` so we can reuse its `done` windows and only scan the remaining/failed window(s).
+ */
+function findReusableMinuteFinderScan(
+  scan: Scan,
+  trimStart: number,
+  trimEnd: number,
+): { completeScan: Scan | null; partialScan: Scan | null } {
+  const candidates = listScans()
+    .filter((s) => s.id !== scan.id)
+    .map((s) => getScan(s.id))
+    .filter((cand): cand is Scan => {
+      if (!cand) return false
+      const sameShort = Boolean(
+        (scan.shortSize && cand.shortSize && cand.shortSize === scan.shortSize) ||
+          (scan.shortName &&
+            cand.shortName === scan.shortName &&
+            scan.shortDuration &&
+            cand.shortDuration &&
+            Math.abs(cand.shortDuration - scan.shortDuration) < 1.0),
+      )
+      const sameMovie = Boolean(
+        (scan.movieSize && cand.movieSize && cand.movieSize === scan.movieSize) ||
+          (scan.movieName &&
+            cand.movieName === scan.movieName &&
+            scan.movieDuration &&
+            cand.movieDuration &&
+            Math.abs(cand.movieDuration - scan.movieDuration) < 1.0),
+      )
+      if (!sameShort || !sameMovie) return false
+      const candStart = cand.movieTrimStart ?? 0
+      const candEnd = cand.movieTrimEnd ?? cand.movieDuration ?? 0
+      return Math.abs(candStart - trimStart) < 1.0 && Math.abs(candEnd - trimEnd) < 1.0
+    })
+
+  let completeScan: Scan | null = null
+  let partialScan: Scan | null = null
+
+  for (const cand of candidates) {
+    const prescan = cand.geminiPrescan
+    const hasCompletePrescan =
+      Boolean(prescan?.minuteSuggestions && prescan.minuteSuggestions.length > 0) &&
+      (prescan?.status === 'done' ||
+        prescan?.status === 'starting_scan' ||
+        (prescan?.windows &&
+          prescan.windows.length > 0 &&
+          prescan.windows.every((w) => w.status === 'done') &&
+          (!prescan.backup ||
+            prescan.backup.status === 'done' ||
+            prescan.backup.status === 'skipped')))
+    const hasApprovedMinutes = Boolean(cand.approvedMinutes && cand.approvedMinutes.length > 0)
+
+    if (!completeScan && (hasCompletePrescan || hasApprovedMinutes)) {
+      completeScan = cand
+      break
+    }
+    if (
+      !partialScan &&
+      prescan?.windows &&
+      prescan.windows.some((w) => w.status === 'done' && Boolean(w.raw))
+    ) {
+      partialScan = cand
+    }
+  }
+
+  return { completeScan, partialScan }
+}
+
 registerMinuteFinderActiveChecker((scanId: string) => isMinuteFinderRunning(scanId))
 
 /** Same gate as the TwelveLabs pipeline: both videos in + trim confirmed. */
@@ -289,15 +374,18 @@ export function startGeminiMinuteFinder(
     state.minuteSuggestions = undefined
     state.backup = undefined
   }
-  if (mode === 'retry') {
+  if (mode === 'retry' || mode === 'start') {
     const targetIndices = windowIndices && windowIndices.length > 0 ? new Set(windowIndices) : null
     for (let idx = 0; idx < state.windows.length; idx++) {
       const w = state.windows[idx]
+      // Only reset windows that actually failed or were interrupted (or explicitly targeted by windowIndices).
+      // NEVER reset an already 'done' window just because w.matches === 0 ("NOT IN THIS WINDOW" is a valid completed result!).
       const shouldRetry = targetIndices
         ? targetIndices.has(idx) || targetIndices.has(w.index)
-        : w.status === 'failed' || w.status === 'running' || (w.status === 'done' && (w.matches || 0) === 0)
+        : w.status === 'failed' || w.status === 'running'
       if (shouldRetry) {
         w.status = 'pending'
+        w.attempts = 0
         w.error = undefined
         w.matches = undefined
         w.minutes = undefined
@@ -308,6 +396,7 @@ export function startGeminiMinuteFinder(
       for (const w of state.backup.windows) {
         if (w.status === 'failed' || w.status === 'running') {
           w.status = 'pending'
+          w.attempts = 0
           w.error = undefined
         }
       }
@@ -336,7 +425,7 @@ export function startGeminiMinuteFinder(
     `Gemini Minute Finder ${mode === 'start' ? 'start' : mode} [Ticket #${alloc.chunkTicket} · Slot ${alloc.keySlot} — Keys ${alloc.keyPair[0]} & ${alloc.keyPair[1]}]: movie copy → upload (per key) → 20-min windows @ 10fps/1fps (${CHUNK_MODEL_POOL.map((m) => m.id).join(' + ')}) → backup pass for missing parts (high fps) → minute list → chunk scan`,
   )
 
-  void run(scanId, ctrl, userApiKeys, user)
+  void run(scanId, ctrl, userApiKeys, user, mode)
     .catch((err) => {
       const msg = err instanceof Error ? err.message : String(err)
       persist(scanId, ctrl, { status: 'error', error: msg, finishedAt: Date.now(), progress: undefined })
@@ -396,7 +485,13 @@ function resetRunningWindows(ctrl: Ctrl) {
 
 // ---------------------------------------------------------------------------
 
-async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser): Promise<void> {
+async function run(
+  id: string,
+  ctrl: Ctrl,
+  apiKeys: string[],
+  user: FinderUser,
+  mode: 'start' | 'retry' | 'rerun' = 'start',
+): Promise<void> {
   const scan0 = getScan(id)
   if (!scan0 || !scan0.shortDuration || !scan0.movieDuration) throw new Error('Scan/media state missing')
   const shortDuration = scan0.shortDuration
@@ -408,6 +503,103 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
     throw new Error(
       `Short video 3 minute se lamba hai (${fmtDur(shortDuration)}) — Gemini Minute Finder sirf ≤3 min short par chalta hai. Manual Full scan use karo.`,
     )
+  }
+
+  // ---- [0] Cross-Scan Reuse: If the exact same Short + Movie (+ trim) already found minutes in an earlier scan,
+  //          skip Minute Finder & Backup Finder completely and start Chunk Scan directly! ----
+  const reusable = mode !== 'rerun' ? findReusableMinuteFinderScan(scan0, trimStart, trimEnd) : { completeScan: null, partialScan: null }
+  if (reusable.completeScan) {
+    const src = reusable.completeScan
+    const srcPrescan = src.geminiPrescan
+    const reusedSuggestions: MinuteSuggestion[] =
+      srcPrescan?.minuteSuggestions && srcPrescan.minuteSuggestions.length > 0
+        ? srcPrescan.minuteSuggestions
+        : (src.approvedMinutes || []).map((m) => ({
+            minute: m,
+            sceneCount: 1,
+            confidences: ['match'],
+            shortWindows: [{ start: 0, end: shortDuration }],
+          }))
+
+    if (reusedSuggestions.length > 0) {
+      if (srcPrescan?.windows && srcPrescan.windows.length > 0) {
+        ctrl.state.windows = srcPrescan.windows.map((w) => ({ ...w }))
+      }
+      if (srcPrescan?.backup) {
+        ctrl.state.backup = { ...srcPrescan.backup }
+      }
+      if (srcPrescan?.movieCopy) {
+        ctrl.state.movieCopy = { ...srcPrescan.movieCopy }
+      }
+      ctrl.state.minuteSuggestions = reusedSuggestions
+      const minuteList = reusedSuggestions.map((s) => s.minute + 1).join(', ')
+      persist(id, ctrl, {
+        status: 'starting_scan',
+        progress: `Same Short + Movie pehle Scan #${src.id.slice(0, 8)} me scan ho chuka hai (Minutes: ${minuteList}) — direct Chunk Scan start ho raha hai...`,
+      })
+      log(
+        id,
+        'success',
+        `Same Short ("${scan0.shortName}") + Movie ("${scan0.movieName}") ka minute pehle hi Scan #${src.id.slice(0, 8)} me find ho chuka hai (Minutes: ${minuteList}) — Minute Finder & Backup Finder skip karke seedha Chunk Scan (clips cut + YT upload) start ho raha hai!`,
+      )
+
+      const scan = getScan(id)
+      if (!scan) throw new Error('Scan missing before chunk scan start')
+      const approved = reusedSuggestions.map((s) => s.minute)
+      const applied = applyApprovedMinutes(scan, approved, reusedSuggestions)
+      if (!applied.ok) throw new Error(applied.error)
+      ctrl.state.appliedMinutes = approved
+      scan.geminiPrescan = ctrl.state
+      scan.chunkWindowsDone = false
+      if (scan.status === 'stopped' || scan.status === 'error' || scan.status === 'done') {
+        scan.status = 'created'
+      }
+      scan.pipelineStage = 'waiting_chunk_ticket'
+      scan.finishedAt = null
+      reactivateScanTicket(id)
+      addLog(scan, 'success', `Reused Minute List applied: movie minute(s) ${minuteList} — Gemini chunk scan direct start ho raha hai`)
+      saveScan(scan, { immediate: true })
+
+      await waitForChunking(id, ctrl)
+      if (ctrl.stopping) return
+
+      const releaseChunkLock = await globalChunkScanCoordinator.acquireChunkScanLock({
+        scanId: id,
+        scanTitle: getScan(id)?.shortName || id,
+        onWait: (msg, pos, ticket, activeId) => {
+          log(id, 'info', msg)
+          persist(id, ctrl, {
+            status: 'starting_scan',
+            progress: `Chunk Queue #${pos} (Ticket #${ticket}) — Scan "${activeId || 'active'}" ka chunk scan chal raha hai. Turn aate hi auto-start hoga...`,
+          })
+        },
+        isStopping: () => ctrl.stopping,
+      })
+      if (ctrl.stopping) {
+        releaseChunkLock()
+        return
+      }
+
+      let charged = false
+      if (user.role !== 'admin') {
+        const bal = await deductTokens(user.username, SCAN_TOKEN_COST)
+        if (bal === null) {
+          releaseChunkLock()
+          throw new Error(`Minutes ready, lekin tokens khatm hain! 1 scan = ${SCAN_TOKEN_COST} tokens. Admin se tokens lo, phir Start dabao.`)
+        }
+        charged = true
+      }
+      persist(id, ctrl, { status: 'done', progress: undefined, finishedAt: Date.now(), error: null })
+      log(id, 'success', 'Chunk scan started directly from cached Minute Finder result (clips cut + YT upload starting)')
+
+      const result = await scheduler.start(id, false, apiKeys, null)
+      if (!result.ok) {
+        releaseChunkLock()
+        if (charged) await refundTokens(user.username, SCAN_TOKEN_COST)
+        throw new Error(result.error || 'Chunk scan start failed')
+      }
+      return
+    }
   }
 
   const mediaDir = scanMediaDir(id)
@@ -463,9 +655,9 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   if (copyValid) {
     log(id, 'info', `Movie copy cached (${fmtDur(ctrl.state.movieCopy!.durationSec)}, ${fmtMB(ctrl.state.movieCopy!.sizeBytes)}) — skip`)
   } else {
-    // Any stale copy (different trim) also invalidates the per-key MOVIE uploads.
+    // Rebuilding the local movie copy file invalidates per-key MOVIE uploads,
+    // but NEVER wipe already-completed windows (`ctrl.state.windows`) when the trim range is unchanged!
     for (const k of Object.keys(ctrl.state.uploads)) ctrl.state.uploads[k] = { ...ctrl.state.uploads[k], movieUri: '', movieName: '' }
-    ctrl.state.windows = []
     ctrl.state.movieCopy = undefined
     try {
       if (fs.existsSync(copyPath)) fs.unlinkSync(copyPath)
@@ -504,9 +696,62 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
     }
     ctrl.state.windows = windows
   }
+
+  // Merge any already 'done' windows from an earlier scan of the same short + movie + trim
+  // so only failed/missing windows (e.g., Window #3) ever need to be scanned!
+  if (mode !== 'rerun' && reusable.partialScan?.geminiPrescan?.windows?.length) {
+    let reusedWinCount = 0
+    for (const w of ctrl.state.windows) {
+      if (w.status === 'done' && w.raw) continue
+      const matchFromPrev = reusable.partialScan.geminiPrescan.windows.find(
+        (pw) =>
+          pw.status === 'done' &&
+          Boolean(pw.raw) &&
+          Math.abs(pw.startOffset - w.startOffset) < 1.0 &&
+          Math.abs(pw.endOffset - w.endOffset) < 1.0,
+      )
+      if (matchFromPrev) {
+        Object.assign(w, {
+          status: 'done',
+          raw: matchFromPrev.raw,
+          tokens: matchFromPrev.tokens,
+          matches: matchFromPrev.matches,
+          minutes: matchFromPrev.minutes ? [...matchFromPrev.minutes] : [],
+          lane: matchFromPrev.lane,
+          error: undefined,
+        })
+        reusedWinCount += 1
+      }
+    }
+    if (reusedWinCount > 0) {
+      persist(id, ctrl)
+      log(
+        id,
+        'success',
+        `Pehle ke scan (${reusable.partialScan.id.slice(0, 8)}) se ${reusedWinCount} completed window(s) reuse ho gaye — sirf bache hue/failed window(s) scan honge!`,
+      )
+    }
+  }
+
+  // Also ensure any window left in 'failed' or 'running' state is queued as 'pending' so retry/start scans ONLY the unfinished windows
+  for (const w of ctrl.state.windows) {
+    if (w.status === 'failed' || w.status === 'running') {
+      w.status = 'pending'
+      w.attempts = 0
+      w.error = undefined
+    }
+  }
+
   ctrl.queue = ctrl.state.windows.filter((w) => w.status === 'pending').map((w) => w.index)
   const total = ctrl.state.windows.length
   const pending = ctrl.queue.length
+  if (pending > 0 && pending < total) {
+    log(
+      id,
+      'info',
+      `Partial Window Resume: ${total - pending}/${total} window(s) pehle se done hain — sirf ${pending} remaining window(s) (${ctrl.queue.map((i) => `#${i}`).join(', ')}) ka minute finder chalega!`,
+    )
+  }
 
   // ---- [2] Uploads: short + movie copy ----
   // QUOTA-AWARE & PARALLEL SCAN-AWARE KEY SELECTION:

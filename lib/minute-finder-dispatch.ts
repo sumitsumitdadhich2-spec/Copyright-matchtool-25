@@ -3,7 +3,12 @@ import 'server-only'
 import { getScan, saveScan, addLog } from './store'
 import { getAllUserApiKeys, getUserTwelveLabsKey, getUserMinuteFinderMode } from './user-keys'
 import { startMergePipeline, pipelineReady, isPipelineRunning } from './merge-pipeline'
-import { startGeminiMinuteFinder, isMinuteFinderRunning, stopAndWaitMinuteFinder } from './gemini-minute-finder'
+import {
+  startGeminiMinuteFinder,
+  isMinuteFinderRunning,
+  isMinuteFinderRunningForSameTrim,
+  stopAndWaitMinuteFinder,
+} from './gemini-minute-finder'
 import { ensureScanTicketAndKeyPair } from './chunk-scan-coordinator'
 import type { MinuteFinderMode } from './types'
 
@@ -62,9 +67,13 @@ export async function dispatchMinuteFinder(scanId: string, user: DispatchUser | 
   }
 
   if (isMinuteFinderRunning(scanId)) {
-    // A new upload/trim arrived while an older run is still going — its
-    // windows point at the OLD range, so stop it and start fresh once its
-    // in-flight request has settled (can take up to ~2 min). Background.
+    // If the currently running Minute Finder is already scanning the exact same
+    // movie + trim range, do NOT stop it (prevents false "naya upload/trim aaya — purana run stale tha").
+    if (isMinuteFinderRunningForSameTrim(scanId)) {
+      return mode
+    }
+    // Otherwise a genuinely different trim/upload arrived while an older run is going —
+    // stop the stale run and start fresh once its in-flight request settles.
     void (async () => {
       const idle = await stopAndWaitMinuteFinder(scanId, 'naya upload/trim aaya — purana run stale tha', 5 * 60_000)
       if (!idle) {

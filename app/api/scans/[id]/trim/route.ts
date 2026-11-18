@@ -20,10 +20,6 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   if (scan.status === 'scanning' || scan.status === 'verifying') {
     return NextResponse.json({ error: 'Cannot change the trim while a scan is running' }, { status: 409 })
   }
-  // A Gemini Minute Finder run on the OLD trim range is stale now — stop it
-  // before the chunk layout is reset (the dispatcher below starts a fresh run).
-  if (isMinuteFinderRunning(id)) await stopAndWaitMinuteFinder(id, 'trim range badla', 10_000)
-
   const dur = scan.movieDuration
   const body = (await req.json().catch(() => ({}))) as { start?: number; end?: number }
   let start = Number.isFinite(Number(body.start)) ? Number(body.start) : 0
@@ -33,6 +29,19 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   if (end - start < 1) return NextResponse.json({ error: 'Trim range must be at least 1 second' }, { status: 400 })
 
   const isFull = start <= 0.01 && end >= dur - 0.01
+  const nextTrimStart = isFull ? 0 : start
+  const nextTrimEnd = isFull ? dur : end
+  const prevTrimStart = scan.movieTrimStart ?? 0
+  const prevTrimEnd = scan.movieTrimEnd ?? dur
+  const trimActuallyChanged =
+    Math.abs(prevTrimStart - nextTrimStart) > 0.5 ||
+    Math.abs(prevTrimEnd - nextTrimEnd) > 0.5
+
+  // Only stop a running Gemini Minute Finder if the user actually changed the trim range!
+  if (trimActuallyChanged && isMinuteFinderRunning(id)) {
+    await stopAndWaitMinuteFinder(id, 'trim range badla', 10_000)
+  }
+
   scan.movieTrimStart = isFull ? undefined : start
   scan.movieTrimEnd = isFull ? undefined : end
   scan.awaitingTrim = false

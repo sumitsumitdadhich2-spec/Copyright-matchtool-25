@@ -7223,8 +7223,11 @@ export class StudioBrowserController {
                 MODEL_FALLBACK_CHAIN.findIndex((m) => m.toLowerCase() === activeModelName.toLowerCase()),
               )
 
-              const nextResetLabel =
-                permissionDeniedRetries % 2 === 1 ? '403 -> hard reset (page+cache)' : '403 -> browser restart'
+              const nextResetCount = permissionDeniedRetries
+              const isEvenBrowserRestart = nextResetCount % 2 === 0
+              const nextResetLabel = !isEvenBrowserRestart
+                ? '403 -> hard reset (page+cache)'
+                : '403 -> browser restart'
               this.logStep(
                 'permission denied - retrying',
                 `${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) -> model fallback: ${prevModel} -> ${activeModelName} (waiting 15s, then ${nextResetLabel})`,
@@ -7235,10 +7238,36 @@ export class StudioBrowserController {
                 `AI Studio 403 PERMISSION_DENIED on ${jobLabel} with ${prevModel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) — waiting 15s, then ${nextResetLabel} and switching model to "${activeModelName}"`,
               )
 
+              // If movieYoutubeUrl is used and 403 PERMISSION_DENIED happens repeatedly, ensure the YouTube video is Unlisted (not stuck in Draft/Private)
+              if (isEvenBrowserRestart && movieYoutubeUrl) {
+                const workerLabel = this.workerTag.replace(/^\[|\]$/g, '') || 'W00'
+                await globalYtStudioController
+                  .enqueueMakeVideoUnlisted({
+                    scanId: scanId || undefined,
+                    windowNumber,
+                    youtubeUrl: movieYoutubeUrl,
+                    username,
+                    workerLabel,
+                    onLog: (qMsg) => {
+                      this.logStep('yt-unlisted-check', qMsg, 'info')
+                      onLog?.('info', qMsg)
+                    },
+                  })
+                  .catch(() => {})
+              }
+
               if (permissionDeniedRetries >= MAX_PERMISSION_RETRIES) {
-                throw new Error(
-                  `PERMISSION_DENIED_EXHAUSTED: ${exactErrLog} after ${MAX_PERMISSION_RETRIES} permission attempts on ${jobLabel}`,
+                this.logStep(
+                  'permission denied cycle reset -> continuing retry',
+                  `${jobLabel}: ${exactErrLog} reached ${MAX_PERMISSION_RETRIES} attempts — resetting 403 counter, restarting browser with fresh Settings cookies, and continuing retry on ${activeModelName}`,
+                  'warn',
                 )
+                onLog?.(
+                  'warn',
+                  `${jobLabel}: 403 PERMISSION_DENIED reached ${MAX_PERMISSION_RETRIES} attempts — resetting counter, restarting browser, and continuing retry with "${activeModelName}"`,
+                )
+                // Keep even counter (2) so the next loop iteration performs a full browser restart + fresh Settings cookies
+                permissionDeniedRetries = 2
               }
               await new Promise((r) => setTimeout(r, 15_000))
               permissionDeniedTriggered = true
@@ -7829,11 +7858,14 @@ export class StudioBrowserController {
           shiftValidateAndCheckCoverage(accumulatedUnshiftedText)
         }
 
-        // Rescue check: if a late 403 or transient banner fired right after HISSA 2 was already generated,
+        // Rescue check: if a late 403 or transient banner fired right after generation started/completed,
         // validate the completed answer first before discarding it!
         if (
           (permissionDeniedTriggered || internalErrorDetected || transientBannerReason) &&
-          (hissa2FirstSeenLogged || /HISSA\s*2\b/i.test(lastCandidateText))
+          (hissa2FirstSeenLogged ||
+            /HISSA\s*2\b/i.test(lastCandidateText) ||
+            /HISSA\s*1\b/i.test(lastCandidateText) ||
+            Date.now() - runStarted >= 45_000)
         ) {
           await fetchShiftAndValidateOnce().catch(() => null)
           if (rawAnswer) {
@@ -7854,9 +7886,8 @@ export class StudioBrowserController {
         }
 
         if (permissionDeniedTriggered) {
-          await this.saveRotatedSessionFromContext(username)
           resetOnPermissionDenied = true
-          // Do NOT consume normal MAX_ATTEMPTS = 3; perform hard page reset or browser restart at the top of the loop and redo the full window setup
+          // Do NOT consume normal MAX_ATTEMPTS; perform hard page reset or browser restart at the top of the loop and redo the full window setup
           attempt -= 1
           continue
         }
@@ -8221,10 +8252,20 @@ export class StudioBrowserController {
           throw new Error(`${codeBugStep}: ${msg}`)
         }
 
-        if (
-          msg.includes('PERMISSION_DENIED_EXHAUSTED:') ||
-          msg.includes('INVALID_RESULT_EXHAUSTED:')
-        ) {
+        if (msg.includes('PERMISSION_DENIED_EXHAUSTED:')) {
+          resetOnPermissionDenied = true
+          permissionDeniedRetries = 2
+          this.logStep(
+            'permission denied recovery -> retrying',
+            `${jobLabel}: ${msg} — restarting browser and continuing retry`,
+            'warn',
+          )
+          onLog?.('warn', `${jobLabel}: ${msg} — restarting browser and continuing retry`)
+          await new Promise((r) => setTimeout(r, 15_000))
+          attempt -= 1
+          continue
+        }
+        if (msg.includes('INVALID_RESULT_EXHAUSTED:')) {
           this.logStep(`ERROR [${currentStage}]`, msg, 'error')
           await this.recordFinishedWindowJobAndMaybeRecyclePage(
             username,
