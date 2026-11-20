@@ -29,6 +29,10 @@ import {
   type UploadProgress,
 } from './gemini'
 import { applyApprovedMinutes } from './minute-ranges'
+import {
+  resolveReusableMinuteFinderData,
+  shouldResetWindowForRetry,
+} from './minute-finder-reuse'
 import { mergeRanges, missingRanges as sharedMissingRanges } from './short-coverage'
 import { scheduler } from './scheduler'
 import { globalGeminiCoordinator } from './global-gemini-coordinator'
@@ -115,6 +119,7 @@ interface Lane {
 interface Ctrl {
   stopping: boolean
   state: GeminiPrescanState
+  mediaKey: string
   queue: number[]
   inFlight: Set<number>
   /** BACKUP pass queue / in-flight (indexes into state.backup.windows) */
@@ -143,6 +148,18 @@ interface LaneEnv {
 const ctrls = new Map<string, Ctrl>()
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
+function scanMediaFingerprint(scan: Scan): string {
+  const { trimStart, trimEnd } = trimRange(scan)
+  return [
+    scan.shortName || '',
+    scan.shortSize || 0,
+    scan.movieName || '',
+    scan.movieSize || 0,
+    Math.round(trimStart),
+    Math.round(trimEnd),
+  ].join('|')
+}
+
 export function isMinuteFinderRunning(id: string): boolean {
   const c = ctrls.get(id)
   return Boolean(c && !c.stopping)
@@ -153,6 +170,7 @@ export function isMinuteFinderRunningForSameTrim(id: string): boolean {
   if (!c || c.stopping) return false
   const s = getScan(id)
   if (!s) return false
+  if (c.mediaKey !== scanMediaFingerprint(s)) return false
   const { trimStart, trimEnd } = trimRange(s)
   if (!c.state.movieCopy) return true
   return (
@@ -161,76 +179,16 @@ export function isMinuteFinderRunningForSameTrim(id: string): boolean {
   )
 }
 
-/**
- * Look for an earlier scan with the SAME short video + SAME movie video + SAME trim range.
- * - If that scan already finished finding minutes (`minuteSuggestions` or `approvedMinutes`),
- *   returns it as `completeScan` so we can skip Minute Finder + Backup Finder and start Chunk Scan directly!
- * - If that scan has partially completed 20-minute windows (`w.status === 'done'`),
- *   returns it as `partialScan` so we can reuse its `done` windows and only scan the remaining/failed window(s).
- */
 function findReusableMinuteFinderScan(
   scan: Scan,
   trimStart: number,
   trimEnd: number,
-): { completeScan: Scan | null; partialScan: Scan | null } {
-  const candidates = listScans()
+) {
+  const earlierScans = listScans()
     .filter((s) => s.id !== scan.id)
     .map((s) => getScan(s.id))
-    .filter((cand): cand is Scan => {
-      if (!cand) return false
-      const sameShort = Boolean(
-        (scan.shortSize && cand.shortSize && cand.shortSize === scan.shortSize) ||
-          (scan.shortName &&
-            cand.shortName === scan.shortName &&
-            scan.shortDuration &&
-            cand.shortDuration &&
-            Math.abs(cand.shortDuration - scan.shortDuration) < 1.0),
-      )
-      const sameMovie = Boolean(
-        (scan.movieSize && cand.movieSize && cand.movieSize === scan.movieSize) ||
-          (scan.movieName &&
-            cand.movieName === scan.movieName &&
-            scan.movieDuration &&
-            cand.movieDuration &&
-            Math.abs(cand.movieDuration - scan.movieDuration) < 1.0),
-      )
-      if (!sameShort || !sameMovie) return false
-      const candStart = cand.movieTrimStart ?? 0
-      const candEnd = cand.movieTrimEnd ?? cand.movieDuration ?? 0
-      return Math.abs(candStart - trimStart) < 1.0 && Math.abs(candEnd - trimEnd) < 1.0
-    })
-
-  let completeScan: Scan | null = null
-  let partialScan: Scan | null = null
-
-  for (const cand of candidates) {
-    const prescan = cand.geminiPrescan
-    const hasCompletePrescan =
-      Boolean(prescan?.minuteSuggestions && prescan.minuteSuggestions.length > 0) &&
-      (prescan?.status === 'done' ||
-        prescan?.status === 'starting_scan' ||
-        (prescan?.windows &&
-          prescan.windows.length > 0 &&
-          prescan.windows.every((w) => w.status === 'done') &&
-          (!prescan.backup ||
-            prescan.backup.status === 'done' ||
-            prescan.backup.status === 'skipped')))
-    const hasApprovedMinutes = Boolean(cand.approvedMinutes && cand.approvedMinutes.length > 0)
-
-    if (!completeScan && (hasCompletePrescan || hasApprovedMinutes)) {
-      completeScan = cand
-      break
-    }
-    if (
-      !partialScan &&
-      prescan?.windows &&
-      prescan.windows.some((w) => w.status === 'done' && Boolean(w.raw))
-    ) {
-      partialScan = cand
-    }
-  }
-
-  return { completeScan, partialScan }
+    .filter((cand): cand is Scan => Boolean(cand))
+  return resolveReusableMinuteFinderData(scan, earlierScans, trimStart, trimEnd)
 }
 
 registerMinuteFinderActiveChecker((scanId: string) => isMinuteFinderRunning(scanId))
@@ -380,9 +338,7 @@ export function startGeminiMinuteFinder(
       const w = state.windows[idx]
       // Only reset windows that actually failed or were interrupted (or explicitly targeted by windowIndices).
       // NEVER reset an already 'done' window just because w.matches === 0 ("NOT IN THIS WINDOW" is a valid completed result!).
-      const shouldRetry = targetIndices
-        ? targetIndices.has(idx) || targetIndices.has(w.index)
-        : w.status === 'failed' || w.status === 'running'
+      const shouldRetry = shouldResetWindowForRetry(w, idx, targetIndices)
       if (shouldRetry) {
         w.status = 'pending'
         w.attempts = 0
@@ -407,6 +363,7 @@ export function startGeminiMinuteFinder(
   const ctrl: Ctrl = {
     stopping: false,
     state,
+    mediaKey: scanMediaFingerprint(scan),
     queue: [],
     inFlight: new Set(),
     backupQueue: [],
@@ -507,19 +464,14 @@ async function run(
 
   // ---- [0] Cross-Scan Reuse: If the exact same Short + Movie (+ trim) already found minutes in an earlier scan,
   //          skip Minute Finder & Backup Finder completely and start Chunk Scan directly! ----
-  const reusable = mode !== 'rerun' ? findReusableMinuteFinderScan(scan0, trimStart, trimEnd) : { completeScan: null, partialScan: null }
-  if (reusable.completeScan) {
+  const reusable =
+    mode !== 'rerun'
+      ? findReusableMinuteFinderScan(scan0, trimStart, trimEnd)
+      : { completeScan: null, reusedSuggestions: [] as MinuteSuggestion[], reusedDoneWindows: new Map() }
+  if (reusable.completeScan && reusable.reusedSuggestions.length > 0) {
     const src = reusable.completeScan
     const srcPrescan = src.geminiPrescan
-    const reusedSuggestions: MinuteSuggestion[] =
-      srcPrescan?.minuteSuggestions && srcPrescan.minuteSuggestions.length > 0
-        ? srcPrescan.minuteSuggestions
-        : (src.approvedMinutes || []).map((m) => ({
-            minute: m,
-            sceneCount: 1,
-            confidences: ['match'],
-            shortWindows: [{ start: 0, end: shortDuration }],
-          }))
+    const reusedSuggestions = reusable.reusedSuggestions
 
     if (reusedSuggestions.length > 0) {
       if (srcPrescan?.windows && srcPrescan.windows.length > 0) {
@@ -697,20 +649,20 @@ async function run(
     ctrl.state.windows = windows
   }
 
-  // Merge any already 'done' windows from an earlier scan of the same short + movie + trim
+  // Merge any already 'done' windows from earlier scans of the same short + movie + trim
   // so only failed/missing windows (e.g., Window #3) ever need to be scanned!
-  if (mode !== 'rerun' && reusable.partialScan?.geminiPrescan?.windows?.length) {
+  if (mode !== 'rerun' && reusable.reusedDoneWindows.size > 0) {
     let reusedWinCount = 0
+    const sourceScanIds = new Set<string>()
     for (const w of ctrl.state.windows) {
       if (w.status === 'done' && w.raw) continue
-      const matchFromPrev = reusable.partialScan.geminiPrescan.windows.find(
-        (pw) =>
-          pw.status === 'done' &&
-          Boolean(pw.raw) &&
-          Math.abs(pw.startOffset - w.startOffset) < 1.0 &&
-          Math.abs(pw.endOffset - w.endOffset) < 1.0,
-      )
-      if (matchFromPrev) {
+      const matchEntry = reusable.reusedDoneWindows.get(w.index)
+      const matchFromPrev = matchEntry?.window
+      if (
+        matchFromPrev &&
+        Math.abs(matchFromPrev.startOffset - w.startOffset) < 1.0 &&
+        Math.abs(matchFromPrev.endOffset - w.endOffset) < 1.0
+      ) {
         Object.assign(w, {
           status: 'done',
           raw: matchFromPrev.raw,
@@ -720,6 +672,7 @@ async function run(
           lane: matchFromPrev.lane,
           error: undefined,
         })
+        sourceScanIds.add(matchEntry.sourceScanId.slice(0, 8))
         reusedWinCount += 1
       }
     }
@@ -728,7 +681,7 @@ async function run(
       log(
         id,
         'success',
-        `Pehle ke scan (${reusable.partialScan.id.slice(0, 8)}) se ${reusedWinCount} completed window(s) reuse ho gaye — sirf bache hue/failed window(s) scan honge!`,
+        `Pehle ke scan (${[...sourceScanIds].join(', ')}) se ${reusedWinCount} completed window(s) reuse ho gaye — sirf bache hue/failed window(s) scan honge!`,
       )
     }
   }

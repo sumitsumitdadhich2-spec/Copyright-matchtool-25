@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { DATA_DIR } from './paths'
+import { DATA_DIR, MEDIA_DIR } from './paths'
 import { extractWindowClip, probeDuration, verifyWindowClipFile } from './ffmpeg'
 import type { CancelToken } from './ffmpeg-pool'
 

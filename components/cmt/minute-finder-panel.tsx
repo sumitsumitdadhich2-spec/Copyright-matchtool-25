@@ -165,7 +165,7 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
 
       {mode === 'off' && (
         <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-          Minute finder OFF hai �� upload + trim ke baad kuch auto nahi chalega. Header me <span className="font-medium text-foreground">Start scan</span>{' '}
+          Minute finder OFF hai — upload + trim ke baad kuch auto nahi chalega. Header me <span className="font-medium text-foreground">Start scan</span>{' '}
           dabao to normal FULL scan hoga (saare chunks, 24 fps).
         </p>
       )}

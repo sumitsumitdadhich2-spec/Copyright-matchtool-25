@@ -8294,7 +8294,7 @@ export class StudioBrowserController {
                 await oldPage.close({ runBeforeUnload: false }).catch(() => {})
               }
               await freshPage
-                .goto(STUDIO_URLS.playgroundNewChat, {
+                .goto(STUDIO_URLS.newChat, {
                   waitUntil: 'domcontentloaded',
                   timeout: 45_000,
                 })

@@ -2059,7 +2059,7 @@ export class StudioParallelManager {
             ytUrl: preservedYtUrl,
             ytVideoId: preservedYtVideoId,
             ytVisibility: preservedYtUrl ? prev?.ytVisibility || 'Unlisted' : null,
-            ytUploadStatus: preservedYtUrl ? 'READY' : 'IDLE',
+            ytUploadStatus: preservedYtUrl ? 'READY' : 'QUEUED',
           }
         })
         this.startedAt = Date.now()

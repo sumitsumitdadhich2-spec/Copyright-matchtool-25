@@ -102,7 +102,7 @@ export interface PublicStudioSettings {
   ytChannelHandle: string | null
   ytLastLoginStatus: 'logged_in' | 'logged_out' | 'untested'
   ytLastLoginTestedAt: number | null
-  ytVisibility: 'unlisted' | 'public'
+  ytVisibility: 'unlisted' | 'private' | 'public'
   ytAutoDeleteAtEnd: boolean
   ytUploadConcurrency: number
   driveConnected: boolean

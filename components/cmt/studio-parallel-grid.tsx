@@ -443,8 +443,8 @@ export function StudioParallelGrid({
   const failedCount = snap?.failedCount ?? 0
   const needsAttentionCount = snap?.needsAttentionCount ?? 0
   const elapsedSec = snap?.elapsedSec ?? 0
-  const workers = snap?.workers ?? []
-  const windows = snap?.windows ?? []
+  const workers = useMemo(() => snap?.workers ?? [], [snap?.workers])
+  const windows = useMemo(() => snap?.windows ?? [], [snap?.windows])
   const prohibitedWindows = useMemo(
     () => windows.filter((w) => w.status === 'PROHIBITED'),
     [windows],
@@ -455,7 +455,7 @@ export function StudioParallelGrid({
   const clipsExtracting = Boolean(snap?.clipsExtracting)
   const mergedReport = snap?.mergedReport ?? null
   const slotPool = snap?.slotPool ?? null
-  const combinedLogs = snap?.combinedLogs ?? []
+  const combinedLogs = useMemo(() => snap?.combinedLogs ?? [], [snap?.combinedLogs])
   const totalLogLinesOnDisk = snap?.totalLogLinesOnDisk ?? combinedLogs.length
   const isRunningOrStarting = Boolean(snap?.active || snap?.starting)
   const hasResumableState = Boolean(snap?.hasResumableState)

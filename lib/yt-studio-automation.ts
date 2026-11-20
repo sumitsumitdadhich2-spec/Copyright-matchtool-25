@@ -788,7 +788,7 @@ export class YtStudioBrowserController {
           if (!handle) {
             const hm = txt.match(/"canonicalBaseUrl"\s*:\s*"\/(@[a-zA-Z0-9_.-]+)"/) ||
               txt.match(/"vanityChannelUrl"\s*:\s*"https?:\/\/[^"]+\/(@[a-zA-Z0-9_.-]+)"/);
-            if (hm) handle = hm[1];
+            if (hm && hm[1].toLowerCase() !== '@mrbeast') handle = hm[1];
           }
         }
 
@@ -872,7 +872,7 @@ export class YtStudioBrowserController {
     }
 
     if (onAuthenticatedStudio && !cfg.encryptedYtCookies && this.context) {
-      await this.saveLiveSessionToSettings(username).catch(() => {});
+      await this.saveSessionFromContext(username).catch(() => {});
     }
 
     return {
