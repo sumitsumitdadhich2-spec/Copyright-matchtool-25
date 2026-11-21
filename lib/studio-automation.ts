@@ -56,6 +56,11 @@ import {
 import { maxMovieEndSecInHissa2, shiftMovieTimestampsInHissa2 } from './studio-clip-offset'
 import { fmtTime } from './format'
 import { globalYtStudioController } from './yt-studio-automation'
+import {
+  isAmbiguousOrInternalErrorText,
+  isModelUnavailableOrHighDemandError,
+  isPermissionDeniedErrorText,
+} from './studio-error-classifier'
 import type { ChunkMatch } from './types'
 
 export interface StudioStepLog {
@@ -1648,6 +1653,9 @@ export class StudioBrowserController {
 
   /**
    * FIX 6: Capture at most ONE screenshot per second (or minIntervalMs) across all connected SSE clients.
+   * Uses CDP Page.captureScreenshot first (compositor-direct, ~50ms, never blocks on web fonts/animations)
+   * with fallback to Playwright screenshot({ animations: 'disabled' }), and returns the cached frame
+   * without stalling SSE if a capture is temporarily slow.
    */
   public async getSnapshot(
     captureFresh = true,
@@ -1661,24 +1669,62 @@ export class StudioBrowserController {
       const now = Date.now()
       if (!this.lastScreenshotAt || now - this.lastScreenshotAt >= minIntervalMs) {
         if (!this.screenshotInFlight) {
+          const targetPage = this.page
+          const targetCtx = this.context
           this.screenshotInFlight = (async () => {
             try {
-              if (!this.page || this.page.isClosed()) return
-              const buf = await this.page.screenshot({
-                type: 'jpeg',
-                quality,
-                timeout: 2500,
-              })
-              this.lastScreenshotB64 = buf.toString('base64')
-              this.lastScreenshotAt = Date.now()
+              if (!targetPage || targetPage.isClosed()) return
+              let b64: string | null = null
+              if (targetCtx) {
+                let cdp: Awaited<ReturnType<BrowserContext['newCDPSession']>> | null = null
+                try {
+                  cdp = await targetCtx.newCDPSession(targetPage)
+                  const res = (await Promise.race([
+                    cdp.send('Page.captureScreenshot', {
+                      format: 'jpeg',
+                      quality: Math.max(20, Math.min(85, quality)),
+                      fromSurface: true,
+                    }),
+                    new Promise<never>((_, rej) =>
+                      setTimeout(() => rej(new Error('cdp_screenshot_timeout')), 2000),
+                    ),
+                  ])) as { data?: string }
+                  if (res && typeof res.data === 'string' && res.data.length > 100) {
+                    b64 = res.data
+                  }
+                } catch {
+                  b64 = null
+                } finally {
+                  if (cdp) {
+                    await cdp.detach().catch(() => {})
+                  }
+                }
+              }
+              if (!b64 && !targetPage.isClosed()) {
+                const buf = await targetPage.screenshot({
+                  type: 'jpeg',
+                  quality,
+                  animations: 'disabled',
+                  timeout: 3500,
+                })
+                b64 = buf.toString('base64')
+              }
+              if (b64) {
+                this.lastScreenshotB64 = b64
+                this.lastScreenshotAt = Date.now()
+              }
             } catch {
-              /* ignore screenshot race while navigating */
+              /* ignore screenshot race while navigating; keep lastScreenshotB64 */
             } finally {
               this.screenshotInFlight = null
             }
           })()
         }
-        await this.screenshotInFlight
+        const waitMs = this.lastScreenshotB64 ? 1000 : 2200
+        await Promise.race([
+          this.screenshotInFlight,
+          new Promise<void>((r) => setTimeout(r, waitMs)),
+        ])
       }
     }
 
@@ -5173,11 +5219,33 @@ export class StudioBrowserController {
 
     const extracted = await page.evaluate(
       ({ turnSels, thoughtSels }) => {
+        const isUserTurnElement = (el: Element): boolean => {
+          const role = (
+            el.getAttribute('data-turn-role') ||
+            el.getAttribute('role') ||
+            ''
+          ).toLowerCase()
+          if (role === 'user') return true
+          if (
+            el.matches('.user-turn, [data-turn-role="User"], [data-turn-role="user"]') ||
+            Boolean(
+              el.querySelector(
+                '.user-prompt-container, [data-turn-role="User"], [data-turn-role="user"], button[aria-label="Edit"], [aria-label*="Finish editing"]',
+              ),
+            )
+          ) {
+            return true
+          }
+          return false
+        }
+
         let turns: Element[] = []
         for (const sel of turnSels) {
           if (sel.includes(':has-text(')) continue
           try {
-            const found = Array.from(document.querySelectorAll(sel))
+            const found = Array.from(document.querySelectorAll(sel)).filter(
+              (el) => !isUserTurnElement(el),
+            )
             if (found.length > 0) {
               turns = found
               break
@@ -5268,10 +5336,17 @@ export class StudioBrowserController {
       },
     )
 
+    if (isPromptEchoText(extracted)) {
+      return ''
+    }
     if (isThinkingOnlyText(extracted)) {
       return extracted.trim()
     }
-    return cleanStudioAnswerText(extracted)
+    const cleaned = cleanStudioAnswerText(extracted)
+    if (isPromptEchoText(cleaned)) {
+      return ''
+    }
+    return cleaned
   }
 
   /**
@@ -5836,16 +5911,35 @@ export class StudioBrowserController {
         return null
       }
 
-      // Find the last model turn Locator
+      // Find the last MODEL turn Locator (strictly skipping User prompt turns)
       let lastTurnLoc: ReturnType<Page['locator']> | null = null
       for (const tSel of STUDIO_SELECTORS.modelTurnContainers) {
         try {
           const allTurns = page.locator(tSel)
           const cnt = await allTurns.count()
-          if (cnt > 0) {
-            lastTurnLoc = allTurns.nth(cnt - 1)
-            break
+          for (let idx = cnt - 1; idx >= 0; idx--) {
+            const cand = allTurns.nth(idx)
+            const isUserTurn = await cand
+              .evaluate((el) => {
+                const role = (
+                  el.getAttribute('data-turn-role') ||
+                  el.getAttribute('role') ||
+                  ''
+                ).toLowerCase()
+                if (role === 'user') return true
+                return Boolean(
+                  el.querySelector(
+                    '.user-prompt-container, [data-turn-role="User"], [data-turn-role="user"], button[aria-label="Edit"], [aria-label*="Finish editing"]',
+                  ),
+                )
+              })
+              .catch(() => false)
+            if (!isUserTurn) {
+              lastTurnLoc = cand
+              break
+            }
           }
+          if (lastTurnLoc) break
         } catch {
           // ignore
         }
@@ -6980,6 +7074,7 @@ export class StudioBrowserController {
         let lastIncompleteLogAt = 0
         let doneIndicator: 'COMPLETION_GATE' | 'INCOMPLETE_60S_CAP' | 'RESCUED_ON_LATE_403' | null = null
         let permissionDeniedTriggered = false
+        let modelUnavailableDetected = false
         let internalErrorDetected = false
         let internalErrorContinueTriedInChat = false
         let quotaContinuePartialText: string | null = null
@@ -7167,13 +7262,22 @@ export class StudioBrowserController {
             if (domPermissionDenied || netPermissionDenied) {
               // If HISSA 2 was already generated in the DOM before the late 403 (e.g. background Drive autosave 403),
               // rescue the completed output immediately instead of discarding it and waiting 15s!
-              if (hissa2FirstSeenLogged || /HISSA\s*2\b/i.test(lastCandidateText)) {
+              if (
+                (hissa2FirstSeenLogged || /HISSA\s*2\b/i.test(lastCandidateText)) &&
+                !isPromptEchoText(lastCandidateText)
+              ) {
                 const candidateNow = await this.extractFinalAnswerWithoutThoughts(page).catch(() => '')
                 const bestCandidate =
-                  candidateNow && candidateNow.length >= lastCandidateText.length
+                  candidateNow &&
+                  !isPromptEchoText(candidateNow) &&
+                  candidateNow.length >= lastCandidateText.length
                     ? candidateNow
                     : lastCandidateText
-                if (/HISSA\s*1\b/i.test(bestCandidate) && /HISSA\s*2\b/i.test(bestCandidate)) {
+                if (
+                  !isPromptEchoText(bestCandidate) &&
+                  /HISSA\s*1\b/i.test(bestCandidate) &&
+                  /HISSA\s*2\b/i.test(bestCandidate)
+                ) {
                   lastCandidateText = bestCandidate
                   doneIndicator = 'RESCUED_ON_LATE_403'
                   this.logStep(
@@ -7278,11 +7382,25 @@ export class StudioBrowserController {
             const mm = String(Math.floor(elapsed / 60)).padStart(2, '0')
             const ss = String(elapsed % 60).padStart(2, '0')
 
-            // Error/quota/daily-limit alert banner detection + last model turn error detection BEFORE logging "running"
+            // Error/quota/daily-limit/503-unavailable alert banner detection + last model turn error detection BEFORE logging "running"
             const errBannerText = await page.evaluate(
               ({ sels, turnSels }) => {
+                const isUserTurnElement = (el: Element): boolean => {
+                  const role = (
+                    el.getAttribute('data-turn-role') ||
+                    el.getAttribute('role') ||
+                    ''
+                  ).toLowerCase()
+                  if (role === 'user') return true
+                  return Boolean(
+                    el.querySelector(
+                      '.user-prompt-container, [data-turn-role="User"], [data-turn-role="user"], button[aria-label="Edit"], [aria-label*="Finish editing"]',
+                    ),
+                  )
+                }
+
                 const strictRegex =
-                  /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|rateLimitExceeded|too\s+many\s+requests|try\s+again\s+later|you\s+have\s+exceeded\s+your\s+quota|exceeded\s+your\s+(?:current\s+)?quota|reached\s+(?:the|your)\s+daily\s+limits?|you(?:'ve|\s+have)?\s+reached\s+(?:the|your)\s+daily\s+limits?|daily\s+limits?\s+(?:of\s+tokens|reached|exceeded)|daily\s+quota|please\s+select\s+another\s+model|prohibited_content|blocked\s+due\s+to\s+safety|an\s+internal\s+error\s+has\s+occurred|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i
+                  /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|rateLimitExceeded|too\s+many\s+requests|try\s+again\s+later|you\s+have\s+exceeded\s+your\s+quota|exceeded\s+your\s+(?:current\s+)?quota|reached\s+(?:the|your)\s+daily\s+limits?|you(?:'ve|\s+have)?\s+reached\s+(?:the|your)\s+daily\s+limits?|daily\s+limits?\s+(?:of\s+tokens|reached|exceeded)|daily\s+quota|please\s+select\s+another\s+model|prohibited_content|blocked\s+due\s+to\s+safety|an\s+internal\s+error\s+has\s+occurred|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate|model\s+isn['’]t\s+available\s+right\s+now|model\s+is\s+(?:not|currently)\s+available|please\s+wait\s+a\s+minute\s+and\s+try\s+again|currently\s+experiencing\s+high\s+demand|service\s+is\s+(?:currently\s+)?unavailable|ambiguous\s+request|permission\s+denied)/i
                 for (const s of sels) {
                   if (s.includes(':has-text(')) continue
                   try {
@@ -7307,13 +7425,15 @@ export class StudioBrowserController {
                     // ignore invalid selector
                   }
                 }
-                // Also check if the latest model turn itself contains a daily limit / quota error message
-                const quotaTurnRe =
-                  /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|reached\s+(?:the|your)\s+daily\s+limits?|you(?:'ve|\s+have)?\s+reached\s+(?:the|your)\s+daily\s+limits?|daily\s+limits?\s+(?:of\s+tokens|reached|exceeded)|please\s+select\s+another\s+model)/i
+                // Also check if the latest MODEL turn itself contains a quota / model-unavailable / error message
+                const turnErrRe =
+                  /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|reached\s+(?:the|your)\s+daily\s+limits?|you(?:'ve|\s+have)?\s+reached\s+(?:the|your)\s+daily\s+limits?|daily\s+limits?\s+(?:of\s+tokens|reached|exceeded)|please\s+select\s+another\s+model|model\s+isn['’]t\s+available\s+right\s+now|model\s+is\s+(?:not|currently)\s+available|please\s+wait\s+a\s+minute\s+and\s+try\s+again|currently\s+experiencing\s+high\s+demand|service\s+is\s+(?:currently\s+)?unavailable|permission\s+denied)/i
                 for (const ts of turnSels) {
                   if (ts.includes(':has-text(')) continue
                   try {
-                    const turns = Array.from(document.querySelectorAll(ts))
+                    const turns = Array.from(document.querySelectorAll(ts)).filter(
+                      (el) => !isUserTurnElement(el),
+                    )
                     const lastTurn = turns[turns.length - 1] as HTMLElement | undefined
                     if (
                       lastTurn &&
@@ -7321,7 +7441,7 @@ export class StudioBrowserController {
                       !lastTurn.closest('[data-cmt-handled-error="true"]')
                     ) {
                       const txt = (lastTurn.innerText || lastTurn.textContent || '').trim()
-                      if (txt.length <= 500 && quotaTurnRe.test(txt)) {
+                      if (txt.length <= 500 && turnErrRe.test(txt)) {
                         return txt
                       }
                     }
@@ -7480,11 +7600,38 @@ export class StudioBrowserController {
                   maxInputTokens: effectiveMaxInputTokens,
                 }
               }
-              if (
-                /(an\s+internal\s+error\s+has\s+occurred|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i.test(
-                  errBannerText,
+              if (isPermissionDeniedErrorText(errBannerText, capturedRunError?.status)) {
+                permissionDeniedRetries += 1
+                const prevModel = activeModelName
+                const nextModelInCycle =
+                  (await getEffectiveModel(
+                    chosenModel,
+                    MODEL_FALLBACK_CHAIN,
+                    Date.now(),
+                    this.profileDirName,
+                    [prevModel],
+                  )) || prevModel
+                activeModelName = nextModelInCycle
+                this.activeModelName = activeModelName
+                this.logStep(
+                  'permission denied banner -> model fallback',
+                  `${jobLabel} (retry ${permissionDeniedRetries}) ${prevModel} -> ${activeModelName} (${errBannerText.slice(0, 120)})`,
+                  'warn',
                 )
-              ) {
+                onLog?.(
+                  'warn',
+                  `${jobLabel}: permission denied toast -> switching model ${prevModel} -> ${activeModelName} and retrying`,
+                )
+                await new Promise((r) => setTimeout(r, 12_000))
+                permissionDeniedTriggered = true
+                break
+              }
+              if (isModelUnavailableOrHighDemandError(errBannerText, capturedRunError?.status)) {
+                modelUnavailableDetected = true
+                transientBannerReason = `model_unavailable:${errBannerText.slice(0, 80)}`
+                break
+              }
+              if (isAmbiguousOrInternalErrorText(errBannerText, capturedRunError?.status)) {
                 internalErrorDetected = true
                 transientBannerReason = `internal_error:${errBannerText.slice(0, 80)}`
                 break
@@ -7504,15 +7651,30 @@ export class StudioBrowserController {
                 throw new Error('POLICY_BLOCKED: Gemini prohibited content')
               }
 
-              // Check the last model turn text + network 500/INTERNAL for "An internal error has occurred" / "Internal error encountered"
-              const turnInternalError = await page
+              // Check the last MODEL turn text + network 503/500/404 for model-unavailable / high-demand / internal errors
+              const turnErrCheck = await page
                 .evaluate(
                   ({ turnSels, preCount, preHadErr, stopSeen, elapsedSec }) => {
+                    const isUserTurnElement = (el: Element): boolean => {
+                      const role = (
+                        el.getAttribute('data-turn-role') ||
+                        el.getAttribute('role') ||
+                        ''
+                      ).toLowerCase()
+                      if (role === 'user') return true
+                      return Boolean(
+                        el.querySelector(
+                          '.user-prompt-container, [data-turn-role="User"], [data-turn-role="user"], button[aria-label="Edit"], [aria-label*="Finish editing"]',
+                        ),
+                      )
+                    }
                     let turns: Element[] = []
                     for (const sel of turnSels) {
                       if (sel.includes(':has-text(')) continue
                       try {
-                        const found = Array.from(document.querySelectorAll(sel))
+                        const found = Array.from(document.querySelectorAll(sel)).filter(
+                          (el) => !isUserTurnElement(el),
+                        )
                         if (found.length > 0) {
                           turns = found
                           break
@@ -7527,15 +7689,23 @@ export class StudioBrowserController {
                     const lastTurn = turns[turns.length - 1] as HTMLElement | undefined
                     if (!lastTurn) return null
                     const t = (lastTurn.innerText || lastTurn.textContent || '').trim()
+                    if (t.length > 600) return null
                     if (
-                      /(an\s+internal\s+error\s+has\s+occurred|internal\s+error(?:\s+has\s+occurred|\s+encountered)?|something\s+went\s+wrong|failed\s+to\s+generate\s+content)/i.test(
+                      /(model\s+isn['’]t\s+available\s+right\s+now|model\s+is\s+(?:not|currently)\s+available|please\s+wait\s+a\s+minute\s+and\s+try\s+again|currently\s+experiencing\s+high\s+demand|service\s+is\s+(?:currently\s+)?unavailable|model\s+is\s+overloaded)/i.test(
+                        t,
+                      )
+                    ) {
+                      return { kind: 'unavailable' as const, text: t.slice(0, 160) }
+                    }
+                    if (
+                      /(an\s+internal\s+error\s+has\s+occurred|internal\s+error(?:\s+has\s+occurred|\s+encountered)?|something\s+went\s+wrong|failed\s+to\s+generate\s+content|ambiguous\s+request)/i.test(
                         t,
                       ) &&
                       !/permission\s+denied|caller\s+does\s+not\s+have\s+permission|quota\s+exceeded|daily\s+limits?|please\s+select\s+another\s+model/i.test(
                         t,
                       )
                     ) {
-                      return t.slice(0, 160)
+                      return { kind: 'internal' as const, text: t.slice(0, 160) }
                     }
                     return null
                   },
@@ -7549,23 +7719,47 @@ export class StudioBrowserController {
                 )
                 .catch(() => null)
 
+              const netModelUnavailable =
+                capturedRunError !== null &&
+                !this.isQuotaOrDailyLimitErrorText(capturedRunError.body) &&
+                isModelUnavailableOrHighDemandError(capturedRunError.body, capturedRunError.status)
+
+              if (
+                (!stopVisible && !spinnerVisible && turnErrCheck?.kind === 'unavailable') ||
+                (netModelUnavailable && !stopVisible && !spinnerVisible)
+              ) {
+                const unavailReason = (
+                  turnErrCheck?.text ||
+                  capturedRunError?.body ||
+                  'HTTP 503 UNAVAILABLE'
+                ).slice(0, 140)
+                this.logStep(
+                  'model unavailable (503) -> switch model',
+                  `${jobLabel} [${activeModelName}] (${unavailReason})`,
+                  'warn',
+                )
+                onLog?.(
+                  'warn',
+                  `${jobLabel}: model unavailable / high demand (${unavailReason}) -> switching model`,
+                )
+                modelUnavailableDetected = true
+                transientBannerReason = `model_unavailable:${unavailReason.slice(0, 80)}`
+                break
+              }
+
               const netInternalError =
                 capturedRunError !== null &&
                 !this.isQuotaOrDailyLimitErrorText(capturedRunError.body) &&
-                (capturedRunError.status === 500 ||
-                  capturedRunError.status === 503 ||
-                  /\bINTERNAL\b|internal\s+error(?:\s+has\s+occurred|\s+encountered)?/i.test(
-                    capturedRunError.body,
-                  ))
+                isAmbiguousOrInternalErrorText(capturedRunError.body, capturedRunError.status)
 
               if (
-                (!stopVisible && !spinnerVisible && turnInternalError) ||
+                (!stopVisible && !spinnerVisible && turnErrCheck?.kind === 'internal') ||
                 (netInternalError && !stopVisible && !spinnerVisible)
               ) {
                 const ieReason = (
-                  turnInternalError ||
+                  turnErrCheck?.text ||
                   capturedRunError?.body ||
-                  'HTTP 500 INTERNAL'
+                  `HTTP ${capturedRunError?.status || 500} INTERNAL`
                 ).slice(0, 120)
                 this.logStep(
                   'internal error detected',
@@ -7628,7 +7822,11 @@ export class StudioBrowserController {
                 this.logStep(`running ${mm}:${ss}`, `${jobLabel} [${activeModelName}]`)
               }
 
-              if (!hissa2FirstSeenLogged && /HISSA\s*2\b/i.test(candidateText)) {
+              if (
+                !hissa2FirstSeenLogged &&
+                !isPromptEchoText(candidateText) &&
+                /HISSA\s*2\b/i.test(candidateText)
+              ) {
                 hissa2FirstSeenLogged = true
                 this.logStep(
                   'HISSA 2 first seen',
@@ -7861,7 +8059,8 @@ export class StudioBrowserController {
         // Rescue check: if a late 403 or transient banner fired right after generation started/completed,
         // validate the completed answer first before discarding it!
         if (
-          (permissionDeniedTriggered || internalErrorDetected || transientBannerReason) &&
+          (permissionDeniedTriggered || modelUnavailableDetected || internalErrorDetected || transientBannerReason) &&
+          !isPromptEchoText(lastCandidateText) &&
           (hissa2FirstSeenLogged ||
             /HISSA\s*2\b/i.test(lastCandidateText) ||
             /HISSA\s*1\b/i.test(lastCandidateText) ||
@@ -7879,6 +8078,7 @@ export class StudioBrowserController {
               `${jobLabel}: rescued valid HISSA 1 + HISSA 2 result (${rawAnswer.length} chars) despite late error/403`,
             )
             permissionDeniedTriggered = false
+            modelUnavailableDetected = false
             internalErrorDetected = false
             transientBannerReason = ''
             validationReason = ''
@@ -7889,6 +8089,44 @@ export class StudioBrowserController {
           resetOnPermissionDenied = true
           // Do NOT consume normal MAX_ATTEMPTS; perform hard page reset or browser restart at the top of the loop and redo the full window setup
           attempt -= 1
+          continue
+        }
+
+        // On HTTP 503 / high demand / "Model isn't available right now", immediately switch to the next fallback model
+        // (e.g. Argon <-> Gemini 3.8 Flash) with a brief backoff instead of repeatedly hammering the overloaded model!
+        if (modelUnavailableDetected && !rawAnswer) {
+          await cancelStuckStopButtonIfVisible()
+          await this.saveRotatedSessionFromContext(username)
+          const prevModel = activeModelName
+          const nextFallback =
+            (await getEffectiveModel(
+              chosenModel,
+              MODEL_FALLBACK_CHAIN,
+              Date.now(),
+              this.profileDirName,
+              [prevModel],
+            )) || prevModel
+          activeModelName = nextFallback
+          this.activeModelName = activeModelName
+          activeModelIndex = Math.max(
+            0,
+            MODEL_FALLBACK_CHAIN.findIndex((m) => m.toLowerCase() === activeModelName.toLowerCase()),
+          )
+          this.logStep(
+            '503 high demand -> switched model',
+            `${jobLabel}: ${prevModel} unavailable -> switching to ${activeModelName} (waiting 6s, fresh chat)`,
+            'warn',
+          )
+          onLog?.(
+            'warn',
+            `${jobLabel}: ${prevModel} unavailable/high-demand -> switching to ${activeModelName} in fresh chat`,
+          )
+          await new Promise((r) => setTimeout(r, 6_000))
+          pendingInternalErrorAction = 'hard_refresh_new_page'
+          if (internalErrorRefreshes < MAX_INTERNAL_ERROR_REFRESH + 3) {
+            internalErrorRefreshes += 1
+            attempt -= 1
+          }
           continue
         }
 
@@ -8083,15 +8321,15 @@ export class StudioBrowserController {
           }
         }
 
-        // Requirement 6.5: On internal error, do NOT switch models!
-        // Keep the same model and perform Hard Refresh + New Page -> Browser Restart -> new_chat retry.
+        // On internal error: hard refresh + new page on first retry, then rotate fallback model on repeated failures
+        // so workers never stay stuck hammering a broken/overloaded model endpoint.
         if (internalErrorDetected && !rawAnswer) {
           await cancelStuckStopButtonIfVisible()
 
           if (internalErrorRefreshes < MAX_INTERNAL_ERROR_REFRESH) {
             internalErrorRefreshes += 1
             await this.saveRotatedSessionFromContext(username)
-            if (internalErrorRefreshes <= 2) {
+            if (internalErrorRefreshes === 1) {
               const refreshLog = `internal error -> hard refresh + new page (${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
               this.logStep(
                 refreshLog,
@@ -8101,14 +8339,28 @@ export class StudioBrowserController {
               onLog?.('warn', `${jobLabel}: ${refreshLog} [${activeModelName}]`)
               pendingInternalErrorAction = 'hard_refresh_new_page'
             } else {
-              const restartLog = `internal error -> browser restart + new page (${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
+              const prevModel = activeModelName
+              const nextFallback =
+                (await getEffectiveModel(
+                  chosenModel,
+                  MODEL_FALLBACK_CHAIN,
+                  Date.now(),
+                  this.profileDirName,
+                  [prevModel],
+                )) || prevModel
+              activeModelName = nextFallback
+              this.activeModelName = activeModelName
+              const restartLog = `internal error -> model fallback (${prevModel} -> ${activeModelName}) + ${
+                internalErrorRefreshes >= 3 ? 'browser restart' : 'hard refresh'
+              } (${internalErrorRefreshes}/${MAX_INTERNAL_ERROR_REFRESH})`
               this.logStep(
                 restartLog,
-                `${jobLabel} [${activeModelName}] (persistent profile relaunch)`,
+                `${jobLabel} [${activeModelName}] (${transientBannerReason || 'internal error'})`,
                 'warn',
               )
-              onLog?.('warn', `${jobLabel}: ${restartLog} (persistent profile relaunch)`)
-              pendingInternalErrorAction = 'browser_restart'
+              onLog?.('warn', `${jobLabel}: ${restartLog}`)
+              pendingInternalErrorAction =
+                internalErrorRefreshes >= 3 ? 'browser_restart' : 'hard_refresh_new_page'
             }
             attempt -= 1
             continue

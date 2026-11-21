@@ -128,29 +128,83 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
       ? `?once=1&scanId=${encodeURIComponent(activeScanId)}`
       : '?once=1'
 
+    const mergeLiveSnap = (
+      prev: StudioLiveSnapshot | null,
+      next: StudioLiveSnapshot,
+    ): StudioLiveSnapshot => {
+      const mergedRootShot =
+        next.screenshotBase64 || (next.active && prev?.screenshotBase64 ? prev.screenshotBase64 : null)
+      if (!next.parallelSnapshot?.workers || !prev?.parallelSnapshot?.workers) {
+        return { ...next, screenshotBase64: mergedRootShot }
+      }
+      const prevWorkerShots = new Map<string, { b64: string; at: number | null }>()
+      for (const pw of prev.parallelSnapshot.workers) {
+        if (pw.screenshotBase64) {
+          prevWorkerShots.set(pw.workerId, {
+            b64: pw.screenshotBase64,
+            at: pw.screenshotAt ?? null,
+          })
+        }
+      }
+      const mergedWorkers = next.parallelSnapshot.workers.map((w) => {
+        if (w.screenshotBase64 || (!w.active && !w.browserOpen)) {
+          return w
+        }
+        const prevShot = prevWorkerShots.get(w.workerId)
+        if (prevShot) {
+          return {
+            ...w,
+            screenshotBase64: prevShot.b64,
+            screenshotAt: prevShot.at,
+          }
+        }
+        return w
+      })
+      return {
+        ...next,
+        screenshotBase64: mergedRootShot,
+        parallelSnapshot: {
+          ...next.parallelSnapshot,
+          workers: mergedWorkers,
+        },
+      }
+    }
+
     const pollOnce = async () => {
       try {
         const res = await fetch(`/api/studio/stream${pollQs}`, { cache: 'no-store' })
         if (!res.ok || !mounted) return
         const data = (await res.json()) as StudioLiveSnapshot
-        if (mounted) setSnap(data)
+        if (mounted) setSnap((prev) => mergeLiveSnap(prev, data))
       } catch {}
     }
 
     try {
       es = new EventSource(`/api/studio/stream${qs}`)
       es.onopen = () => {
-        if (mounted) setStreamConnected(true)
+        if (mounted) {
+          setStreamConnected(true)
+          if (fallbackTimer) {
+            clearInterval(fallbackTimer)
+            fallbackTimer = null
+          }
+        }
       }
       es.onmessage = (ev) => {
         if (!mounted) return
         try {
           const data = JSON.parse(ev.data) as StudioLiveSnapshot
-          setSnap(data)
+          setSnap((prev) => mergeLiveSnap(prev, data))
         } catch {}
       }
       es.onerror = () => {
-        if (mounted) setStreamConnected(false)
+        if (mounted) {
+          setStreamConnected(false)
+          if (!fallbackTimer) {
+            void pollOnce()
+            fallbackTimer = setInterval(pollOnce, 2000)
+          }
+        }
       }
     } catch {
       void pollOnce()

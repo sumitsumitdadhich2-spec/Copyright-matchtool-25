@@ -12,6 +12,11 @@ import {
   type StudioThinkingLevel,
 } from './studio-model-state'
 import type { ChunkScanEngine } from './types'
+import {
+  clampStudioConcurrency,
+  DEFAULT_STUDIO_PARALLEL_CONCURRENCY,
+  MAX_STUDIO_PARALLEL_CONCURRENCY,
+} from './studio-error-classifier'
 
 export interface StudioUserConfig {
   chunkScanEngine: ChunkScanEngine
@@ -152,7 +157,7 @@ export function computeEffectiveMaxInputTokens(
   return STUDIO_CONTEXT_WINDOW_TOKENS - out - STUDIO_SAFETY_MARGIN_TOKENS
 }
 
-export const DEFAULT_STUDIO_CONCURRENCY = 10
+export const DEFAULT_STUDIO_CONCURRENCY = DEFAULT_STUDIO_PARALLEL_CONCURRENCY
 export const DEFAULT_STUDIO_UPLOAD_GATE = 2
 export const DEFAULT_YT_UPLOAD_CONCURRENCY = 3
 export const DEFAULT_STUDIO_RUN_STAGGER_SEC = 20
@@ -294,18 +299,13 @@ export async function loadStudioUserConfig(username: string): Promise<StudioUser
       raw?.studioOffsetMode === 'relative' || raw?.studioOffsetMode === 'absolute'
         ? raw.studioOffsetMode
         : 'auto',
-    studioConcurrency: Math.max(
-      1,
-      Math.min(
-        10,
-        Number(raw?.studioConcurrency) > 4
-          ? Math.round(Number(raw?.studioConcurrency))
-          : DEFAULT_STUDIO_CONCURRENCY,
-      ),
-    ),
+    studioConcurrency: clampStudioConcurrency(raw?.studioConcurrency, DEFAULT_STUDIO_CONCURRENCY),
     studioUploadGateConcurrency: Math.max(
       1,
-      Math.min(10, Math.round(Number(raw?.studioUploadGateConcurrency) || DEFAULT_STUDIO_UPLOAD_GATE)),
+      Math.min(
+        MAX_STUDIO_PARALLEL_CONCURRENCY,
+        Math.round(Number(raw?.studioUploadGateConcurrency) || DEFAULT_STUDIO_UPLOAD_GATE),
+      ),
     ),
     studioRunStaggerSec: Math.max(
       5,
@@ -363,10 +363,8 @@ export async function saveStudioUserConfig(
   )
   const nextConcurrency =
     patch.studioConcurrency !== undefined
-      ? Number.isFinite(Number(patch.studioConcurrency))
-        ? Math.max(1, Math.min(10, Math.round(Number(patch.studioConcurrency))))
-        : DEFAULT_STUDIO_CONCURRENCY
-      : current.studioConcurrency
+      ? clampStudioConcurrency(patch.studioConcurrency, DEFAULT_STUDIO_CONCURRENCY)
+      : clampStudioConcurrency(current.studioConcurrency, DEFAULT_STUDIO_CONCURRENCY)
   const next: StudioUserConfig = {
     ...current,
     ...patch,

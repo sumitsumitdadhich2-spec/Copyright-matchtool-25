@@ -261,8 +261,8 @@ export function StudioParallelGrid({
   const [minuteInputSource, setMinuteInputSource] = useState<'auto' | 'manual'>(initialSource)
   const [minuteInput, setMinuteInput] = useState<string>(resolveInitialMinutes)
   const [concurrency, setConcurrency] = useState<number>(() => {
-    const rawC = snap?.concurrency || scanConcurrency || 10
-    return rawC <= 4 ? 10 : Math.min(10, rawC)
+    const rawC = snap?.concurrency || scanConcurrency || 6
+    return Math.max(1, Math.min(6, Math.round(rawC)))
   })
   const [confirmClearStateOpen, setConfirmClearStateOpen] = useState<boolean>(false)
   const [busyAction, setBusyAction] = useState<string | null>(null)
@@ -302,8 +302,8 @@ export function StudioParallelGrid({
       } else {
         setMinuteInput(effectiveFoundMinutes)
       }
-      const rawC = snap?.concurrency || scanConcurrency || 10
-      setConcurrency(rawC <= 4 ? 10 : Math.min(10, rawC))
+      const rawC = snap?.concurrency || scanConcurrency || 6
+      setConcurrency(Math.max(1, Math.min(6, Math.round(rawC))))
       setConfirmClearStateOpen(false)
       setSelectedWorkerId(null)
       setErrorMsg(null)
@@ -952,13 +952,13 @@ export function StudioParallelGrid({
           </div>
 
           <div className="flex items-center gap-2">
-            <label className="text-[11px] font-medium text-zinc-400">Concurrency:</label>
+            <label className="text-[11px] font-medium text-zinc-400">Concurrency (1–6):</label>
             <input
               type="number"
               min={1}
-              max={10}
+              max={6}
               value={concurrency}
-              onChange={(e) => setConcurrency(Math.max(1, Math.min(10, Number(e.target.value) || 10)))}
+              onChange={(e) => setConcurrency(Math.max(1, Math.min(6, Number(e.target.value) || 6)))}
               className="w-16 rounded bg-zinc-950 border border-zinc-800 px-2 py-1 text-xs font-mono text-zinc-200 text-center focus:outline-none focus:border-cyan-500/50"
             />
             <button

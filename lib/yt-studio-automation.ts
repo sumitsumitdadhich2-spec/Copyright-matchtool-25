@@ -14,6 +14,10 @@ import {
   readClipYtSidecar,
   saveClipYtSidecar,
 } from './studio-window-clips';
+import {
+  isYouTubeAuthWallUrl,
+  isYouTubeSelectChannelPromptUrl,
+} from './studio-error-classifier';
 
 export interface YtStepLog {
   ts: number;
@@ -895,6 +899,105 @@ export class YtStudioBrowserController {
     }
   }
 
+  /**
+   * Handle YouTube's post-login "Select a channel" modal (e.g. youtube.com/signin_prompt).
+   * Ticks "Don't ask again" if visible and clicks the preferred locked channel (e.g. SUNSA_EDIT)
+   * or the first channel with subscribers.
+   */
+  private async handleSelectChannelPromptIfPresent(
+    page: Page,
+    preferredHandle?: string | null,
+  ): Promise<boolean> {
+    if (!page || page.isClosed()) return false;
+    const url = page.url();
+    const isPromptUrl = isYouTubeSelectChannelPromptUrl(url);
+    const selected = await page
+      .evaluate(
+        ({ pref, promptUrl }) => {
+          const bodyTxt = (document.body?.innerText || '').toLowerCase();
+          const hasSelectChannelModal =
+            promptUrl ||
+            bodyTxt.includes('select a channel') ||
+            Boolean(document.querySelector('ytd-account-item-renderer, tp-yt-paper-dialog ytd-account-item-renderer'));
+          if (!hasSelectChannelModal) return null;
+
+          // Tick "Don't ask again" checkbox if present and not checked
+          const checkboxCandidates = Array.from(
+            document.querySelectorAll(
+              'tp-yt-paper-checkbox, input[type="checkbox"], [role="checkbox"]',
+            ),
+          ) as HTMLElement[];
+          for (const cb of checkboxCandidates) {
+            const labelTxt = (
+              cb.innerText ||
+              cb.textContent ||
+              cb.parentElement?.innerText ||
+              cb.getAttribute('aria-label') ||
+              ''
+            ).toLowerCase();
+            if (labelTxt.includes("don't ask again") || labelTxt.includes('dont ask again')) {
+              const checked =
+                cb.getAttribute('aria-checked') === 'true' ||
+                cb.hasAttribute('checked') ||
+                (cb instanceof HTMLInputElement && cb.checked);
+              if (!checked) {
+                cb.click();
+              }
+              break;
+            }
+          }
+
+          const items = Array.from(
+            document.querySelectorAll(
+              'ytd-account-item-renderer, tp-yt-paper-item.ytd-account-item-renderer, ytd-account-item-section-renderer ytd-account-item-renderer',
+            ),
+          ) as HTMLElement[];
+          const visibleItems = items.filter((el) => {
+            const r = el.getBoundingClientRect();
+            return r.width > 40 && r.height > 20;
+          });
+          if (visibleItems.length === 0) return null;
+
+          const cleanPref = (pref || '').replace(/^@/, '').trim().toLowerCase();
+          let target: HTMLElement | null = null;
+
+          if (cleanPref) {
+            target =
+              visibleItems.find((el) =>
+                (el.innerText || el.textContent || '').toLowerCase().includes(cleanPref),
+              ) || null;
+          }
+          if (!target) {
+            target =
+              visibleItems.find((el) => {
+                const t = (el.innerText || el.textContent || '').toLowerCase();
+                return t.includes('subscriber') && !t.includes('no subscribers');
+              }) || visibleItems[0];
+          }
+          if (!target) return null;
+          const pickedName = (target.innerText || target.textContent || '')
+            .trim()
+            .split('\n')[0]
+            ?.trim();
+          target.click();
+          return pickedName || 'channel';
+        },
+        { pref: preferredHandle || '', promptUrl: isPromptUrl },
+      )
+      .catch(() => null);
+
+    if (selected) {
+      this.log(
+        'select channel',
+        `Auto-selected YouTube channel "${selected}" on Select-a-channel prompt (Don't ask again ticked)`,
+        'ok',
+      );
+      await page.waitForTimeout(2500);
+      return true;
+    }
+    return false;
+  }
+
   async testLogin(username = 'admin'): Promise<{
     loggedIn: boolean;
     url: string;
@@ -902,6 +1005,7 @@ export class YtStudioBrowserController {
     channelHandle: string | null;
     message: string;
   }> {
+    const cfg = await loadStudioUserConfig(username);
     const page = await this.ensurePage(username);
     await this.applySavedCookiesToContext(username);
 
@@ -920,12 +1024,22 @@ export class YtStudioBrowserController {
         .catch(() => {});
     }
 
-    // Wait up to 12 seconds for passive redirects (CheckCookie / AccountChooser / studio.youtube.com/channel/UC...)
-    const waitDeadline = Date.now() + 12_000;
+    // Wait up to 16 seconds for passive redirects (CheckCookie / AccountChooser / Select-a-channel / studio.youtube.com/channel/UC...)
+    const waitDeadline = Date.now() + 16_000;
     while (Date.now() < waitDeadline) {
       const u = page.url();
       if (u.startsWith('https://studio.youtube.com/channel/UC')) {
         break;
+      }
+      // Handle YouTube's "Select a channel" prompt (youtube.com/signin_prompt) automatically
+      if (isYouTubeSelectChannelPromptUrl(u) || u.includes('youtube.com')) {
+        const pickedChannel = await this.handleSelectChannelPromptIfPresent(
+          page,
+          this.channelHandle || cfg.ytChannelHandle,
+        );
+        if (pickedChannel) {
+          continue;
+        }
       }
       // If on Google AccountChooser with an already signed-in account row (not signed out), click it automatically
       if (u.includes('accounts.google.com') && (u.includes('AccountChooser') || u.includes('signin/v2/identifier') === false)) {
@@ -962,10 +1076,7 @@ export class YtStudioBrowserController {
     }
 
     const url = page.url();
-    const isAuthWall =
-      url.includes('accounts.google.com') ||
-      url.includes('ServiceLogin') ||
-      url.includes('/signin');
+    const isAuthWall = isYouTubeAuthWallUrl(url) || isYouTubeSelectChannelPromptUrl(url);
 
     if (isAuthWall) {
       await saveStudioUserConfig(username, {
@@ -978,7 +1089,9 @@ export class YtStudioBrowserController {
         url,
         channelId: null,
         channelHandle: null,
-        message: 'Not logged in — redirected to Google Sign-In. Use Login Assist or paste fresh cookies.',
+        message: isYouTubeSelectChannelPromptUrl(url)
+          ? 'YouTube asked to Select a channel — click your channel in Login Assist (or click Test Login again).'
+          : 'Not logged in — redirected to Google Sign-In. Use Login Assist or paste fresh cookies.',
       };
     }
 

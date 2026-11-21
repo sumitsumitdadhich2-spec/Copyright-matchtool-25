@@ -63,6 +63,7 @@ import {
   skipScanTicket,
 } from './chunk-scan-coordinator'
 import { computeShortCoverage } from './short-coverage'
+import { clampStudioConcurrency } from './studio-error-classifier'
 import type { ChunkMatch, Scan } from './types'
 
 export type ParallelWindowStatus =
@@ -1150,11 +1151,10 @@ export class StudioParallelManager {
             !this.active &&
             !this.starting
           ) {
-            const effC =
-              scan.studioParallelConcurrency <= 4
-                ? DEFAULT_STUDIO_CONCURRENCY
-                : scan.studioParallelConcurrency
-            this.concurrency = Math.min(MAX_CONCURRENT_MODEL_WINDOWS, effC)
+            this.concurrency = clampStudioConcurrency(
+              scan.studioParallelConcurrency,
+              DEFAULT_STUDIO_CONCURRENCY,
+            )
           }
 
           const foundCompact = extractScanFoundMinutesCompact(scan)
@@ -1245,11 +1245,7 @@ export class StudioParallelManager {
             : raw.minuteInputSource === 'manual'
               ? (raw.minuteInput || '').trim()
               : ''
-        const restoredC = raw.concurrency || DEFAULT_STUDIO_CONCURRENCY
-        this.concurrency = Math.min(
-          MAX_CONCURRENT_MODEL_WINDOWS,
-          restoredC <= 4 ? DEFAULT_STUDIO_CONCURRENCY : restoredC,
-        )
+        this.concurrency = clampStudioConcurrency(raw.concurrency, DEFAULT_STUDIO_CONCURRENCY)
 
         // Strictly accept saved paths ONLY if they belong to data/media/<this.scanId>/
         this.shortLocalPath = this.isPathStrictlyInsideThisScanMediaDir(raw.shortLocalPath)
@@ -1669,10 +1665,7 @@ export class StudioParallelManager {
       this.minuteInput = this.foundMinutesInput
     }
     if (concurrency !== undefined && Number.isFinite(Number(concurrency))) {
-      this.concurrency = Math.max(
-        1,
-        Math.min(MAX_CONCURRENT_MODEL_WINDOWS, Math.round(Number(concurrency))),
-      )
+      this.concurrency = clampStudioConcurrency(concurrency, DEFAULT_STUDIO_CONCURRENCY)
     }
     if (movieDurationSec !== undefined && movieDurationSec > 0) {
       this.movieDurationSec = movieDurationSec
@@ -1940,19 +1933,16 @@ export class StudioParallelManager {
 
       const uploadGateLimit = Math.max(
         1,
-        Math.min(10, Number(cfg.studioUploadGateConcurrency || DEFAULT_STUDIO_UPLOAD_GATE)),
+        Math.min(
+          MAX_CONCURRENT_MODEL_WINDOWS,
+          Number(cfg.studioUploadGateConcurrency || DEFAULT_STUDIO_UPLOAD_GATE),
+        ),
       )
       globalStudioUploadGate.setMaxConcurrent(uploadGateLimit)
 
-      const rawReqConcurrency = Number(
-        params.concurrency ?? this.concurrency ?? cfg.studioConcurrency ?? DEFAULT_STUDIO_CONCURRENCY,
-      )
-      this.concurrency = Math.max(
-        1,
-        Math.min(
-          MAX_CONCURRENT_MODEL_WINDOWS,
-          rawReqConcurrency <= 4 ? DEFAULT_STUDIO_CONCURRENCY : rawReqConcurrency,
-        ),
+      this.concurrency = clampStudioConcurrency(
+        params.concurrency ?? this.concurrency ?? cfg.studioConcurrency,
+        DEFAULT_STUDIO_CONCURRENCY,
       )
 
       this.persistMinuteInputOnScanRecord(
@@ -4747,141 +4737,170 @@ export class StudioParallelManager {
       }
     }
 
-    const workerCards: ParallelWorkerCardSnapshot[] = []
-    const totalCards = Math.max(this.concurrency, slotPool.totalSlots || DEFAULT_STUDIO_CONCURRENCY)
+    const totalCards = Math.min(
+      MAX_CONCURRENT_MODEL_WINDOWS,
+      Math.max(this.concurrency, slotPool.totalSlots || DEFAULT_STUDIO_CONCURRENCY),
+    )
     const chromeStats = readChromeProcsPerWorker(totalCards)
 
-    for (let i = 1; i <= totalCards; i++) {
-      const slot = globalProfileSlotPool.getOrCreateSlot(i)
-      const isLeasedByThisScan = slot.leasedByScanId === this.scanId
-      const isLeasedByOtherScan =
-        slot.leasedByScanId !== null && slot.leasedByScanId !== this.scanId
-      const activeWin =
-        isLeasedByThisScan && slot.leasedWindowId
-          ? this.windows.find((w) => w.id === slot.leasedWindowId) || null
-          : null
-      const wProcs = chromeStats.perWorkerProcs[slot.workerId] || 0
-      const wRssMb = chromeStats.perWorkerRssMb[slot.workerId] || 0
-      const isOpenOrAssist =
-        slot.controller.isBrowserOpen() || slot.controller.isAssistMode()
+    const slotIndices = Array.from({ length: totalCards }, (_, idx) => idx + 1)
+    const workerCards: ParallelWorkerCardSnapshot[] = await Promise.all(
+      slotIndices.map(async (i): Promise<ParallelWorkerCardSnapshot> => {
+        const slot = globalProfileSlotPool.getOrCreateSlot(i)
+        const isLeasedByThisScan = slot.leasedByScanId === this.scanId
+        const isLeasedByOtherScan =
+          slot.leasedByScanId !== null && slot.leasedByScanId !== this.scanId
+        const activeWin =
+          isLeasedByThisScan && slot.leasedWindowId
+            ? this.windows.find((w) => w.id === slot.leasedWindowId) || null
+            : null
+        const wProcs = chromeStats.perWorkerProcs[slot.workerId] || 0
+        const wRssMb = chromeStats.perWorkerRssMb[slot.workerId] || 0
+        const isOpenOrAssist =
+          slot.controller.isBrowserOpen() || slot.controller.isAssistMode()
 
-      if (isLeasedByThisScan) {
-        const snap = await slot.controller.getSnapshot(
-          captureThumbnails && (Boolean(activeWin) || isOpenOrAssist),
-          {
-            quality: isOpenOrAssist && slot.controller.isAssistMode() ? 50 : 38,
-            minIntervalMs: slot.controller.isAssistMode() ? 1000 : 3000,
+        const getTimedSnapshot = async (
+          fresh: boolean,
+          opts: { quality: number; minIntervalMs: number; maxLogs: number },
+        ) => {
+          if (!fresh) {
+            return slot.controller.getSnapshot(false, opts)
+          }
+          const timeoutFallback = new Promise<Awaited<ReturnType<typeof slot.controller.getSnapshot>>>(
+            (resolve) => {
+              setTimeout(() => {
+                void slot.controller.getSnapshot(false, opts).then(resolve)
+              }, 2400)
+            },
+          )
+          return Promise.race([
+            slot.controller.getSnapshot(true, opts),
+            timeoutFallback,
+          ])
+        }
+
+        if (isLeasedByThisScan) {
+          const snap = await getTimedSnapshot(
+            captureThumbnails && (Boolean(activeWin) || isOpenOrAssist),
+            {
+              quality: isOpenOrAssist && slot.controller.isAssistMode() ? 52 : 42,
+              minIntervalMs: slot.controller.isAssistMode() ? 900 : 1800,
+              maxLogs: 200,
+            },
+          )
+          const meta = slot.controller.getActiveRunMeta()
+          return {
+            workerId: slot.workerId,
+            workerIndex: i,
+            profileDirName: slot.profileDirName,
+            active: true,
+            leasedByScanId: this.scanId,
+            leasedByScanLabel: this.scanName,
+            leasedByOtherScan: false,
+            status: activeWin ? activeWin.status : 'SETUP',
+            windowId: activeWin?.id ?? slot.leasedWindowId,
+            windowNumber: activeWin?.windowNumber ?? slot.leasedWindowNumber,
+            windowRange: activeWin
+              ? `${activeWin.startFormatted}–${activeWin.endFormatted}`
+              : slot.leasedWindowRange,
+            runLabel: activeWin?.runLabel ?? null,
+            modelName: activeWin?.modelName || meta.modelName || 'Gemini 3.8 Flash',
+            stage: activeWin ? meta.currentStep : snap.currentStep || 'running',
+            tokens: activeWin ? meta.tokenCount : snap.tokenCount,
+            elapsedSec: activeWin?.elapsedSec ?? snap.elapsedSec,
+            attempt: activeWin?.attempt ?? meta.attempt,
+            maxAttempts: activeWin?.maxAttempts ?? meta.maxAttempts,
+            permRetry: activeWin?.permRetry ?? meta.permRetry,
+            summaryText: activeWin?.summaryText ?? null,
+            screenshotBase64: snap.screenshotBase64,
+            screenshotAt: snap.screenshotAt,
+            assistMode: snap.assistMode,
+            paused: snap.paused,
+            currentUrl: snap.currentUrl,
+            browserOpen: isOpenOrAssist,
+            chromeProcessCount: wProcs,
+            chromeRssMb: wRssMb,
+            logs: slot.controller.getLogs(200),
+          }
+        }
+
+        if (isLeasedByOtherScan) {
+          // Slot is currently leased by a DIFFERENT scan: never leak the other scan's window controls or screenshot as ours
+          return {
+            workerId: slot.workerId,
+            workerIndex: i,
+            profileDirName: slot.profileDirName,
+            active: false,
+            leasedByScanId: slot.leasedByScanId,
+            leasedByScanLabel: slot.leasedByScanLabel,
+            leasedByOtherScan: true,
+            status: 'IDLE',
+            windowId: null,
+            windowNumber: null,
+            windowRange: null,
+            runLabel: null,
+            modelName: 'Gemini 3.8 Flash',
+            stage: `In use by ${slot.leasedByScanLabel || slot.leasedByScanId}`,
+            tokens: null,
+            elapsedSec: 0,
+            attempt: 0,
+            maxAttempts: 5,
+            permRetry: 0,
+            summaryText: `Busy (${slot.leasedByScanLabel || slot.leasedByScanId})`,
+            screenshotBase64: null,
+            screenshotAt: null,
+            assistMode: false,
+            paused: false,
+            currentUrl: '',
+            browserOpen: false,
+            chromeProcessCount: wProcs,
+            chromeRssMb: wRssMb,
+            logs: [],
+          }
+        }
+
+        if (isOpenOrAssist) {
+          // Worker browser is open (e.g. via per-worker Login Assist or Test Login) while IDLE
+          const snap = await getTimedSnapshot(captureThumbnails, {
+            quality: 52,
+            minIntervalMs: 900,
             maxLogs: 200,
-          },
-        )
-        const meta = slot.controller.getActiveRunMeta()
-        workerCards.push({
-          workerId: slot.workerId,
-          workerIndex: i,
-          profileDirName: slot.profileDirName,
-          active: true,
-          leasedByScanId: this.scanId,
-          leasedByScanLabel: this.scanName,
-          leasedByOtherScan: false,
-          status: activeWin ? activeWin.status : 'SETUP',
-          windowId: activeWin?.id ?? slot.leasedWindowId,
-          windowNumber: activeWin?.windowNumber ?? slot.leasedWindowNumber,
-          windowRange: activeWin
-            ? `${activeWin.startFormatted}–${activeWin.endFormatted}`
-            : slot.leasedWindowRange,
-          runLabel: activeWin?.runLabel ?? null,
-          modelName: activeWin?.modelName || meta.modelName || 'Gemini 3.8 Flash',
-          stage: activeWin ? meta.currentStep : snap.currentStep || 'running',
-          tokens: activeWin ? meta.tokenCount : snap.tokenCount,
-          elapsedSec: activeWin?.elapsedSec ?? snap.elapsedSec,
-          attempt: activeWin?.attempt ?? meta.attempt,
-          maxAttempts: activeWin?.maxAttempts ?? meta.maxAttempts,
-          permRetry: activeWin?.permRetry ?? meta.permRetry,
-          summaryText: activeWin?.summaryText ?? null,
-          screenshotBase64: snap.screenshotBase64,
-          screenshotAt: snap.screenshotAt,
-          assistMode: snap.assistMode,
-          paused: snap.paused,
-          currentUrl: snap.currentUrl,
-          browserOpen: isOpenOrAssist,
-          chromeProcessCount: wProcs,
-          chromeRssMb: wRssMb,
-          logs: slot.controller.getLogs(200),
-        })
-      } else if (isLeasedByOtherScan) {
-        // Slot is currently leased by a DIFFERENT scan: never leak the other scan's window controls or screenshot as ours
-        workerCards.push({
-          workerId: slot.workerId,
-          workerIndex: i,
-          profileDirName: slot.profileDirName,
-          active: false,
-          leasedByScanId: slot.leasedByScanId,
-          leasedByScanLabel: slot.leasedByScanLabel,
-          leasedByOtherScan: true,
-          status: 'IDLE',
-          windowId: null,
-          windowNumber: null,
-          windowRange: null,
-          runLabel: null,
-          modelName: 'Gemini 3.8 Flash',
-          stage: `In use by ${slot.leasedByScanLabel || slot.leasedByScanId}`,
-          tokens: null,
-          elapsedSec: 0,
-          attempt: 0,
-          maxAttempts: 5,
-          permRetry: 0,
-          summaryText: `Busy (${slot.leasedByScanLabel || slot.leasedByScanId})`,
-          screenshotBase64: null,
-          screenshotAt: null,
-          assistMode: false,
-          paused: false,
-          currentUrl: '',
-          browserOpen: false,
-          chromeProcessCount: wProcs,
-          chromeRssMb: wRssMb,
-          logs: [],
-        })
-      } else if (isOpenOrAssist) {
-        // Worker browser is open (e.g. via per-worker Login Assist or Test Login) while IDLE
-        const snap = await slot.controller.getSnapshot(captureThumbnails, {
-          quality: 50,
-          minIntervalMs: 1000,
-          maxLogs: 200,
-        })
-        const meta = slot.controller.getActiveRunMeta()
-        workerCards.push({
-          workerId: slot.workerId,
-          workerIndex: i,
-          profileDirName: slot.profileDirName,
-          active: true,
-          leasedByScanId: null,
-          leasedByScanLabel: null,
-          leasedByOtherScan: false,
-          status: 'IDLE',
-          windowId: null,
-          windowNumber: null,
-          windowRange: null,
-          runLabel: null,
-          modelName: meta.modelName || 'Gemini 3.8 Flash',
-          stage: snap.assistMode ? `Login Assist (${snap.currentStep || 'ready'})` : snap.currentStep || 'open',
-          tokens: snap.tokenCount,
-          elapsedSec: snap.elapsedSec,
-          attempt: 0,
-          maxAttempts: 5,
-          permRetry: 0,
-          summaryText: snap.assistMode ? 'Login Assist Active' : null,
-          screenshotBase64: snap.screenshotBase64,
-          screenshotAt: snap.screenshotAt,
-          assistMode: snap.assistMode,
-          paused: snap.paused,
-          currentUrl: snap.currentUrl,
-          browserOpen: true,
-          chromeProcessCount: wProcs,
-          chromeRssMb: wRssMb,
-          logs: slot.controller.getLogs(200),
-        })
-      } else {
-        workerCards.push({
+          })
+          const meta = slot.controller.getActiveRunMeta()
+          return {
+            workerId: slot.workerId,
+            workerIndex: i,
+            profileDirName: slot.profileDirName,
+            active: true,
+            leasedByScanId: null,
+            leasedByScanLabel: null,
+            leasedByOtherScan: false,
+            status: 'IDLE',
+            windowId: null,
+            windowNumber: null,
+            windowRange: null,
+            runLabel: null,
+            modelName: meta.modelName || 'Gemini 3.8 Flash',
+            stage: snap.assistMode ? `Login Assist (${snap.currentStep || 'ready'})` : snap.currentStep || 'open',
+            tokens: snap.tokenCount,
+            elapsedSec: snap.elapsedSec,
+            attempt: 0,
+            maxAttempts: 5,
+            permRetry: 0,
+            summaryText: snap.assistMode ? 'Login Assist Active' : null,
+            screenshotBase64: snap.screenshotBase64,
+            screenshotAt: snap.screenshotAt,
+            assistMode: snap.assistMode,
+            paused: snap.paused,
+            currentUrl: snap.currentUrl,
+            browserOpen: true,
+            chromeProcessCount: wProcs,
+            chromeRssMb: wRssMb,
+            logs: slot.controller.getLogs(200),
+          }
+        }
+
+        return {
           workerId: slot.workerId,
           workerIndex: i,
           profileDirName: slot.profileDirName,
@@ -4911,9 +4930,9 @@ export class StudioParallelManager {
           chromeProcessCount: wProcs,
           chromeRssMb: wRssMb,
           logs: slot.controller.getLogs(200),
-        })
-      }
-    }
+        }
+      }),
+    )
 
     // Also reflect scan.movie360p compression state if active in store
     let liveCompressing360p = this.compressing360p

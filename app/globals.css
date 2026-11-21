@@ -133,8 +133,18 @@
   * {
     @apply border-border outline-ring/50;
   }
+  html {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: clip;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
   body {
     @apply bg-background text-foreground;
+    width: 100%;
+    max-width: 100%;
+    overflow-x: clip;
     /* Subtle amber glow from the top + faint grid, like a scanning console. */
     background-image:
       radial-gradient(ellipse 70% 45% at 50% -10%, oklch(0.76 0.16 65 / 0.08), transparent),

@@ -302,7 +302,7 @@ export function YtStudioPanel({ studio, scanId, scan, onRefresh }: YtStudioPanel
   }, [scanWindows])
 
   return (
-    <div className="rounded-xl border border-rose-500/35 bg-zinc-950/90 p-4 space-y-4 shadow-lg">
+    <div className="w-full min-w-0 overflow-hidden rounded-xl border border-rose-500/35 bg-zinc-950/90 p-3 sm:p-4 space-y-4 shadow-lg">
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 pb-3">
         <div className="flex items-center gap-2">
@@ -723,15 +723,15 @@ export function YtStudioPanel({ studio, scanId, scan, onRefresh }: YtStudioPanel
               </button>
             </div>
 
-            <span className="text-[11px] font-mono text-zinc-400">
+            <span className="min-w-0 max-w-full break-all text-[11px] font-mono text-zinc-400">
               Status: <strong className="text-zinc-200 uppercase">{snap?.status || 'idle'}</strong> ·{' '}
               {snap?.currentStep || 'Idle'}
             </span>
           </div>
 
           {/* Type / Enter / Navigate row */}
-          <div className="flex flex-wrap items-center gap-1.5">
-            <div className="flex items-center gap-1 flex-1 min-w-[200px]">
+          <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+            <div className="flex items-center gap-1 flex-1 min-w-0 basis-[200px]">
               <input
                 type="text"
                 value={typeText}
@@ -770,13 +770,13 @@ export function YtStudioPanel({ studio, scanId, scan, onRefresh }: YtStudioPanel
               </button>
             </div>
 
-            <div className="flex items-center gap-1 flex-1 min-w-[220px]">
+            <div className="flex items-center gap-1 flex-1 min-w-0 basis-[220px]">
               <input
                 type="text"
                 value={navUrl}
                 onChange={(e) => setNavUrl(e.target.value)}
                 placeholder="https://studio.youtube.com"
-                className="flex-1 rounded bg-zinc-900 border border-zinc-800 px-2 py-1 text-xs font-mono text-zinc-300"
+                className="flex-1 min-w-0 rounded bg-zinc-900 border border-zinc-800 px-2 py-1 text-xs font-mono text-zinc-300"
               />
               <button
                 type="button"
@@ -875,12 +875,12 @@ export function YtStudioPanel({ studio, scanId, scan, onRefresh }: YtStudioPanel
           <div className="p-2.5 max-h-72 overflow-y-auto font-mono text-[11px] space-y-1">
             {snap?.logs && snap.logs.length > 0 ? (
               snap.logs.map((l, idx) => (
-                <div key={`${l.ts}-${idx}`} className="flex items-start gap-2">
+                <div key={`${l.ts}-${idx}`} className="flex min-w-0 items-start gap-2">
                   <span className="text-zinc-500 shrink-0">
                     {new Date(l.ts).toTimeString().slice(0, 8)}
                   </span>
                   <span
-                    className={
+                    className={`min-w-0 break-all ${
                       l.status === 'error'
                         ? 'text-red-400'
                         : l.status === 'warn'
@@ -888,7 +888,7 @@ export function YtStudioPanel({ studio, scanId, scan, onRefresh }: YtStudioPanel
                           : l.status === 'ok'
                             ? 'text-emerald-300'
                             : 'text-zinc-300'
-                    }
+                    }`}
                   >
                     [{l.step}] {l.detail}
                   </span>

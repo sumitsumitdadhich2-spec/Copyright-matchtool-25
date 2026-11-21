@@ -241,9 +241,9 @@ export function Dashboard() {
   }
 
   return (
-    <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-4 p-4 md:p-6">
+    <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-4 overflow-x-clip p-3 sm:p-4 md:p-6">
       <TopMilestoneBanner scan={scan} onSelectScan={setScanId} />
-      <header className="alert-in sticky top-3 z-20 flex flex-wrap items-center gap-3 rounded-xl border border-border bg-card/80 p-3 shadow-lg backdrop-blur-md md:px-4">
+      <header className="alert-in sticky top-3 z-20 flex w-full min-w-0 flex-wrap items-center gap-3 rounded-xl border border-border bg-card/80 p-3 shadow-lg backdrop-blur-md md:px-4">
         <div className="flex items-center gap-3">
           <span className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-md shadow-primary/30">
             <ScanSearch className="size-5" aria-hidden />
@@ -580,8 +580,8 @@ export function Dashboard() {
         </p>
       )}
 
-      <div className="grid gap-4 lg:grid-cols-3">
-        <div className="flex flex-col gap-4 lg:col-span-2">
+      <div className="grid w-full min-w-0 gap-4 lg:grid-cols-3">
+        <div className="flex min-w-0 flex-col gap-4 lg:col-span-2">
           <ErrorBoundary fallbackTitle="Scan view error">
             {scan && <LiveActivityBar scan={scan} />}
             {scan && (
@@ -627,7 +627,7 @@ export function Dashboard() {
             {scan && <LogsPanel scan={scan} />}
           </ErrorBoundary>
         </div>
-        <div className="flex flex-col gap-4">
+        <div className="flex min-w-0 flex-col gap-4">
           <ErrorBoundary fallbackTitle="History error">
             <HistoryPanel
               activeId={scanId}

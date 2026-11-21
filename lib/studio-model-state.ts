@@ -9,11 +9,11 @@ export const STUDIO_MODEL_OPTIONS = [
 export type StudioModelOption = (typeof STUDIO_MODEL_OPTIONS)[number]
 
 /**
- * Up to 10 parallel windows can run simultaneously on the same configured model.
- * Model switches only when quota/daily-limit is reached.
+ * Up to 6 parallel windows can run simultaneously on the same configured model.
+ * Keeps Chrome process count and RAM stable while maximizing throughput.
  */
-export const MAX_CONCURRENT_MODEL_WINDOWS = 10
-export const MAX_PARALLEL_CONCURRENCY = 10
+export const MAX_CONCURRENT_MODEL_WINDOWS = 6
+export const MAX_PARALLEL_CONCURRENCY = 6
 
 export const DEFAULT_STUDIO_MODEL_NAME: StudioModelOption = 'Argon'
 
