@@ -454,6 +454,55 @@ function parseNetscapeCookiesTxt(text: string): Array<Record<string, unknown>> {
   return out
 }
 
+/**
+ * Last resort for any cookie export whose JSON is damaged: cut the text into { ... } blocks and
+ * read name / value / domain / path / expiry / flags from each block with tolerant regexes.
+ */
+function extractCookieObjectsLoosely(text: string): Array<Record<string, unknown>> {
+  const norm = text.replace(/[\u201C\u201D\u201E\u201F\u2033]/g, '"').replace(/[\u2018\u2019]/g, "'")
+  const field = (block: string, key: string): string | null => {
+    const re = new RegExp(`["']?\\b${key}\\b["']?\\s*[:=]\\s*(?:"((?:[^"\\\\]|\\\\.)*)"|'([^']*)'|([^,}\\s]+))`, 'i')
+    const m = block.match(re)
+    if (!m) return null
+    return (m[1] ?? m[2] ?? m[3] ?? '').replace(/\\"/g, '"')
+  }
+  const out: Array<Record<string, unknown>> = []
+  for (const block of norm.split('}')) {
+    const name = field(block, 'name')
+    const domain = field(block, 'domain')
+    const value = field(block, 'value')
+    // A block without a value is a cookie cut off by the copy/paste: skip it
+    if (!name || !domain || value === null) continue
+    const exp = Number(field(block, 'expirationDate') ?? field(block, 'expires') ?? '')
+    out.push({
+      name,
+      value,
+      domain,
+      path: field(block, 'path') || '/',
+      ...(Number.isFinite(exp) && exp > 0 ? { expirationDate: exp } : {}),
+      httpOnly: /^true$/i.test(field(block, 'httpOnly') || ''),
+      secure: !/^false$/i.test(field(block, 'secure') || 'true'),
+      ...(field(block, 'sameSite') ? { sameSite: field(block, 'sameSite') } : {}),
+    })
+  }
+  return out
+}
+
+/** Cookie-Editor "Header String" export: "NAME=value; NAME2=value2" (Google cookies -> .google.com). */
+function parseCookieHeaderString(text: string): Array<Record<string, unknown>> {
+  const t = text.replace(/^cookie:\s*/i, '').trim()
+  if (!t || /[{}\[\]\n]/.test(t) || !t.includes('=')) return []
+  return t
+    .split(';')
+    .map((part) => part.trim())
+    .filter((part) => part.includes('='))
+    .map((part) => {
+      const idx = part.indexOf('=')
+      return { name: part.slice(0, idx).trim(), value: part.slice(idx + 1).trim(), domain: '.google.com', path: '/' }
+    })
+    .filter((c) => c.name)
+}
+
 /** "line 115, col 26" + the text around it, so the user can see what broke. */
 function describeJsonErrorPosition(text: string, err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err)
@@ -474,18 +523,33 @@ export function parseCookieInputToPlaywright(rawJson: string): PlaywrightCookie[
   try {
     parsed = JSON.parse(trimmed)
   } catch (firstErr) {
-    try {
-      parsed = JSON.parse(repairCookieJsonText(trimmed))
-    } catch {
-      const netscape = parseNetscapeCookiesTxt(trimmed)
-      if (netscape.length > 0) {
-        parsed = netscape
-      } else {
-        throw new Error(
-          `Invalid JSON in Google cookies field: ${describeJsonErrorPosition(trimmed, firstErr)}. ` +
-            'Export again from Cookie-Editor (Export -> JSON) on aistudio.google.com and paste the whole text without editing it.',
-        )
+    const fallbacks: Array<() => unknown> = [
+      () => JSON.parse(repairCookieJsonText(trimmed)),
+      () => parseNetscapeCookiesTxt(trimmed),
+      () => extractCookieObjectsLoosely(trimmed),
+      () => parseCookieHeaderString(trimmed),
+    ]
+    for (const tryParse of fallbacks) {
+      try {
+        const res = tryParse()
+        const list = Array.isArray(res)
+          ? res
+          : res && typeof res === 'object' && Array.isArray((res as { cookies?: unknown[] }).cookies)
+            ? (res as { cookies: unknown[] }).cookies
+            : null
+        if (list && list.length > 0) {
+          parsed = res
+          break
+        }
+      } catch {
+        /* try the next format */
       }
+    }
+    if (parsed === undefined) {
+      throw new Error(
+        `Could not read any cookies: ${describeJsonErrorPosition(trimmed, firstErr)}. ` +
+          'Export again from Cookie-Editor (Export -> JSON) on aistudio.google.com and paste the whole text.',
+      )
     }
   }
 
@@ -538,7 +602,10 @@ export function parseCookieInputToPlaywright(rawJson: string): PlaywrightCookie[
   if (out.length === 0) {
     throw new Error('No valid Google cookies found in the provided JSON.')
   }
-  return out
+  // Same cookie pasted twice: keep the last copy
+  const byKey = new Map<string, PlaywrightCookie>()
+  for (const c of out) byKey.set(`${c.name}|${c.domain}|${c.path}`, c)
+  return [...byKey.values()]
 }
 
 /** Read one account's record (slot 1 maps onto the original top-level fields). */
