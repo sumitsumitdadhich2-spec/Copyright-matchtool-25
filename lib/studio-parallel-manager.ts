@@ -45,8 +45,10 @@ import {
   DEFAULT_STUDIO_CONCURRENCY,
   DEFAULT_STUDIO_MINUTE_INPUT,
   DEFAULT_STUDIO_UPLOAD_GATE,
+  allowedModelsForAccountMode,
   getActiveGoogleAccountSlots,
   getGoogleAccountEmail,
+  getGoogleAccountRunSettings,
   loadStudioUserConfig,
   type GoogleAccountSlot,
 } from './studio-settings'
@@ -68,6 +70,12 @@ import {
  *   3 accounts: W01 A1, W02 A2, W03 A3, W04 A1, W05 A2, W06 A3   (2 + 2 + 2)
  * An account whose every model's daily quota is used up is skipped (unless all are).
  */
+/** Every model this account may use (its fixed model, or all in Auto) has no quota left today. */
+async function isGoogleAccountOutOfQuota(username: string, acct: GoogleAccountSlot): Promise<boolean> {
+  const run = await getGoogleAccountRunSettings(username, acct).catch(() => null)
+  return isAccountFullyExhausted(acct, Date.now(), allowedModelsForAccountMode(run?.modelMode ?? 'auto'))
+}
+
 export async function resolveGoogleAccountForWorker(
   username: string,
   slotIndex: number,
@@ -76,7 +84,7 @@ export async function resolveGoogleAccountForWorker(
   const skippedExhausted: GoogleAccountSlot[] = []
   const usable: GoogleAccountSlot[] = []
   for (const acct of activeSlots) {
-    if (await isAccountFullyExhausted(acct)) skippedExhausted.push(acct)
+    if (await isGoogleAccountOutOfQuota(username, acct)) skippedExhausted.push(acct)
     else usable.push(acct)
   }
   const pool = usable.length > 0 ? usable : activeSlots
@@ -3686,7 +3694,7 @@ export class StudioParallelManager {
           )
           let otherUsable: GoogleAccountSlot | null = null
           for (const a of activeAccts) {
-            if (a !== usedAcct && !(await isAccountFullyExhausted(a))) {
+            if (a !== usedAcct && !(await isGoogleAccountOutOfQuota(this.username || 'admin', a))) {
               otherUsable = a
               break
             }
@@ -3894,12 +3902,18 @@ export class StudioParallelManager {
     }
 
     try {
-      // Takes a model slot for this worker: max windows per model (e.g. Argon 2 at once),
-      // otherwise the next free allowed model (3.8 Flash -> Hydrogen -> Neon -> 3.6 Flash).
+      // Takes a model slot for this worker: max windows per model per account (e.g. Argon 2 at once).
+      // Account set to one fixed model -> only that model; Auto -> next free model
+      // (3.8 Flash -> Hydrogen -> Neon -> 3.6 Flash).
+      const acctRun = await getGoogleAccountRunSettings(
+        this.username || 'admin',
+        slot.controller.getGoogleAccountSlot(),
+      ).catch(() => null)
+      const fixedModel = acctRun && acctRun.modelMode !== 'auto' ? acctRun.modelMode : null
       const effectiveWinModel =
         (await getEffectiveModel(
-          cfg.studioModelName,
-          undefined,
+          fixedModel || cfg.studioModelName,
+          fixedModel ? [fixedModel] : undefined,
           Date.now(),
           slot.profileDirName,
           undefined,
@@ -3981,7 +3995,7 @@ export class StudioParallelManager {
         jobLabel,
         windowNumber: win.windowNumber,
         modelName: effectiveWinModel,
-        thinkingLevel: cfg.studioThinkingLevel,
+        // Thinking level comes from the worker's Google account settings (default Medium)
         maxOutputTokens: resolveEffectiveMaxOutputTokensForModel(
           effectiveWinModel,
           cfg.studioMaxOutputTokens,

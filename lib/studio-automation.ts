@@ -14,6 +14,8 @@ import {
   DEFAULT_STUDIO_UPLOAD_GATE,
   DEFAULT_STUDIO_RUN_STAGGER_SEC,
   computeEffectiveMaxInputTokens,
+  getGoogleAccountRunSettings,
+  resolveAccountThinkingLevel,
   getSettingsCookieFingerprint,
   loadDecryptedPlaywrightCookies,
   loadStudioUserConfig,
@@ -29,7 +31,9 @@ import {
   gemini4NamedModelIn,
   gemini4SlugFor,
   describeStudioModelLeases,
+  getActiveLeasedModelsByOtherHolders,
   getEffectiveModel,
+  maxWindowsForModel,
   setStudioHolderAccount,
   hasFreeModelSlot,
   loadStudioModelQuotaState,
@@ -866,6 +870,8 @@ export class StudioBrowserController {
 
   /** Google account (Settings slot 1..3) whose cookies / quota / cooldown this browser uses. */
   private googleAccountSlot: 1 | 2 | 3 = 1
+  /** Set while a window job runs on an account fixed to one model: the picker may use only these. */
+  private allowedModelsForJob: string[] | null = null
 
   public getGoogleAccountSlot(): 1 | 2 | 3 {
     return this.googleAccountSlot
@@ -3427,7 +3433,12 @@ export class StudioBrowserController {
         idx === 0 ||
         ((nonExhaustedCandidates.length === 0 || !isExhaustedNow(m)) &&
           // Never fall back onto a model that already runs in its max number of windows
-          hasFreeModelSlot(m, this.profileDirName)),
+          hasFreeModelSlot(m, this.profileDirName) &&
+          // Account fixed to one model: no other model at all
+          (!this.allowedModelsForJob ||
+            this.allowedModelsForJob.some(
+              (a) => canonicalizeStudioModelName(a) === canonicalizeStudioModelName(m),
+            ))),
     )
 
     for (let i = 0; i < candidatesToTry.length; i++) {
@@ -3459,6 +3470,17 @@ export class StudioBrowserController {
     const actualSelectedCanonical = fallbackCard
       ? canonicalizeStudioModelName(fallbackCard)
       : canonicalizeStudioModelName(targetModelName)
+    if (
+      this.allowedModelsForJob &&
+      !this.allowedModelsForJob.some(
+        (a) => canonicalizeStudioModelName(a) === actualSelectedCanonical,
+      )
+    ) {
+      // Account is fixed to one model and AI Studio would run another one: retry instead
+      throw new Error(
+        `Model "${targetModelName}" could not be selected in AI Studio (this account is set to use only ${this.allowedModelsForJob.join(', ')}; card shows "${fallbackCard || 'none'}")`,
+      )
+    }
     updateExclusiveStudioModelLease(this.profileDirName, actualSelectedCanonical)
     return {
       selectedModelName: actualSelectedCanonical,
@@ -6471,8 +6493,12 @@ export class StudioBrowserController {
         undefined)
 
     const userCfg = await loadStudioUserConfig(username)
+    // Per Google account settings (Settings -> account box): fixed model or Auto, and thinking
+    // (Default = Medium). These win over the global settings.
+    const acctRun = await getGoogleAccountRunSettings(username, this.googleAccountSlot)
+    const accountFixedModel = acctRun.modelMode !== 'auto' ? acctRun.modelMode : null
     const effectiveThinkingLevel = normalizeStudioThinkingLevel(
-      params.thinkingLevel ?? userCfg.studioThinkingLevel,
+      resolveAccountThinkingLevel(acctRun.thinking),
     )
     const rawEffectiveMaxInputTokens = computeEffectiveMaxInputTokens(
       maxOutputTokens,
@@ -6507,9 +6533,21 @@ export class StudioBrowserController {
     // Allowed models: Argon, Gemini 3.8 Flash, Hydrogen, Neon, Gemini 3.6 Flash (never Carbon / 3.7).
     // Max windows per model (STUDIO_MODEL_MAX_WINDOWS, e.g. Argon 2) via this.profileDirName lease.
     const chosenModel = canonicalizeStudioModelName(
-      modelName || userCfg.studioModelName || DEFAULT_STUDIO_MODEL_NAME,
+      accountFixedModel || modelName || userCfg.studioModelName || DEFAULT_STUDIO_MODEL_NAME,
     )
-    const MODEL_FALLBACK_CHAIN = buildStudioFallbackCycle(chosenModel)
+    // Fixed model account -> the chain is just that model: every fallback (403 / 503 / quota /
+    // internal error) stays on it, and the model picker never falls back to another model.
+    const MODEL_FALLBACK_CHAIN = accountFixedModel
+      ? [chosenModel]
+      : buildStudioFallbackCycle(chosenModel)
+    this.allowedModelsForJob = accountFixedModel ? [chosenModel] : null
+    this.logStep(
+      'account settings',
+      `${jobLabel}: Account ${this.googleAccountSlot} -> model ${
+        accountFixedModel ? `ONLY ${accountFixedModel}` : `Auto (start ${chosenModel})`
+      } · thinking ${effectiveThinkingLevel}${acctRun.thinking === 'default' ? ' (default)' : ''}`,
+      'info',
+    )
     const formatQuotaResetTime = async (): Promise<string> => {
       const qState = await loadStudioModelQuotaState(Date.now(), this.googleAccountSlot)
       const timestamps = Object.values(qState.exhausted).filter((t) => Number.isFinite(t) && t > 0)
@@ -6544,7 +6582,7 @@ export class StudioBrowserController {
     }
     if (!initialEffectiveModel) {
       const resetTimeStr = await formatQuotaResetTime()
-      throw new Error(`NEEDS_ATTENTION: saare models ka quota khatam (Account ${this.googleAccountSlot}), reset ${resetTimeStr} par`)
+      throw new Error(`NEEDS_ATTENTION: ${accountFixedModel ? `${accountFixedModel} ka quota khatam (Account ${this.googleAccountSlot} par sirf ${accountFixedModel} set hai)` : `saare models ka quota khatam (Account ${this.googleAccountSlot})`}, reset ${resetTimeStr} par`)
     }
 
     let activeModelName = initialEffectiveModel
@@ -7365,6 +7403,50 @@ export class StudioBrowserController {
             ? Math.max(20, userCfg.studioRunStaggerSec || DEFAULT_STUDIO_RUN_STAGGER_SEC)
             : userCfg.studioRunStaggerSec ?? DEFAULT_STUDIO_RUN_STAGGER_SEC
           globalStudioRunStaggerGate.setStaggerMs(staggerSec * 1000)
+          // Model limit guard (per account): never press Run on a model that already runs in its
+          // max number of windows on this account (e.g. a 3rd Argon). Switch to a free allowed
+          // model first; an account fixed to one model waits for its slot instead.
+          {
+            const canonActive = canonicalizeStudioModelName(activeModelName)
+            const othersOnModel =
+              getActiveLeasedModelsByOtherHolders(this.profileDirName).get(canonActive) || 0
+            if (othersOnModel >= maxWindowsForModel(canonActive)) {
+              const guardMsg = `${jobLabel}: ${canonActive} already in ${othersOnModel} window(s) on Account ${this.googleAccountSlot} (limit ${maxWindowsForModel(canonActive)}) -> choosing another model before Run`
+              this.logStep('model limit guard', guardMsg, 'warn')
+              onLog?.('warn', guardMsg)
+              const replacement = await getEffectiveModel(
+                chosenModel,
+                MODEL_FALLBACK_CHAIN,
+                Date.now(),
+                this.profileDirName,
+                [canonActive],
+                {
+                  isAborted: () => this.isStopping(scope),
+                  onWaitForSlot: (msg) => {
+                    this.logStep('waiting for model slot', `${jobLabel}: ${msg}`, 'info')
+                    onLog?.('info', `${jobLabel}: ${msg}`)
+                  },
+                },
+              )
+              if (replacement && replacement !== canonActive) {
+                const switched = await this.selectModelInRunSettings(page, replacement, MODEL_FALLBACK_CHAIN)
+                activeModelName = switched.selectedModelName || replacement
+                this.activeModelName = activeModelName
+                if (/\bargon\b/i.test(activeModelName)) {
+                  await this.setOutputLengthInRunSettings(
+                    page,
+                    resolveEffectiveMaxOutputTokensForModel(activeModelName),
+                    activeModelName,
+                  )
+                }
+                this.logStep(
+                  'model limit guard',
+                  `${jobLabel}: switched to ${activeModelName} (Account ${this.googleAccountSlot}: ${describeStudioModelLeases(Date.now(), this.googleAccountSlot)})`,
+                  'info',
+                )
+              }
+            }
+          }
           // Keep this window's model slot fresh (stale leases expire after 30 min)
           updateExclusiveStudioModelLease(this.profileDirName, activeModelName)
           await globalStudioRunStaggerGate.acquireRunSlot(jobLabel, {
@@ -7556,6 +7638,7 @@ export class StudioBrowserController {
                   [prevModel],
                 )) || prevModel
               activeModelName = nextModelInCycle
+              this.activeModelName = activeModelName
               activeModelIndex = Math.max(
                 0,
                 MODEL_FALLBACK_CHAIN.findIndex((m) => m.toLowerCase() === activeModelName.toLowerCase()),
@@ -7729,7 +7812,7 @@ export class StudioBrowserController {
               )
               if (!nextAvailableModel) {
                 const resetTimeStr = await formatQuotaResetTime()
-                const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam (Account ${this.googleAccountSlot}), reset ${resetTimeStr} par`
+                const allExhaustedMsg = `NEEDS_ATTENTION: ${accountFixedModel ? `${accountFixedModel} ka quota khatam (Account ${this.googleAccountSlot} par sirf ${accountFixedModel} set hai)` : `saare models ka quota khatam (Account ${this.googleAccountSlot})`}, reset ${resetTimeStr} par`
                 this.logStep('all models quota exhausted', allExhaustedMsg, 'error')
                 onLog?.('error', `${allExhaustedMsg} (${jobLabel})`)
                 throw new Error(allExhaustedMsg)
@@ -7765,7 +7848,7 @@ export class StudioBrowserController {
                 )
                 if (!nextAvailableModel) {
                   const resetTimeStr = await formatQuotaResetTime()
-                  const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam (Account ${this.googleAccountSlot}), reset ${resetTimeStr} par`
+                  const allExhaustedMsg = `NEEDS_ATTENTION: ${accountFixedModel ? `${accountFixedModel} ka quota khatam (Account ${this.googleAccountSlot} par sirf ${accountFixedModel} set hai)` : `saare models ka quota khatam (Account ${this.googleAccountSlot})`}, reset ${resetTimeStr} par`
                   this.logStep('all models quota exhausted', allExhaustedMsg, 'error')
                   onLog?.('error', `${allExhaustedMsg} (${jobLabel})`)
                   throw new Error(allExhaustedMsg)
@@ -8432,7 +8515,7 @@ export class StudioBrowserController {
                 )
                 if (!nextMod) {
                   const resetTimeStr = await formatQuotaResetTime()
-                  const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam (Account ${this.googleAccountSlot}), reset ${resetTimeStr} par`
+                  const allExhaustedMsg = `NEEDS_ATTENTION: ${accountFixedModel ? `${accountFixedModel} ka quota khatam (Account ${this.googleAccountSlot} par sirf ${accountFixedModel} set hai)` : `saare models ka quota khatam (Account ${this.googleAccountSlot})`}, reset ${resetTimeStr} par`
                   this.logStep('all models quota exhausted', allExhaustedMsg, 'error')
                   onLog?.('error', `${allExhaustedMsg} (${jobLabel})`)
                   throw new Error(allExhaustedMsg)
@@ -8546,7 +8629,7 @@ export class StudioBrowserController {
                     )
                     if (!nextMod) {
                       const resetTimeStr = await formatQuotaResetTime()
-                      const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam (Account ${this.googleAccountSlot}), reset ${resetTimeStr} par`
+                      const allExhaustedMsg = `NEEDS_ATTENTION: ${accountFixedModel ? `${accountFixedModel} ka quota khatam (Account ${this.googleAccountSlot} par sirf ${accountFixedModel} set hai)` : `saare models ka quota khatam (Account ${this.googleAccountSlot})`}, reset ${resetTimeStr} par`
                       this.logStep('all models quota exhausted', allExhaustedMsg, 'error')
                       onLog?.('error', `${allExhaustedMsg} (${jobLabel})`)
                       throw new Error(allExhaustedMsg)
@@ -8983,6 +9066,7 @@ export class StudioBrowserController {
     throw new Error(`Studio job ${jobLabel} failed after ${MAX_ATTEMPTS} attempts`)
     } finally {
       releaseExclusiveStudioModel(this.profileDirName)
+      this.allowedModelsForJob = null
     }
   }
 

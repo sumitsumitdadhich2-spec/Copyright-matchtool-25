@@ -23,7 +23,10 @@ import { getKeyStorageInfo, deleteAllFilesOnKey } from '@/lib/gemini'
 import {
   clearUserGoogleCookies,
   getPublicStudioSettings,
+  normalizeAccountModelMode,
+  normalizeAccountThinking,
   normalizeGoogleAccountSlot,
+  saveGoogleAccountRunSettings,
   saveStudioUserConfig,
   saveUserGoogleCookies,
 } from '@/lib/studio-settings'
@@ -236,6 +239,15 @@ export async function POST(req: Request) {
   const purgeForAccount = async () => {
     if (accountSlot === 1) await globalProfileSlotPool.purgeAllWorkerProfilesAndContexts()
     else await globalProfileSlotPool.purgeProfilesForAccount(accountSlot)
+  }
+  // Per-account run settings: { googleAccountRunSettings: { slot, modelMode?, thinking? } }
+  if (body.googleAccountRunSettings && typeof body.googleAccountRunSettings === 'object') {
+    const rs = body.googleAccountRunSettings as Record<string, unknown>
+    await saveGoogleAccountRunSettings(username, normalizeGoogleAccountSlot(rs.slot), {
+      ...(rs.modelMode !== undefined ? { modelMode: normalizeAccountModelMode(rs.modelMode) } : {}),
+      ...(rs.thinking !== undefined ? { thinking: normalizeAccountThinking(rs.thinking) } : {}),
+    })
+    return NextResponse.json({ ok: true, studio: await getPublicStudioSettings(username) })
   }
   if (body.clearGoogleCookies === true) {
     await clearUserGoogleCookies(username, accountSlot)

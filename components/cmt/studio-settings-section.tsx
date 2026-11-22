@@ -338,7 +338,7 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
             <label className="space-y-1 text-xs">
-              <span className="text-muted-foreground">Model (1 window = 1 model)</span>
+              <span className="text-muted-foreground">Start model for accounts set to Auto</span>
               <select
                 value={
                   STUDIO_MODEL_DROPDOWN_OPTIONS.includes(
@@ -366,18 +366,12 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
               </select>
             </label>
 
-            <label className="space-y-1 text-xs">
-              <span className="text-muted-foreground">Thinking level (default High)</span>
-              <select
-                value={thinkingLevel}
-                onChange={(e) => setThinkingLevel(e.target.value as StudioThinkingLevel)}
-                className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring"
-              >
-                <option value="high">High</option>
-                <option value="medium">Medium</option>
-                <option value="low">Low</option>
-              </select>
-            </label>
+            <div className="space-y-1 text-xs">
+              <span className="text-muted-foreground">Thinking level</span>
+              <div className="rounded-md border border-input bg-background/50 px-2.5 py-1.5 text-[11px] text-muted-foreground">
+                Set per Google account (Default = Medium) in the account boxes.
+              </div>
+            </div>
 
             {studio?.studioExhaustedModels &&
               Object.keys(studio.studioExhaustedModels).length > 0 && (
@@ -558,7 +552,7 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
 
           <div className="flex items-center justify-between pt-1">
             <span className="text-[11px] text-muted-foreground">
-              Temp = 0 · Thinking = {thinkingLevel === 'medium' ? 'Medium' : thinkingLevel === 'low' ? 'Low' : 'High'} · Safety = OFF · 24 FPS
+              Temp = 0 · Thinking = per account (default Medium) · Argon output = 1000000 · Safety = OFF · 24 FPS
             </span>
             <button
               type="button"
@@ -582,8 +576,31 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
 
 type GoogleAccountView = Pick<
   PublicGoogleAccount,
-  'slot' | 'hasCookies' | 'cookieCount' | 'lastLoginEmail' | 'lastLoginStatus' | 'lastLoginTestedAt' | 'exhaustedModels'
+  | 'slot'
+  | 'modelMode'
+  | 'thinking'
+  | 'hasCookies'
+  | 'cookieCount'
+  | 'lastLoginEmail'
+  | 'lastLoginStatus'
+  | 'lastLoginTestedAt'
+  | 'exhaustedModels'
 >
+
+const ACCOUNT_MODEL_MODE_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: 'auto', label: 'Auto (default: fallback across models)' },
+  { value: 'Argon', label: 'Only Argon' },
+  { value: 'Gemini 3.8 Flash', label: 'Only Gemini 3.8 Flash' },
+  { value: 'Hydrogen', label: 'Only Hydrogen' },
+  { value: 'Neon', label: 'Only Neon' },
+  { value: 'Gemini 3.6 Flash', label: 'Only Gemini 3.6 Flash' },
+]
+
+function accountModeLabel(a: GoogleAccountView): string {
+  const model = a.modelMode === 'auto' ? 'Auto' : `Only ${a.modelMode}`
+  const thinking = a.thinking === 'default' ? 'Medium' : a.thinking.charAt(0).toUpperCase() + a.thinking.slice(1)
+  return `${model} · Thinking ${thinking}`
+}
 
 /** Same round-robin as resolveGoogleAccountForWorker() on the server (for the preview only). */
 function previewAccountSplit(accounts: GoogleAccountView[], workers: number): string[] {
@@ -598,7 +615,10 @@ function previewAccountSplit(accounts: GoogleAccountView[], workers: number): st
     for (let i = 1; i <= workers; i++) {
       if (active[(i - 1) % active.length] === acct) ws.push(`W${String(i).padStart(2, '0')}`)
     }
-    lines.push(`Account ${acct}: ${ws.length > 0 ? ws.join(', ') : '—'} (${ws.length})`)
+    const view = accounts.find((a) => a.slot === acct)
+    lines.push(
+      `Account ${acct}: ${ws.length > 0 ? ws.join(', ') : '—'} (${ws.length})${view ? ` · ${accountModeLabel(view)}` : ''}`,
+    )
   }
   return lines
 }
@@ -616,6 +636,8 @@ function GoogleAccountsPanel({
       : [
           {
             slot: 1,
+            modelMode: 'auto' as const,
+            thinking: 'default' as const,
             hasCookies: Boolean(studio?.hasCookies),
             cookieCount: studio?.cookieCount ?? 0,
             lastLoginEmail: studio?.lastLoginEmail ?? null,
@@ -625,6 +647,8 @@ function GoogleAccountsPanel({
           },
           ...([2, 3] as const).map((slot) => ({
             slot,
+            modelMode: 'auto' as const,
+            thinking: 'default' as const,
             hasCookies: false,
             cookieCount: 0,
             lastLoginEmail: null,
@@ -645,7 +669,8 @@ function GoogleAccountsPanel({
       <p className="text-[11px] text-muted-foreground leading-relaxed">
         Account 1 is required; 2 and 3 are optional. Workers are split evenly across the accounts that
         have cookies (an account whose Test login fails is skipped). Each account has its own model
-        limits, quota and cooldown.
+        setting, thinking level, quota and cooldown, and never runs more than 2 windows on the same
+        model at once.
       </p>
       <div className="rounded-md border border-sky-500/30 bg-sky-500/10 px-2.5 py-1.5 font-mono text-[11px] text-sky-200">
         <div className="text-sky-300/80">Split for {workers} parallel windows:</div>
@@ -672,6 +697,26 @@ function GoogleAccountCard({
   const [testing, setTesting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [testResult, setTestResult] = useState<{ loggedIn: boolean; message: string } | null>(null)
+  const [savingRun, setSavingRun] = useState(false)
+
+  async function saveRunSettings(patch: { modelMode?: string; thinking?: string }) {
+    setSavingRun(true)
+    setError(null)
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ googleAccountRunSettings: { slot: account.slot, ...patch } }),
+      })
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}))
+        setError(j.error || `Failed to save Account ${account.slot} settings`)
+      }
+      onRefresh()
+    } finally {
+      setSavingRun(false)
+    }
+  }
 
   async function saveCookies() {
     if (!cookieText.trim()) return
@@ -759,6 +804,44 @@ function GoogleAccountCard({
           </span>
         )}
       </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+        <label className="space-y-1 text-[11px]">
+          <span className="text-muted-foreground">Model for this account</span>
+          <select
+            value={account.modelMode}
+            disabled={savingRun}
+            onChange={(e) => void saveRunSettings({ modelMode: e.target.value })}
+            className="w-full rounded-md border border-input bg-background px-2 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring disabled:opacity-50"
+          >
+            {ACCOUNT_MODEL_MODE_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="space-y-1 text-[11px]">
+          <span className="text-muted-foreground">Thinking for this account</span>
+          <select
+            value={account.thinking}
+            disabled={savingRun}
+            onChange={(e) => void saveRunSettings({ thinking: e.target.value })}
+            className="w-full rounded-md border border-input bg-background px-2 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring disabled:opacity-50"
+          >
+            <option value="default">Default (Medium)</option>
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
+            <option value="low">Low</option>
+          </select>
+        </label>
+      </div>
+      {account.modelMode !== 'auto' && (
+        <div className="text-[11px] text-sky-300">
+          Only {account.modelMode} is used on this account (no fallback to other models).
+          {account.modelMode === 'Argon' ? ' Output length = 1000000.' : ''}
+        </div>
+      )}
 
       <textarea
         value={cookieText}

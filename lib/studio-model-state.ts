@@ -502,13 +502,17 @@ export async function resetModelQuotaState(
   return first as StudioModelQuotaState
 }
 
-/** True when every allowed model's daily quota is used up on this account. */
+/**
+ * True when every model this account may use has its daily quota used up
+ * (`allowedModels` = the one fixed model, or all models in Auto mode).
+ */
 export async function isAccountFullyExhausted(
   accountSlot: number,
   nowMs: number = Date.now(),
+  allowedModels: readonly string[] = STUDIO_MODEL_OPTIONS,
 ): Promise<boolean> {
   const state = await loadStudioModelQuotaState(nowMs, accountSlot)
-  return STUDIO_MODEL_OPTIONS.every((m) => {
+  return allowedModels.map((m) => canonicalizeStudioModelName(m)).every((m) => {
     const untilTs = state.exhausted[m]
     return Boolean(untilTs && untilTs > nowMs)
   })

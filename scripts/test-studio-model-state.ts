@@ -195,6 +195,17 @@ async function runTests() {
     }
     assert.equal(await isAccountFullyExhausted(2), true, 'Account 2: every model used up')
     assert.equal(await isAccountFullyExhausted(1), false, 'Account 1 unaffected')
+    // Account fixed to one model: out of quota as soon as THAT model is used up
+    await markModelExhausted('Neon', Date.now(), 1)
+    assert.equal(await isAccountFullyExhausted(1, Date.now(), ['Neon']), true, 'Neon-only account 1 is out')
+    assert.equal(await isAccountFullyExhausted(1, Date.now(), ['Argon']), false, 'Argon-only account 1 still has quota')
+    // A fixed chain never falls back to another model (free account 1's two Argon slots first)
+    releaseExclusiveStudioModel('acct-test-a1')
+    releaseExclusiveStudioModel('acct-test-a1b')
+    setStudioHolderAccount('acct-test-fixed', 1)
+    assert.equal(await getEffectiveModel('Neon', ['Neon'], Date.now(), 'acct-test-fixed'), '', 'Neon-only: no fallback')
+    assert.equal(await getEffectiveModel('Argon', ['Argon'], Date.now(), 'acct-test-fixed', ['Argon']), 'Argon')
+    releaseExclusiveStudioModel('acct-test-fixed')
     for (const h of ['acct-test-a1', 'acct-test-a2', 'acct-test-a1b', 'acct-test-a3']) releaseExclusiveStudioModel(h)
     await resetModelQuotaState(null, baseNow)
     assert.equal(await isAccountFullyExhausted(2), false, 'Reset clears every account')

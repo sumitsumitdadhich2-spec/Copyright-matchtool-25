@@ -263,7 +263,6 @@ export async function POST(req: NextRequest) {
                 scanId: 'test-clip',
                 jobLabel,
                 modelName: cfg.studioModelName || DEFAULT_STUDIO_MODEL_NAME,
-                thinkingLevel: cfg.studioThinkingLevel,
                 maxOutputTokens: cfg.studioMaxOutputTokens || 65536,
                 maxInputTokens: cfg.studioMaxInputTokens,
                 pageRecycleInterval: cfg.studioPageRecycleInterval,

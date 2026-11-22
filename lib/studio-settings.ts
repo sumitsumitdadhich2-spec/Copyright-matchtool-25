@@ -2,6 +2,8 @@ import crypto from 'crypto'
 import { readJSONRecord, writeJSONRecord } from './json-record'
 import {
   ARGON_MAX_OUTPUT_TOKENS,
+  STUDIO_MODEL_OPTIONS,
+  type StudioModelOption,
   canonicalizeStudioModelName,
   DEFAULT_STUDIO_MODEL_NAME,
   DEFAULT_STUDIO_THINKING_LEVEL,
@@ -36,8 +38,50 @@ export interface GoogleAccountRecord {
   lastLoginTestedAt?: number | null
 }
 
+/** 'auto' = start from the Settings model and fall back across all allowed models (default). */
+export type GoogleAccountModelMode = 'auto' | StudioModelOption
+/** 'default' = Medium. */
+export type GoogleAccountThinking = 'default' | StudioThinkingLevel
+
+/** Per-account run settings chosen under each account's cookies. */
+export interface GoogleAccountRunSettings {
+  modelMode: GoogleAccountModelMode
+  thinking: GoogleAccountThinking
+}
+
+export const DEFAULT_ACCOUNT_THINKING_LEVEL: StudioThinkingLevel = 'medium'
+
+export function normalizeAccountModelMode(raw: unknown): GoogleAccountModelMode {
+  if (typeof raw !== 'string' || !raw.trim() || raw.trim().toLowerCase() === 'auto') return 'auto'
+  const direct = STUDIO_MODEL_OPTIONS.find((m) => m.toLowerCase() === raw.trim().toLowerCase())
+  if (direct) return direct
+  // Only a name that clearly means one of the allowed models (never Carbon / unknown -> Auto)
+  if (/carbon/i.test(raw)) return 'auto'
+  if (/argon|neon|hydrogen|3\.8|3\.6/i.test(raw)) return canonicalizeStudioModelName(raw)
+  return 'auto'
+}
+
+export function normalizeAccountThinking(raw: unknown): GoogleAccountThinking {
+  if (raw === 'high' || raw === 'medium' || raw === 'low') return raw
+  return 'default'
+}
+
+/** Thinking level actually used for an account ('default' -> Medium). */
+export function resolveAccountThinkingLevel(thinking: GoogleAccountThinking): StudioThinkingLevel {
+  return thinking === 'default' ? DEFAULT_ACCOUNT_THINKING_LEVEL : thinking
+}
+
+/** Models an account may use: just the fixed one, or every allowed model in Auto mode. */
+export function allowedModelsForAccountMode(mode: GoogleAccountModelMode): StudioModelOption[] {
+  return mode === 'auto' ? [...STUDIO_MODEL_OPTIONS] : [mode]
+}
+
 export interface PublicGoogleAccount {
   slot: GoogleAccountSlot
+  /** 'auto' or the one model this account is fixed to */
+  modelMode: GoogleAccountModelMode
+  /** 'default' (= Medium) | 'high' | 'medium' | 'low' */
+  thinking: GoogleAccountThinking
   hasCookies: boolean
   cookieCount: number
   lastLoginEmail: string | null
@@ -73,6 +117,8 @@ export interface StudioUserConfig {
   lastLoginTestedAt?: number | null
   /** Google accounts 2 and 3 (account 1 = encryptedCookies / lastLogin* above) */
   extraGoogleAccounts?: Partial<Record<'2' | '3', GoogleAccountRecord>>
+  /** Model mode + thinking per Google account (all 3 slots) */
+  googleAccountRunSettings?: Partial<Record<'1' | '2' | '3', Partial<GoogleAccountRunSettings>>>
   /** Encrypted Google Drive OAuth token bundle — NEVER sent to client */
   encryptedDriveTokens?: string
   driveConnectedEmail?: string | null
@@ -711,6 +757,41 @@ export async function getActiveGoogleAccountSlots(username: string): Promise<Goo
   return notLoggedOut.length > 0 ? notLoggedOut : withCookies
 }
 
+export function readGoogleAccountRunSettings(
+  cfg: StudioUserConfig,
+  slot: GoogleAccountSlot,
+): GoogleAccountRunSettings {
+  const raw = cfg.googleAccountRunSettings?.[String(slot) as '1' | '2' | '3'] || {}
+  return {
+    modelMode: normalizeAccountModelMode(raw.modelMode),
+    thinking: normalizeAccountThinking(raw.thinking),
+  }
+}
+
+export async function getGoogleAccountRunSettings(
+  username: string,
+  slot: GoogleAccountSlot,
+): Promise<GoogleAccountRunSettings> {
+  return readGoogleAccountRunSettings(await loadStudioUserConfig(username), slot)
+}
+
+export async function saveGoogleAccountRunSettings(
+  username: string,
+  slot: GoogleAccountSlot,
+  patch: Partial<GoogleAccountRunSettings>,
+): Promise<GoogleAccountRunSettings> {
+  const cfg = await loadStudioUserConfig(username)
+  const current = readGoogleAccountRunSettings(cfg, slot)
+  const next: GoogleAccountRunSettings = {
+    modelMode: patch.modelMode !== undefined ? normalizeAccountModelMode(patch.modelMode) : current.modelMode,
+    thinking: patch.thinking !== undefined ? normalizeAccountThinking(patch.thinking) : current.thinking,
+  }
+  await saveStudioUserConfig(username, {
+    googleAccountRunSettings: { ...(cfg.googleAccountRunSettings || {}), [String(slot)]: next },
+  })
+  return next
+}
+
 export async function getGoogleAccountEmail(
   username: string,
   slot: GoogleAccountSlot,
@@ -836,8 +917,11 @@ export async function getPublicStudioSettings(username: string): Promise<PublicS
         count = 0
       }
     }
+    const runSettings = readGoogleAccountRunSettings(cfg, slot)
     googleAccounts.push({
       slot,
+      modelMode: runSettings.modelMode,
+      thinking: runSettings.thinking,
       hasCookies: count > 0,
       cookieCount: count,
       lastLoginEmail: rec.lastLoginEmail ?? null,
