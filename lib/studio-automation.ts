@@ -25,6 +25,8 @@ import {
   buildStudioFallbackCycle,
   buildStudioModelChain,
   canonicalizeStudioModelName,
+  gemini4NamedModelIn,
+  gemini4SlugFor,
   getEffectiveModel,
   loadStudioModelQuotaState,
   markModelExhausted,
@@ -621,10 +623,66 @@ export const globalStudioUploadGate: GlobalStudioUploadGate =
  * can press Run until at least 20 seconds have elapsed.
  * This prevents account-level concurrency spikes and 403 PERMISSION_DENIED errors.
  */
+export type StudioAccountErrorKind = '403' | '401' | '503'
+
+/** Account-level error burst -> every worker pauses pressing Run for a while. */
+const ACCOUNT_ERROR_WINDOW_MS = 120_000
+const ACCOUNT_ERROR_BURST_COUNT = 3
+const ACCOUNT_COOLDOWN_STEPS_MS = [60_000, 120_000, 240_000, 300_000]
+const ACCOUNT_COOLDOWN_RESET_AFTER_MS = 10 * 60_000
+
 export class GlobalStudioRunStaggerGate {
   private lastRunAt = 0
   private staggerMs = 20_000
   private queueTail: Promise<void> = Promise.resolve()
+  private accountErrors: Array<{ at: number; kind: StudioAccountErrorKind; worker: string }> = []
+  private cooldownUntil = 0
+  private cooldownLevel = 0
+  private lastAccountErrorAt = 0
+  private cooldownReason = ''
+
+  /**
+   * All parallel workers share ONE Google account. When several of them get 403 / 401 / 503
+   * within a short time, the account is being throttled, and every immediate retry from the
+   * other workers only adds load (and burns daily requests). After ACCOUNT_ERROR_BURST_COUNT
+   * such errors within ACCOUNT_ERROR_WINDOW_MS, block all Run presses for a cooldown that
+   * grows on repeated bursts (60s -> 120s -> 240s -> 300s) and resets after 10 quiet minutes.
+   */
+  public reportAccountError(
+    kind: StudioAccountErrorKind,
+    worker: string,
+  ): { cooldownStarted: boolean; cooldownSec: number } {
+    const now = Date.now()
+    if (this.lastAccountErrorAt > 0 && now - this.lastAccountErrorAt > ACCOUNT_COOLDOWN_RESET_AFTER_MS) {
+      this.cooldownLevel = 0
+    }
+    this.lastAccountErrorAt = now
+    if (now < this.cooldownUntil) {
+      // Errors from runs that were already in flight when the cooldown began are not counted
+      // again, otherwise the cooldown would re-trigger the moment it ends.
+      return { cooldownStarted: false, cooldownSec: Math.ceil((this.cooldownUntil - now) / 1000) }
+    }
+    this.accountErrors = this.accountErrors.filter((e) => now - e.at <= ACCOUNT_ERROR_WINDOW_MS)
+    this.accountErrors.push({ at: now, kind, worker })
+    if (this.accountErrors.length < ACCOUNT_ERROR_BURST_COUNT) {
+      return { cooldownStarted: false, cooldownSec: 0 }
+    }
+
+    const stepMs =
+      ACCOUNT_COOLDOWN_STEPS_MS[Math.min(this.cooldownLevel, ACCOUNT_COOLDOWN_STEPS_MS.length - 1)]
+    this.cooldownLevel += 1
+    this.cooldownUntil = now + stepMs
+    const summary = this.accountErrors.map((e) => `${e.worker}:${e.kind}`).join(', ')
+    this.cooldownReason = `${this.accountErrors.length} account errors in ${Math.round(
+      ACCOUNT_ERROR_WINDOW_MS / 1000,
+    )}s (${summary})`
+    this.accountErrors = []
+    return { cooldownStarted: true, cooldownSec: Math.round(stepMs / 1000) }
+  }
+
+  public getAccountCooldownRemainingSec(): number {
+    return Math.max(0, Math.ceil((this.cooldownUntil - Date.now()) / 1000))
+  }
 
   public setStaggerMs(ms: number) {
     this.staggerMs = Math.max(1000, ms)
@@ -643,6 +701,7 @@ export class GlobalStudioRunStaggerGate {
     options?: {
       isAborted?: () => boolean
       onWait?: (waitRemainingSec: number) => void
+      onCooldown?: (waitRemainingSec: number, reason: string) => void
     },
   ): Promise<void> {
     let releaseQueue!: () => void
@@ -658,6 +717,15 @@ export class GlobalStudioRunStaggerGate {
     try {
       if (options?.isAborted?.()) {
         return
+      }
+
+      // Account cooldown after a 403 / 401 / 503 burst (see reportAccountError)
+      if (Date.now() < this.cooldownUntil) {
+        options?.onCooldown?.(this.getAccountCooldownRemainingSec(), this.cooldownReason)
+        while (Date.now() < this.cooldownUntil) {
+          if (options?.isAborted?.()) return
+          await new Promise((r) => setTimeout(r, Math.min(5_000, this.cooldownUntil - Date.now())))
+        }
       }
 
       const now = Date.now()
@@ -1133,6 +1201,21 @@ export class StudioBrowserController {
       return allCookies.length
     } catch {
       return 0
+    }
+  }
+
+  /** Report a 403 / 401 / 503 to the shared account cooldown gate and log when a cooldown starts. */
+  private reportStudioAccountError(
+    kind: StudioAccountErrorKind,
+    jobLabel: string,
+    onLog?: (level: 'info' | 'warn' | 'error' | 'success', message: string) => void,
+  ) {
+    const worker = this.workerTag.replace(/^\[|\]$/g, '') || this.profileDirName
+    const res = globalStudioRunStaggerGate.reportAccountError(kind, worker)
+    if (res.cooldownStarted) {
+      const msg = `${jobLabel}: HTTP ${kind} burst across workers -> pausing Run on ALL workers for ${res.cooldownSec}s so the shared Google account can recover (retries no longer hammer AI Studio)`
+      this.logStep('account cooldown started', msg, 'warn')
+      onLog?.('warn', msg)
     }
   }
 
@@ -2575,7 +2658,7 @@ export class StudioBrowserController {
             if (
               t &&
               !isWelcomeHeading(t) &&
-              (/\bargon\b/i.test(t) || /gemini/i.test(t) || /3\.[678]/i.test(t) || /2\.5/i.test(t))
+              (/\b(argon|neon|carbon|hydrogen)\b/i.test(t) || /gemini/i.test(t) || /3\.[678]/i.test(t) || /2\.5/i.test(t))
             ) {
               return t
             }
@@ -2610,7 +2693,7 @@ export class StudioBrowserController {
           const t = (node.innerText || node.textContent || '').trim().replace(/\s+/g, ' ')
           if (!t || isWelcomeHeading(t)) continue
           if (
-            /\bargon\b/i.test(t) ||
+            /\b(argon|neon|carbon|hydrogen)\b/i.test(t) ||
             /^gemini[\s-]+\d+(\.\d+)?/i.test(t) ||
             /\bgemini[\s-]+3\.[678]\b/i.test(t) ||
             /\bgemini[\s-]+2\.5\b/i.test(t)
@@ -2656,17 +2739,18 @@ export class StudioBrowserController {
     const matchesModelText = (text: string, desiredRaw: string): boolean => {
       if (!text) return false
       const desired = (desiredRaw || DEFAULT_STUDIO_MODEL_NAME).trim()
-      const isArgon = /\bargon\b/i.test(desired)
-      const versionMatch = isArgon ? null : desired.match(/(\d+\.\d+)/)
+      const namedModel = gemini4NamedModelIn(desired)
+      const versionMatch = namedModel ? null : desired.match(/(\d+\.\d+)/)
       const desiredVersion = versionMatch ? versionMatch[1] : ''
       const isFlash = /flash/i.test(desired)
 
-      // Never match TTS, Lite, Image, Audio, Live, or Pro when selecting standard Argon / Flash
+      // Never match TTS, Lite, Image, Audio, Live, or Pro when selecting a standard Gemini 4 / Flash model
       if (/\b(tts|lite|image|audio|live)\b/i.test(text)) return false
       if (isFlash && /\bpro\b/i.test(text) && !/\bflash\b/i.test(text)) return false
 
-      if (isArgon) {
-        return /\bargon\b/i.test(text)
+      if (namedModel) {
+        // Gemini 4 Argon / Neon / Carbon / Hydrogen: the card must name THIS model
+        return gemini4NamedModelIn(text) === namedModel
       }
       if (desiredVersion) {
         const hasVer = text.includes(desiredVersion)
@@ -2852,7 +2936,8 @@ export class StudioBrowserController {
     const tagAndClickModelInDrawer = async (params: {
       ver: string
       wantFlash: boolean
-      wantArgon: boolean
+      /** lowercase Gemini 4 model name ('argon' | 'neon' | 'carbon' | 'hydrogen') or '' */
+      wantNamed: string
       fullLabel: string
     }): Promise<string | null> => {
       const scrollSteps = [0, 320, 640, 960, 1300]
@@ -2863,7 +2948,7 @@ export class StudioBrowserController {
           await scrollModelDrawerList(scrollPx)
         }
         taggedText = await page
-          .evaluate(({ ver, wantFlash, wantArgon, fullLabel }) => {
+          .evaluate(({ ver, wantFlash, wantNamed, fullLabel }) => {
             document
               .querySelectorAll('[data-cmt-pick-model-title], [data-cmt-pick-model-card]')
               .forEach((el) => {
@@ -2911,8 +2996,8 @@ export class StudioBrowserController {
               }
             })
 
-            const targetSlug = wantArgon
-              ? 'gemini-4-argon'
+            const targetSlug = wantNamed
+              ? `gemini-4-${wantNamed}`
               : ver && wantFlash
                 ? `gemini-${ver}-flash`
                 : ''
@@ -2925,8 +3010,8 @@ export class StudioBrowserController {
 
             const matchesModel = (txt: string): boolean => {
               if (!txt || isExcludedText(txt)) return false
-              if (wantArgon) {
-                return /\bargon\b/i.test(txt)
+              if (wantNamed) {
+                return new RegExp(`\\b${wantNamed}\\b`, 'i').test(txt)
               }
               if (ver) {
                 return txt.includes(ver) && (!wantFlash || /flash/i.test(txt))
@@ -2966,7 +3051,7 @@ export class StudioBrowserController {
               let score = 0
               if (targetSlug && txt.toLowerCase() === targetSlug) score += 100
               else if (targetSlug && uniqueSlugs.has(targetSlug)) score += 80
-              if (wantArgon && /^gemini\s*4\s*argon$/i.test(txt)) score += 95
+              if (wantNamed && new RegExp(`^gemini\\s*4\\s*${wantNamed}$`, 'i').test(txt)) score += 95
               if (ver && new RegExp(`^gemini\\s*${ver.replace('.', '\\.')}\\s*flash$`, 'i').test(txt)) {
                 score += 95
               }
@@ -3066,8 +3151,9 @@ export class StudioBrowserController {
       desiredRaw: string,
     ): Promise<{ matched: boolean; cardText: string }> => {
       const desired = (desiredRaw || DEFAULT_STUDIO_MODEL_NAME).trim()
-      const isArgon = /\bargon\b/i.test(desired)
-      const versionMatch = isArgon ? null : desired.match(/(\d+\.\d+)/)
+      const namedModel = gemini4NamedModelIn(desired)
+      const wantNamed = namedModel ? namedModel.toLowerCase() : ''
+      const versionMatch = namedModel ? null : desired.match(/(\d+\.\d+)/)
       const desiredVersion = versionMatch ? versionMatch[1] : ''
       const isFlash = /flash/i.test(desired)
 
@@ -3097,7 +3183,7 @@ export class StudioBrowserController {
       try {
         const searchInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSearchInput, 1000)
         if (searchInput) {
-          const searchQuery = isArgon ? 'argon' : desiredVersion ? `${desiredVersion}` : desired
+          const searchQuery = wantNamed || (desiredVersion ? `${desiredVersion}` : desired)
           await searchInput.click({ timeout: 1500 }).catch(() => {})
           await searchInput.fill('').catch(() => {})
           await searchInput.type(searchQuery, { delay: 30 }).catch(async () => {
@@ -3114,7 +3200,7 @@ export class StudioBrowserController {
       let clickedModel = await tagAndClickModelInDrawer({
         ver: desiredVersion,
         wantFlash: isFlash,
-        wantArgon: isArgon,
+        wantNamed,
         fullLabel: desired,
       })
 
@@ -3138,7 +3224,7 @@ export class StudioBrowserController {
         clickedModel = await tagAndClickModelInDrawer({
           ver: desiredVersion,
           wantFlash: isFlash,
-          wantArgon: isArgon,
+          wantNamed,
           fullLabel: desired,
         })
       }
@@ -3150,7 +3236,7 @@ export class StudioBrowserController {
         clickedModel = await tagAndClickModelInDrawer({
           ver: desiredVersion,
           wantFlash: isFlash,
-          wantArgon: isArgon,
+          wantNamed,
           fullLabel: desired,
         })
       }
@@ -3160,13 +3246,18 @@ export class StudioBrowserController {
           .evaluate(() => {
             const txt = document.body?.innerText || ''
             const m = txt.match(/\bgemini-[0-9a-z.-]+\b/gi) || []
-            return Array.from(new Set(m.map((s) => s.toLowerCase()))).slice(0, 12)
+            return Array.from(new Set(m.map((s) => s.toLowerCase()))).slice(0, 16)
           })
           .catch(() => [] as string[])
         if (availableSlugs.length > 0) {
+          const expectedSlug = namedModel
+            ? gemini4SlugFor(namedModel)
+            : desiredVersion && isFlash
+              ? `gemini-${desiredVersion}-flash`
+              : ''
           this.logStep(
             'drawer models check',
-            `"${desired}" card not visible in drawer (visible slugs: ${availableSlugs.join(', ')})`,
+            `"${desired}" card not visible in drawer${expectedSlug ? ` (expected ${expectedSlug})` : ''} (visible slugs: ${availableSlugs.join(', ')})`,
             'warn',
           )
         }
@@ -3215,10 +3306,21 @@ export class StudioBrowserController {
       nonExhaustedCandidates.length > 0 ? nonExhaustedCandidates : orderedCandidates
     // Keep targetModelName strictly at index 0 (so explicit model switches never revert back),
     // while ordering any fallback models with unleased models first (1 window = 1 model).
+    // orderFallbacksKeepingTargetFirst() appends every known model to the list, which used to
+    // re-add models whose daily quota was already exhausted (log: Argon re-selected after
+    // "Argon quota exhausted", wasting an attempt on every retry). Drop them again here,
+    // except the explicitly requested target model.
+    const isExhaustedNow = (m: string): boolean => {
+      const untilTs = quotaStateNow.exhausted[canonicalizeStudioModelName(m)]
+      return Boolean(untilTs && untilTs > Date.now())
+    }
     const candidatesToTry = orderFallbacksKeepingTargetFirst(
       this.profileDirName,
       targetModelName,
       baseCandidates,
+    ).filter(
+      (m, idx) =>
+        idx === 0 || nonExhaustedCandidates.length === 0 || !isExhaustedNow(m),
     )
 
     for (let i = 0; i < candidatesToTry.length; i++) {
@@ -7147,6 +7249,11 @@ export class StudioBrowserController {
               this.logStep('waiting run stagger', waitMsg, 'info')
               onLog?.('info', `[${this.workerTag || this.profileDirName}] ${waitMsg}`)
             },
+            onCooldown: (waitRemainingSec, reason) => {
+              const waitMsg = `Account cooldown: waiting ${waitRemainingSec}s before pressing Run on ${jobLabel} (${reason})`
+              this.logStep('account cooldown', waitMsg, 'warn')
+              onLog?.('warn', `[${this.workerTag || this.profileDirName}] ${waitMsg}`)
+            },
           })
 
           await this.closePaidApiKeyPopupByCrossButton(page)
@@ -7310,6 +7417,7 @@ export class StudioBrowserController {
               onLog?.('error', `${exactErrLog} on ${jobLabel}`)
 
               permissionDeniedRetries += 1
+              this.reportStudioAccountError('403', jobLabel, onLog)
 
               // Model fallback: advance to next unleased non-exhausted model in MODEL_FALLBACK_CHAIN
               const prevModel = activeModelName
@@ -7602,6 +7710,7 @@ export class StudioBrowserController {
               }
               if (isPermissionDeniedErrorText(errBannerText, capturedRunError?.status)) {
                 permissionDeniedRetries += 1
+                this.reportStudioAccountError('403', jobLabel, onLog)
                 const prevModel = activeModelName
                 const nextModelInCycle =
                   (await getEffectiveModel(
@@ -7630,6 +7739,15 @@ export class StudioBrowserController {
                 modelUnavailableDetected = true
                 transientBannerReason = `model_unavailable:${errBannerText.slice(0, 80)}`
                 break
+              }
+              if (
+                capturedRunError?.status === 401 ||
+                /(authentication\s+error|missing\s+required\s+authentication|HTTP\s+401)/i.test(
+                  `${errBannerText} ${netDetail}`,
+                )
+              ) {
+                // 401 = the shared Google session was rejected (usually several workers using one account).
+                this.reportStudioAccountError('401', jobLabel, onLog)
               }
               if (isAmbiguousOrInternalErrorText(errBannerText, capturedRunError?.status)) {
                 internalErrorDetected = true
@@ -8112,16 +8230,22 @@ export class StudioBrowserController {
             0,
             MODEL_FALLBACK_CHAIN.findIndex((m) => m.toLowerCase() === activeModelName.toLowerCase()),
           )
+          this.reportStudioAccountError('503', jobLabel, onLog)
+          // Back off longer on each repeated 503 instead of a fixed 6s (the log showed 37 immediate
+          // 503s in a row from 6 workers retrying every few seconds).
+          const highDemandWaitSec = Math.min(60, 15 * Math.max(1, internalErrorRefreshes + 1))
           this.logStep(
             '503 high demand -> switched model',
-            `${jobLabel}: ${prevModel} unavailable -> switching to ${activeModelName} (waiting 6s, fresh chat)`,
+            `${jobLabel}: ${prevModel} unavailable -> switching to ${activeModelName} (waiting ${highDemandWaitSec}s, fresh chat)`,
             'warn',
           )
           onLog?.(
             'warn',
-            `${jobLabel}: ${prevModel} unavailable/high-demand -> switching to ${activeModelName} in fresh chat`,
+            `${jobLabel}: ${prevModel} unavailable/high-demand -> switching to ${activeModelName} in fresh chat (waiting ${highDemandWaitSec}s)`,
           )
-          await new Promise((r) => setTimeout(r, 6_000))
+          for (let waited = 0; waited < highDemandWaitSec && !this.isStopping(scope); waited++) {
+            await new Promise((r) => setTimeout(r, 1000))
+          }
           pendingInternalErrorAction = 'hard_refresh_new_page'
           if (internalErrorRefreshes < MAX_INTERNAL_ERROR_REFRESH + 3) {
             internalErrorRefreshes += 1

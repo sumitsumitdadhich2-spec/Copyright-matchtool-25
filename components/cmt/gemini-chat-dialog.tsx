@@ -76,6 +76,9 @@ export interface ChatPaneState {
 }
 
 const AVAILABLE_MODELS = [
+  { id: 'gemini-4-neon', name: 'Gemini 4 Neon', tag: 'Gemini 4 · Newest (paid API tier)' },
+  { id: 'gemini-4-carbon', name: 'Gemini 4 Carbon', tag: 'Gemini 4 · Most capable (paid API tier)' },
+  { id: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen', tag: 'Gemini 4 · Fast (free tier available)' },
   { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', tag: '3.7-shiva · Fast Forensic' },
   { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', tag: '3.8-shiva · Deep Forensic (Recommended)' },
   { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', tag: '3.6-shiva · Robust Baseline' },

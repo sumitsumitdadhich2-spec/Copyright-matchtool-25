@@ -46,6 +46,9 @@ function formatMmSs(sec: number): string {
 function shortModelBadge(modelName: string | null | undefined): string {
   const raw = (modelName || '').toLowerCase()
   if (raw.includes('argon')) return 'Argon'
+  if (raw.includes('neon')) return 'Neon'
+  if (raw.includes('carbon')) return 'Carbon'
+  if (raw.includes('hydrogen')) return 'Hydrogen'
   if (raw.includes('3.6')) return '3.6'
   if (raw.includes('3.1-pro')) return '3.1 Pro'
   if (raw.includes('3-pro')) return '3 Pro'

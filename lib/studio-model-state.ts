@@ -1,9 +1,18 @@
-import { readJSONRecord, writeJSONRecord } from './json-record'
+import { invalidateJSONRecord, readJSONRecord, writeJSONRecord } from './json-record'
 
+/**
+ * AI Studio models the parallel scan can use, in fallback order.
+ * The Gemini 4 "element" models (Neon, Carbon, Hydrogen) come after the
+ * long-tested Argon / Flash models, so an existing setup keeps its old order and
+ * simply gets extra daily quota at the end of the fallback chain.
+ */
 export const STUDIO_MODEL_OPTIONS = [
   'Argon',
   'Gemini 3.8 Flash',
   'Gemini 3.6 Flash',
+  'Neon',
+  'Carbon',
+  'Hydrogen',
 ] as const
 
 export type StudioModelOption = (typeof STUDIO_MODEL_OPTIONS)[number]
@@ -51,17 +60,37 @@ export function thinkingLevelToDisplayLabel(level?: StudioThinkingLevel | string
   return 'High'
 }
 
+/** Gemini 4 models are shown in AI Studio as "Gemini 4 <Name>" (slug gemini-4-<name>). */
+export const GEMINI4_NAMED_MODELS = ['Argon', 'Neon', 'Carbon', 'Hydrogen'] as const
+export type Gemini4NamedModel = (typeof GEMINI4_NAMED_MODELS)[number]
+
+/** Returns 'Argon' | 'Neon' | 'Carbon' | 'Hydrogen' when the text names one of them, else null. */
+export function gemini4NamedModelIn(raw?: string | null): Gemini4NamedModel | null {
+  const text = raw || ''
+  for (const name of GEMINI4_NAMED_MODELS) {
+    if (new RegExp(`\\b${name}\\b`, 'i').test(text)) return name
+  }
+  return null
+}
+
+/** AI Studio slug for a Gemini 4 named model, e.g. "gemini-4-neon". */
+export function gemini4SlugFor(name: Gemini4NamedModel): string {
+  return `gemini-4-${name.toLowerCase()}`
+}
+
 /**
- * Strictly canonicalize to the 3 allowed models ONLY:
- * - 'Argon'
- * - 'Gemini 3.8 Flash'
- * - 'Gemini 3.6 Flash'
- * (3.7 is removed everywhere; any 3.7 or unknown model maps to 'Gemini 3.8 Flash' or 'Argon').
+ * Canonicalize to one of STUDIO_MODEL_OPTIONS:
+ * - 'Argon' | 'Neon' | 'Carbon' | 'Hydrogen' (Gemini 4, matched by name)
+ * - 'Gemini 3.8 Flash' | 'Gemini 3.6 Flash'
+ * (3.7 is removed everywhere; any 3.7 or unknown model maps to 'Gemini 3.8 Flash').
+ * Named models are checked first so a card like "Gemini 4 Hydrogen ..." is never
+ * mistaken for a Flash model.
  */
 export function canonicalizeStudioModelName(raw?: string | null): StudioModelOption {
   const trimmed = (raw || '').trim()
   if (!trimmed) return DEFAULT_STUDIO_MODEL_NAME
-  if (/^argon$/i.test(trimmed) || /\bargon\b/i.test(trimmed)) return 'Argon'
+  const named = gemini4NamedModelIn(trimmed)
+  if (named) return named
   if (/3\.8/.test(trimmed)) return 'Gemini 3.8 Flash'
   if (/3\.6/.test(trimmed)) return 'Gemini 3.6 Flash'
   if (/3\.7/.test(trimmed)) return 'Gemini 3.8 Flash'
@@ -70,7 +99,8 @@ export function canonicalizeStudioModelName(raw?: string | null): StudioModelOpt
 
 /**
  * Whenever Argon is used, Output length (maxOutputTokens) MUST be 1,000,000 (1000000).
- * For Gemini 3.8 Flash / Gemini 3.6 Flash, use 65,536 (or user setting <= 65,536).
+ * For every other model (Neon, Carbon, Hydrogen, Gemini 3.8 Flash, Gemini 3.6 Flash) use
+ * 65,536 (or user setting <= 65,536) and leave AI Studio's Output length untouched.
  */
 export function resolveEffectiveMaxOutputTokensForModel(
   modelName?: string | null,
@@ -89,7 +119,7 @@ export function resolveEffectiveMaxOutputTokensForModel(
 
 /**
  * Build the ordered fallback chain starting from the user's chosen model
- * across the 3 allowed models: Argon, Gemini 3.8 Flash, Gemini 3.6 Flash.
+ * across all STUDIO_MODEL_OPTIONS.
  */
 export function buildStudioModelChain(chosenModel?: string | null): StudioModelOption[] {
   const canonical = canonicalizeStudioModelName(chosenModel)
@@ -103,8 +133,8 @@ export function buildStudioModelChain(chosenModel?: string | null): StudioModelO
 }
 
 /**
- * Build a complete fallback cycle across all 3 allowed models
- * ('Argon', 'Gemini 3.8 Flash', 'Gemini 3.6 Flash') starting from `chosenModel`.
+ * Build a complete fallback cycle across all STUDIO_MODEL_OPTIONS
+ * starting from `chosenModel`.
  */
 export function buildStudioFallbackCycle(chosenModel?: string | null): StudioModelOption[] {
   const primary = buildStudioModelChain(chosenModel)
@@ -261,16 +291,30 @@ export async function loadStudioModelQuotaState(
     }
   }
 
-  const state: StudioModelQuotaState = {
+  // Read-only: expired entries are simply skipped here. Writing the cleaned copy back from a
+  // reader raced with markModelExhausted() in parallel workers and could erase a model that
+  // another worker had just marked exhausted. Writers below prune expired entries themselves.
+  return {
     exhausted: cleaned,
     updatedAt: changed ? nowMs : saved?.updatedAt || nowMs,
   }
+}
 
-  if (changed) {
-    await writeJSONRecord(MODEL_QUOTA_RECORD_KEY, state)
-  }
+/**
+ * Serialize every read-modify-write of the quota record across all parallel workers
+ * (and across Next.js bundles, via globalThis) and always re-read the record from disk
+ * first, so two workers marking two different models at the same moment both persist.
+ */
+const globalForQuotaLock = globalThis as unknown as { __cmtStudioQuotaLock?: Promise<unknown> }
 
-  return state
+async function withQuotaRecordLock<T>(fn: () => Promise<T>): Promise<T> {
+  const prev = globalForQuotaLock.__cmtStudioQuotaLock || Promise.resolve()
+  const run = prev.catch(() => undefined).then(async () => {
+    invalidateJSONRecord(MODEL_QUOTA_RECORD_KEY)
+    return fn()
+  })
+  globalForQuotaLock.__cmtStudioQuotaLock = run.catch(() => undefined)
+  return run
 }
 
 export async function markModelExhausted(
@@ -278,40 +322,44 @@ export async function markModelExhausted(
   nowMs: number = Date.now(),
 ): Promise<{ model: string; untilTimestamp: number; state: StudioModelQuotaState }> {
   const canonical = canonicalizeStudioModelName(model)
-  const current = await loadStudioModelQuotaState(nowMs)
   const untilTimestamp = nextPacificMidnight(nowMs)
-  const nextState: StudioModelQuotaState = {
-    exhausted: {
-      ...current.exhausted,
-      [canonical]: untilTimestamp,
-    },
-    updatedAt: nowMs,
-  }
-  await writeJSONRecord(MODEL_QUOTA_RECORD_KEY, nextState)
-  return { model: canonical, untilTimestamp, state: nextState }
+  return withQuotaRecordLock(async () => {
+    const current = await loadStudioModelQuotaState(nowMs)
+    const nextState: StudioModelQuotaState = {
+      exhausted: {
+        ...current.exhausted,
+        [canonical]: untilTimestamp,
+      },
+      updatedAt: nowMs,
+    }
+    await writeJSONRecord(MODEL_QUOTA_RECORD_KEY, nextState)
+    return { model: canonical, untilTimestamp, state: nextState }
+  })
 }
 
 export async function resetModelQuotaState(
   model?: string | null,
   nowMs: number = Date.now(),
 ): Promise<StudioModelQuotaState> {
-  const current = await loadStudioModelQuotaState(nowMs)
-  const nextExhausted: Record<string, number> = { ...current.exhausted }
-  if (model && model.trim()) {
-    const canonical = canonicalizeStudioModelName(model)
-    delete nextExhausted[canonical]
-    delete nextExhausted[model.trim()]
-  } else {
-    for (const k of Object.keys(nextExhausted)) {
-      delete nextExhausted[k]
+  return withQuotaRecordLock(async () => {
+    const current = await loadStudioModelQuotaState(nowMs)
+    const nextExhausted: Record<string, number> = { ...current.exhausted }
+    if (model && model.trim()) {
+      const canonical = canonicalizeStudioModelName(model)
+      delete nextExhausted[canonical]
+      delete nextExhausted[model.trim()]
+    } else {
+      for (const k of Object.keys(nextExhausted)) {
+        delete nextExhausted[k]
+      }
     }
-  }
-  const nextState: StudioModelQuotaState = {
-    exhausted: nextExhausted,
-    updatedAt: nowMs,
-  }
-  await writeJSONRecord(MODEL_QUOTA_RECORD_KEY, nextState)
-  return nextState
+    const nextState: StudioModelQuotaState = {
+      exhausted: nextExhausted,
+      updatedAt: nowMs,
+    }
+    await writeJSONRecord(MODEL_QUOTA_RECORD_KEY, nextState)
+    return nextState
+  })
 }
 
 /**
