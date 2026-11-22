@@ -1165,6 +1165,14 @@ export function StudioParallelGrid({
                       <span className="text-[10px] font-mono text-zinc-400">
                         {w.profileDirName}
                       </span>
+                      {w.googleAccountSlot ? (
+                        <span
+                          className="px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-[10px] font-mono text-amber-300"
+                          title={`Google Account ${w.googleAccountSlot}`}
+                        >
+                          A{w.googleAccountSlot}
+                        </span>
+                      ) : null}
                       {w.windowNumber !== null && (
                         <span className="px-1.5 py-0.5 rounded bg-zinc-900 border border-zinc-700 text-[10px] font-mono text-zinc-100">
                           #{w.windowNumber} ({w.windowRange})
@@ -2146,6 +2154,7 @@ export function StudioParallelGrid({
                   </span>
                   <span className="text-xs font-mono text-zinc-300">
                     Profile: {selectedWorker.profileDirName}
+                    {selectedWorker.googleAccountSlot ? ` · Account ${selectedWorker.googleAccountSlot}` : ''}
                   </span>
                   {selectedWorker.windowNumber !== null && (
                     <span className="text-xs font-mono text-zinc-100">

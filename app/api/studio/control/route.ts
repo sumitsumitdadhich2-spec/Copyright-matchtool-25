@@ -7,6 +7,7 @@ import {
   type StudioTestClipLine,
 } from '@/lib/studio-automation'
 import {
+  getAccountTestController,
   getStudioParallelManager,
   globalProfileSlotPool,
   resolveScanMovieDurationSec,
@@ -434,9 +435,21 @@ export async function POST(req: NextRequest) {
         })
       }
       case 'test_login': {
+        // Account 1 = main Studio browser (unchanged). Accounts 2/3 = their own test browser
+        // profile, closed again after the check.
+        const acct = Number((body as Record<string, unknown>).googleAccountSlot)
+        if (acct === 2 || acct === 3) {
+          const testCtrl = getAccountTestController(acct)
+          try {
+            const res = await testCtrl.testLogin(username)
+            return NextResponse.json({ ok: true, ...res, googleAccountSlot: acct })
+          } finally {
+            await testCtrl.closeContext().catch(() => {})
+          }
+        }
         const res = await studioController.testLogin(username)
         const snap = await studioController.getSnapshot(true)
-        return NextResponse.json({ ok: true, ...res, snapshot: snap })
+        return NextResponse.json({ ok: true, ...res, googleAccountSlot: 1, snapshot: snap })
       }
       case 'pause': {
         studioController.setPaused(true)

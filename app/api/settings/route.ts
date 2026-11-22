@@ -21,7 +21,9 @@ import { MODEL_POOL } from '@/lib/models'
 import { poolSnapshot } from '@/lib/ffmpeg-pool'
 import { getKeyStorageInfo, deleteAllFilesOnKey } from '@/lib/gemini'
 import {
+  clearUserGoogleCookies,
   getPublicStudioSettings,
+  normalizeGoogleAccountSlot,
   saveStudioUserConfig,
   saveUserGoogleCookies,
 } from '@/lib/studio-settings'
@@ -228,20 +230,22 @@ export async function POST(req: Request) {
   const body = (await req.json()) as Record<string, unknown>
 
   // ----- Google Cookies (encrypted with SESSION_SECRET, never returned to client) -----
+  // `googleAccountSlot` 1 | 2 | 3 (default 1). Account 1 change wipes every worker profile
+  // (they are all seeded from it); account 2/3 change wipes only that account's profiles.
+  const accountSlot = normalizeGoogleAccountSlot(body.googleAccountSlot)
+  const purgeForAccount = async () => {
+    if (accountSlot === 1) await globalProfileSlotPool.purgeAllWorkerProfilesAndContexts()
+    else await globalProfileSlotPool.purgeProfilesForAccount(accountSlot)
+  }
   if (body.clearGoogleCookies === true) {
-    await saveStudioUserConfig(username, {
-      encryptedCookies: undefined,
-      lastLoginStatus: 'untested',
-      lastLoginEmail: null,
-      lastLoginTestedAt: null,
-    })
-    await globalProfileSlotPool.purgeAllWorkerProfilesAndContexts()
+    await clearUserGoogleCookies(username, accountSlot)
+    await purgeForAccount()
     return NextResponse.json({ ok: true, studio: await getPublicStudioSettings(username) })
   }
   if (typeof body.googleCookies === 'string') {
     try {
-      const { count } = await saveUserGoogleCookies(username, body.googleCookies)
-      await globalProfileSlotPool.purgeAllWorkerProfilesAndContexts()
+      const { count } = await saveUserGoogleCookies(username, body.googleCookies, accountSlot)
+      await purgeForAccount()
       return NextResponse.json({ ok: true, count, studio: await getPublicStudioSettings(username) })
     } catch (err) {
       return NextResponse.json(

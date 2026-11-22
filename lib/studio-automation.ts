@@ -17,6 +17,7 @@ import {
   getSettingsCookieFingerprint,
   loadDecryptedPlaywrightCookies,
   loadStudioUserConfig,
+  recordGoogleAccountLoginTest,
   saveStudioUserConfig,
   type PlaywrightCookie,
 } from './studio-settings'
@@ -29,6 +30,7 @@ import {
   gemini4SlugFor,
   describeStudioModelLeases,
   getEffectiveModel,
+  setStudioHolderAccount,
   hasFreeModelSlot,
   loadStudioModelQuotaState,
   markModelExhausted,
@@ -627,63 +629,88 @@ export const globalStudioUploadGate: GlobalStudioUploadGate =
  */
 export type StudioAccountErrorKind = '403' | '401' | '503'
 
-/** Account-level error burst -> every worker pauses pressing Run for a while. */
+/** Account-level error burst -> every worker ON THAT ACCOUNT pauses pressing Run for a while. */
 const ACCOUNT_ERROR_WINDOW_MS = 120_000
 const ACCOUNT_ERROR_BURST_COUNT = 3
 const ACCOUNT_COOLDOWN_STEPS_MS = [60_000, 120_000, 240_000, 300_000]
 const ACCOUNT_COOLDOWN_RESET_AFTER_MS = 10 * 60_000
 
-export class GlobalStudioRunStaggerGate {
-  private lastRunAt = 0
-  private staggerMs = 20_000
-  private queueTail: Promise<void> = Promise.resolve()
-  private accountErrors: Array<{ at: number; kind: StudioAccountErrorKind; worker: string }> = []
-  private cooldownUntil = 0
-  private cooldownLevel = 0
-  private lastAccountErrorAt = 0
-  private cooldownReason = ''
+interface RunGateAccountState {
+  lastRunAt: number
+  queueTail: Promise<void>
+  errors: Array<{ at: number; kind: StudioAccountErrorKind; worker: string }>
+  cooldownUntil: number
+  cooldownLevel: number
+  lastErrorAt: number
+  cooldownReason: string
+}
 
-  /**
-   * All parallel workers share ONE Google account. When several of them get 403 / 401 / 503
-   * within a short time, the account is being throttled, and every immediate retry from the
-   * other workers only adds load (and burns daily requests). After ACCOUNT_ERROR_BURST_COUNT
-   * such errors within ACCOUNT_ERROR_WINDOW_MS, block all Run presses for a cooldown that
-   * grows on repeated bursts (60s -> 120s -> 240s -> 300s) and resets after 10 quiet minutes.
-   */
+/**
+ * Run gate, kept separately for every Google account (1..3):
+ * - Stagger: at least `staggerMs` (default 20s) between two Run presses on the SAME account.
+ * - Cooldown: after ACCOUNT_ERROR_BURST_COUNT 403 / 401 / 503 errors within
+ *   ACCOUNT_ERROR_WINDOW_MS on one account, every worker on that account stops pressing Run
+ *   for 60s -> 120s -> 240s -> 300s (resets after 10 quiet minutes). Workers on the other
+ *   accounts keep running.
+ */
+export class GlobalStudioRunStaggerGate {
+  private staggerMs = 20_000
+  private accounts = new Map<number, RunGateAccountState>()
+
+  private acct(accountSlot: number = 1): RunGateAccountState {
+    const key = accountSlot === 2 || accountSlot === 3 ? accountSlot : 1
+    let st = this.accounts.get(key)
+    if (!st) {
+      st = {
+        lastRunAt: 0,
+        queueTail: Promise.resolve(),
+        errors: [],
+        cooldownUntil: 0,
+        cooldownLevel: 0,
+        lastErrorAt: 0,
+        cooldownReason: '',
+      }
+      this.accounts.set(key, st)
+    }
+    return st
+  }
+
   public reportAccountError(
     kind: StudioAccountErrorKind,
     worker: string,
+    accountSlot: number = 1,
   ): { cooldownStarted: boolean; cooldownSec: number } {
+    const st = this.acct(accountSlot)
     const now = Date.now()
-    if (this.lastAccountErrorAt > 0 && now - this.lastAccountErrorAt > ACCOUNT_COOLDOWN_RESET_AFTER_MS) {
-      this.cooldownLevel = 0
+    if (st.lastErrorAt > 0 && now - st.lastErrorAt > ACCOUNT_COOLDOWN_RESET_AFTER_MS) {
+      st.cooldownLevel = 0
     }
-    this.lastAccountErrorAt = now
-    if (now < this.cooldownUntil) {
+    st.lastErrorAt = now
+    if (now < st.cooldownUntil) {
       // Errors from runs that were already in flight when the cooldown began are not counted
       // again, otherwise the cooldown would re-trigger the moment it ends.
-      return { cooldownStarted: false, cooldownSec: Math.ceil((this.cooldownUntil - now) / 1000) }
+      return { cooldownStarted: false, cooldownSec: Math.ceil((st.cooldownUntil - now) / 1000) }
     }
-    this.accountErrors = this.accountErrors.filter((e) => now - e.at <= ACCOUNT_ERROR_WINDOW_MS)
-    this.accountErrors.push({ at: now, kind, worker })
-    if (this.accountErrors.length < ACCOUNT_ERROR_BURST_COUNT) {
+    st.errors = st.errors.filter((e) => now - e.at <= ACCOUNT_ERROR_WINDOW_MS)
+    st.errors.push({ at: now, kind, worker })
+    if (st.errors.length < ACCOUNT_ERROR_BURST_COUNT) {
       return { cooldownStarted: false, cooldownSec: 0 }
     }
 
     const stepMs =
-      ACCOUNT_COOLDOWN_STEPS_MS[Math.min(this.cooldownLevel, ACCOUNT_COOLDOWN_STEPS_MS.length - 1)]
-    this.cooldownLevel += 1
-    this.cooldownUntil = now + stepMs
-    const summary = this.accountErrors.map((e) => `${e.worker}:${e.kind}`).join(', ')
-    this.cooldownReason = `${this.accountErrors.length} account errors in ${Math.round(
+      ACCOUNT_COOLDOWN_STEPS_MS[Math.min(st.cooldownLevel, ACCOUNT_COOLDOWN_STEPS_MS.length - 1)]
+    st.cooldownLevel += 1
+    st.cooldownUntil = now + stepMs
+    const summary = st.errors.map((e) => `${e.worker}:${e.kind}`).join(', ')
+    st.cooldownReason = `Account ${accountSlot}: ${st.errors.length} errors in ${Math.round(
       ACCOUNT_ERROR_WINDOW_MS / 1000,
     )}s (${summary})`
-    this.accountErrors = []
+    st.errors = []
     return { cooldownStarted: true, cooldownSec: Math.round(stepMs / 1000) }
   }
 
-  public getAccountCooldownRemainingSec(): number {
-    return Math.max(0, Math.ceil((this.cooldownUntil - Date.now()) / 1000))
+  public getAccountCooldownRemainingSec(accountSlot: number = 1): number {
+    return Math.max(0, Math.ceil((this.acct(accountSlot).cooldownUntil - Date.now()) / 1000))
   }
 
   public setStaggerMs(ms: number) {
@@ -695,8 +722,8 @@ export class GlobalStudioRunStaggerGate {
   }
 
   /**
-   * Acquire permission to press Run. Guarantees that at least `staggerMs` (default 20s)
-   * has elapsed since the previous window pressed Run across ALL workers and scans.
+   * Acquire permission to press Run on `accountSlot`: waits out that account's cooldown
+   * (outside the queue, so other workers are not blocked), then enforces the stagger.
    */
   public async acquireRunSlot(
     jobLabel: string,
@@ -704,59 +731,65 @@ export class GlobalStudioRunStaggerGate {
       isAborted?: () => boolean
       onWait?: (waitRemainingSec: number) => void
       onCooldown?: (waitRemainingSec: number, reason: string) => void
+      accountSlot?: number
     },
   ): Promise<void> {
-    let releaseQueue!: () => void
-    const nextInQueue = new Promise<void>((resolve) => {
-      releaseQueue = resolve
-    })
+    const st = this.acct(options?.accountSlot)
 
-    const prevInQueue = this.queueTail
-    this.queueTail = prevInQueue.then(() => nextInQueue).catch(() => nextInQueue)
-
-    await prevInQueue
-
-    try {
-      if (options?.isAborted?.()) {
-        return
-      }
-
-      // Account cooldown after a 403 / 401 / 503 burst (see reportAccountError)
-      if (Date.now() < this.cooldownUntil) {
-        options?.onCooldown?.(this.getAccountCooldownRemainingSec(), this.cooldownReason)
-        while (Date.now() < this.cooldownUntil) {
+    for (;;) {
+      // 1. Account cooldown after a 403 / 401 / 503 burst (see reportAccountError)
+      if (Date.now() < st.cooldownUntil) {
+        options?.onCooldown?.(
+          Math.max(0, Math.ceil((st.cooldownUntil - Date.now()) / 1000)),
+          st.cooldownReason,
+        )
+        while (Date.now() < st.cooldownUntil) {
           if (options?.isAborted?.()) return
-          await new Promise((r) => setTimeout(r, Math.min(5_000, this.cooldownUntil - Date.now())))
+          await new Promise((r) => setTimeout(r, Math.min(5_000, Math.max(50, st.cooldownUntil - Date.now()))))
         }
       }
 
-      const now = Date.now()
-      const elapsedSinceLastRun = now - this.lastRunAt
-      if (this.lastRunAt > 0 && elapsedSinceLastRun < this.staggerMs) {
-        const remainingMs = this.staggerMs - elapsedSinceLastRun
-        const remainingSec = Math.ceil(remainingMs / 1000)
-        options?.onWait?.(remainingSec)
-        await new Promise((r) => setTimeout(r, remainingMs))
-      }
+      // 2. Stagger queue for this account
+      let releaseQueue!: () => void
+      const nextInQueue = new Promise<void>((resolve) => {
+        releaseQueue = resolve
+      })
+      const prevInQueue = st.queueTail
+      st.queueTail = prevInQueue.then(() => nextInQueue).catch(() => nextInQueue)
+      await prevInQueue
 
-      this.lastRunAt = Date.now()
-    } finally {
-      releaseQueue()
+      try {
+        if (options?.isAborted?.()) return
+        // A cooldown may have started while this worker waited in the queue
+        if (Date.now() < st.cooldownUntil) continue
+
+        const now = Date.now()
+        const elapsedSinceLastRun = now - st.lastRunAt
+        if (st.lastRunAt > 0 && elapsedSinceLastRun < this.staggerMs) {
+          const remainingMs = this.staggerMs - elapsedSinceLastRun
+          options?.onWait?.(Math.ceil(remainingMs / 1000))
+          await new Promise((r) => setTimeout(r, remainingMs))
+        }
+        st.lastRunAt = Date.now()
+        return
+      } finally {
+        releaseQueue()
+      }
     }
   }
 
-  public recordRunPressed() {
-    this.lastRunAt = Date.now()
+  public recordRunPressed(accountSlot: number = 1) {
+    this.acct(accountSlot).lastRunAt = Date.now()
   }
 }
 
 const globalForRunStaggerGate = globalThis as unknown as {
-  __cmtStudioRunStaggerGate?: GlobalStudioRunStaggerGate
+  __cmtStudioRunStaggerGateV2?: GlobalStudioRunStaggerGate
 }
 
 export const globalStudioRunStaggerGate: GlobalStudioRunStaggerGate =
-  globalForRunStaggerGate.__cmtStudioRunStaggerGate ||
-  (globalForRunStaggerGate.__cmtStudioRunStaggerGate = new GlobalStudioRunStaggerGate())
+  globalForRunStaggerGate.__cmtStudioRunStaggerGateV2 ||
+  (globalForRunStaggerGate.__cmtStudioRunStaggerGateV2 = new GlobalStudioRunStaggerGate())
 
 let globalClipboardLockPromise: Promise<void> = Promise.resolve()
 
@@ -778,6 +811,8 @@ async function withClipboardLock<T>(fn: () => Promise<T>): Promise<T> {
 export interface StudioBrowserControllerOptions {
   profileDirName?: string
   workerTag?: string
+  /** Google account slot (1..3) from Settings; default 1 */
+  googleAccountSlot?: 1 | 2 | 3
 }
 
 export class StudioBrowserController {
@@ -825,6 +860,55 @@ export class StudioBrowserController {
   constructor(options?: StudioBrowserControllerOptions) {
     this.profileDirName = options?.profileDirName || STUDIO_CHROME_PROFILE_NAME
     this.workerTag = options?.workerTag || ''
+    this.googleAccountSlot = options?.googleAccountSlot || 1
+    setStudioHolderAccount(this.profileDirName, this.googleAccountSlot)
+  }
+
+  /** Google account (Settings slot 1..3) whose cookies / quota / cooldown this browser uses. */
+  private googleAccountSlot: 1 | 2 | 3 = 1
+
+  public getGoogleAccountSlot(): 1 | 2 | 3 {
+    return this.googleAccountSlot
+  }
+
+  /**
+   * Switch this worker to another Google account. An open browser is closed so the next
+   * launch wipes the profile's old session and seeds the new account's cookies
+   * (two accounts never share one Chrome profile).
+   */
+  public async setGoogleAccountSlot(slot: number): Promise<boolean> {
+    const next: 1 | 2 | 3 = slot === 2 || slot === 3 ? slot : 1
+    setStudioHolderAccount(this.profileDirName, next)
+    if (next === this.googleAccountSlot) return false
+    this.googleAccountSlot = next
+    this.appliedCookieFingerprint = null
+    if (this.context && !this.assistMode) {
+      await this.closeContext().catch(() => {})
+    }
+    return true
+  }
+
+  private readProfileAccountMarker(): number | null {
+    try {
+      const f = path.join(DATA_DIR, this.profileDirName, '.google-account')
+      if (fs.existsSync(f)) {
+        const n = Number(fs.readFileSync(f, 'utf8').trim())
+        return n === 1 || n === 2 || n === 3 ? n : null
+      }
+    } catch {
+      /* ignore */
+    }
+    return null
+  }
+
+  private writeProfileAccountMarker(slot: number) {
+    try {
+      const profileDir = path.join(DATA_DIR, this.profileDirName)
+      fs.mkdirSync(profileDir, { recursive: true })
+      fs.writeFileSync(path.join(profileDir, '.google-account'), String(slot), 'utf8')
+    } catch {
+      /* ignore */
+    }
   }
 
   public setScanContextTag(tag: string) {
@@ -1190,8 +1274,9 @@ export class StudioBrowserController {
       await this.saveWorkerLocalSessionIfAuthenticated()
       const state = await this.context.storageState()
       const { saveUserGoogleCookies } = await import('./studio-settings')
-      await saveUserGoogleCookies(username || 'admin', JSON.stringify(state))
-      const newFp = await getSettingsCookieFingerprint(username || 'admin')
+      // Save into THIS worker's own account slot (never overwrite account 1 from an account-2 worker)
+      await saveUserGoogleCookies(username || 'admin', JSON.stringify(state), this.googleAccountSlot)
+      const newFp = await getSettingsCookieFingerprint(username || 'admin', this.googleAccountSlot)
       this.appliedCookieFingerprint = newFp
       this.writeProfileCookieFingerprint(newFp)
       const workerCookieId = this.computeWorkerCookieId(allCookies)
@@ -1213,9 +1298,9 @@ export class StudioBrowserController {
     onLog?: (level: 'info' | 'warn' | 'error' | 'success', message: string) => void,
   ) {
     const worker = this.workerTag.replace(/^\[|\]$/g, '') || this.profileDirName
-    const res = globalStudioRunStaggerGate.reportAccountError(kind, worker)
+    const res = globalStudioRunStaggerGate.reportAccountError(kind, worker, this.googleAccountSlot)
     if (res.cooldownStarted) {
-      const msg = `${jobLabel}: HTTP ${kind} burst across workers -> pausing Run on ALL workers for ${res.cooldownSec}s so the shared Google account can recover (retries no longer hammer AI Studio)`
+      const msg = `${jobLabel}: HTTP ${kind} burst on Account ${this.googleAccountSlot} -> pausing Run on all Account ${this.googleAccountSlot} workers for ${res.cooldownSec}s so the account can recover (other accounts keep running)`
       this.logStep('account cooldown started', msg, 'warn')
       onLog?.('warn', msg)
     }
@@ -1382,7 +1467,7 @@ export class StudioBrowserController {
     forceApply = false,
   ): Promise<void> {
     if (!this.context) return
-    const fingerprint = await getSettingsCookieFingerprint(username)
+    const fingerprint = await getSettingsCookieFingerprint(username, this.googleAccountSlot)
     if (!forceApply && this.appliedCookieFingerprint === fingerprint) {
       return
     }
@@ -1433,8 +1518,8 @@ export class StudioBrowserController {
       }
     }
 
-    // 3. Initial seed from Settings when this worker profile has no session yet
-    const cookies = await loadDecryptedPlaywrightCookies(username)
+    // 3. Initial seed from Settings (this worker's Google account) when the profile has no session yet
+    const cookies = await loadDecryptedPlaywrightCookies(username, this.googleAccountSlot)
 
     if (cookies.length === 0) {
       // If user is actively in Login Assist mode, do NOT wipe their in-progress login!
@@ -1451,7 +1536,7 @@ export class StudioBrowserController {
       this.lastInjectedCookieUser = null
       this.logStep(
         'cookies cleared',
-        'No cookies configured in Settings — cleared all browser cookies & session storage',
+        `No cookies configured in Settings for Account ${this.googleAccountSlot} — cleared all browser cookies & session storage`,
         'warn',
       )
       return
@@ -1465,7 +1550,7 @@ export class StudioBrowserController {
       this.writeProfileCookieFingerprint(fingerprint)
       this.logStep(
         'cookies seeded from Settings',
-        `${cookies.length} Google cookie(s) seeded into ${this.profileDirName} (workerId=${workerCookieId}, settingsId=${fingerprint.slice(0, 8)})`,
+        `${cookies.length} Google cookie(s) of Account ${this.googleAccountSlot} seeded into ${this.profileDirName} (workerId=${workerCookieId}, settingsId=${fingerprint.slice(0, 8)})`,
         'info',
       )
     } catch (err) {
@@ -1514,7 +1599,7 @@ export class StudioBrowserController {
         if (!fs.existsSync(profileDir)) fs.mkdirSync(profileDir, { recursive: true })
         // Only wipe disk session files if Settings cookies were explicitly deleted (currentFp === 'NONE').
         // NEVER wipe a worker's persistent profile just because another worker rotated cookies!
-        const currentFp = await getSettingsCookieFingerprint(username)
+        const currentFp = await getSettingsCookieFingerprint(username, this.googleAccountSlot)
         const diskFp = this.readProfileCookieFingerprint()
         if (
           !this.assistMode &&
@@ -1525,6 +1610,25 @@ export class StudioBrowserController {
         ) {
           this.wipeProfileSessionFilesOnDisk(profileDir)
         }
+        // One Chrome profile = one Google account. Profiles without a marker were seeded from
+        // the base profile (= Account 1). If this worker now uses another account, wipe the old
+        // session (cookies, storage, worker-cookies.json) so the new account's cookies are seeded.
+        const profileAccount = this.readProfileAccountMarker() ?? 1
+        if (!this.assistMode && profileAccount !== this.googleAccountSlot) {
+          this.wipeProfileSessionFilesOnDisk(profileDir)
+          try {
+            fs.rmSync(path.join(profileDir, 'worker-cookies.json'), { force: true })
+            fs.rmSync(path.join(profileDir, '.worker-cookie-id'), { force: true })
+          } catch {
+            /* ignore */
+          }
+          this.logStep(
+            'account switch',
+            `${this.profileDirName}: Account ${profileAccount} -> Account ${this.googleAccountSlot} (old session wiped, new account cookies will be seeded)`,
+            'info',
+          )
+        }
+        this.writeProfileAccountMarker(this.googleAccountSlot)
         this.appliedCookieFingerprint = null
 
         const displayEnv = await this.ensureXvfbDisplay()
@@ -1862,8 +1966,8 @@ export class StudioBrowserController {
     } else if (action.type === 'save_session' && this.context) {
       const state = await this.context.storageState()
       const { saveUserGoogleCookies } = await import('./studio-settings')
-      await saveUserGoogleCookies(username, JSON.stringify(state))
-      const newFp = await getSettingsCookieFingerprint(username)
+      await saveUserGoogleCookies(username, JSON.stringify(state), this.googleAccountSlot)
+      const newFp = await getSettingsCookieFingerprint(username, this.googleAccountSlot)
       this.appliedCookieFingerprint = newFp
       this.writeProfileCookieFingerprint(newFp)
       this.logStep('session saved', `Saved ${state.cookies.length} cookies from live browser (id=${newFp.slice(0, 8)})`, 'success')
@@ -1931,20 +2035,18 @@ export class StudioBrowserController {
       await this.saveLiveSessionToSettingsIfAuthenticated(username).catch(() => {})
     }
 
-    await saveStudioUserConfig(username, {
-      lastLoginStatus: loggedIn ? 'logged_in' : 'logged_out',
-      lastLoginEmail: email,
-      lastLoginTestedAt: Date.now(),
-    })
+    await recordGoogleAccountLoginTest(username, this.googleAccountSlot, { loggedIn, email })
 
     if (loggedIn) {
-      const msg = `Logged in to Google AI Studio${email ? ` as ${email}` : ''}`
+      const msg = `Account ${this.googleAccountSlot}: logged in to Google AI Studio${email ? ` as ${email}` : ''}`
       this.logStep('login verified', msg, 'success')
       return { loggedIn: true, email, currentUrl: url, message: msg }
     } else {
-      const msg = isGoogleLoginRedirect
-        ? 'Redirected to Google Sign-In (cookies expired or verification needed — use Login Assist in Live View or paste fresh cookies)'
-        : `Could not confirm AI Studio workspace at ${url}`
+      const msg = `Account ${this.googleAccountSlot}: ${
+        isGoogleLoginRedirect
+          ? 'Redirected to Google Sign-In (cookies expired or verification needed — use Login Assist in Live View or paste fresh cookies)'
+          : `Could not confirm AI Studio workspace at ${url}`
+      }`
       this.logStep('login failed', msg, 'error')
       return { loggedIn: false, email: null, currentUrl: url, message: msg }
     }
@@ -3283,7 +3385,7 @@ export class StudioBrowserController {
       }
     }
 
-    const quotaStateNow = await loadStudioModelQuotaState()
+    const quotaStateNow = await loadStudioModelQuotaState(Date.now(), this.googleAccountSlot)
     const startCanonical = canonicalizeStudioModelName(targetModelName)
     const startIdx = Math.max(
       0,
@@ -6292,7 +6394,7 @@ export class StudioBrowserController {
    *    - Never run the shrink check after pressing Run (during generation the counter can include output tokens)
    *    - Keep the implausibly low token counter check (minimum 500 tokens/sec of video)
    *    - Wait 10s after token counter settles before pressing Run
-   * e. Press Run -> capture GenerateContent network response (status + body) & page toast -> wait up to 10m -> check permission denied first (own 5-retry counter + model fallback 3.8 -> 3.7 -> 3.6 Flash) -> detect completion via STOP_GONE | HISSA_FOUND | STABLE_6S
+   * e. Press Run -> capture GenerateContent network response (status + body) & page toast -> wait up to 15m -> check permission denied first (own 5-retry counter + model fallback 3.8 -> 3.7 -> 3.6 Flash) -> detect completion via STOP_GONE | HISSA_FOUND | STABLE_6S
    * f. Fetch final answer via turn "Copy as text" (or DOM fallback) -> synchronously validate with validateStudioAnswer (retry up to 3x in new chat if invalid) -> calibrate offset mode -> parseChunkMatches
    * g. Save rotated cookies/profile & recycle Playwright page in same persistent context after every N finished window jobs (default 5)
    */
@@ -6409,7 +6511,7 @@ export class StudioBrowserController {
     )
     const MODEL_FALLBACK_CHAIN = buildStudioFallbackCycle(chosenModel)
     const formatQuotaResetTime = async (): Promise<string> => {
-      const qState = await loadStudioModelQuotaState()
+      const qState = await loadStudioModelQuotaState(Date.now(), this.googleAccountSlot)
       const timestamps = Object.values(qState.exhausted).filter((t) => Number.isFinite(t) && t > 0)
       const earliestTs = timestamps.length > 0 ? Math.min(...timestamps) : Date.now()
       return new Date(earliestTs).toLocaleTimeString('en-US', {
@@ -6436,13 +6538,13 @@ export class StudioBrowserController {
     if (initialEffectiveModel) {
       this.logStep(
         'model assigned',
-        `${jobLabel}: ${initialEffectiveModel} (models in use: ${describeStudioModelLeases()})`,
+        `${jobLabel}: ${initialEffectiveModel} on Account ${this.googleAccountSlot} (models in use on this account: ${describeStudioModelLeases(Date.now(), this.googleAccountSlot)})`,
         'info',
       )
     }
     if (!initialEffectiveModel) {
       const resetTimeStr = await formatQuotaResetTime()
-      throw new Error(`NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`)
+      throw new Error(`NEEDS_ATTENTION: saare models ka quota khatam (Account ${this.googleAccountSlot}), reset ${resetTimeStr} par`)
     }
 
     let activeModelName = initialEffectiveModel
@@ -7178,7 +7280,8 @@ export class StudioBrowserController {
         page.on('response', onRunResponse)
 
         const runStarted = Date.now()
-        const TIMEOUT_MS = 10 * 60_000
+        // Max time a single Run may stay generating / "Thinking" (all models)
+        const TIMEOUT_MS = 15 * 60_000
         const INCOMPLETE_REASONS = new Set([
           'empty',
           'missing_hissa',
@@ -7265,6 +7368,7 @@ export class StudioBrowserController {
           // Keep this window's model slot fresh (stale leases expire after 30 min)
           updateExclusiveStudioModelLease(this.profileDirName, activeModelName)
           await globalStudioRunStaggerGate.acquireRunSlot(jobLabel, {
+            accountSlot: this.googleAccountSlot,
             isAborted: () => this.isStopping(scope),
             onWait: (waitRemainingSec) => {
               const waitMsg = `Waiting ${waitRemainingSec}s before pressing Run on ${jobLabel} (${staggerSec}s Run stagger gate between windows)`
@@ -7350,7 +7454,7 @@ export class StudioBrowserController {
           for (let runClickTry = 1; runClickTry <= 3; runClickTry++) {
             await triggerRunButtonOrShortcut(runClickTry)
             if (runClickTry === 1) {
-              globalStudioRunStaggerGate.recordRunPressed()
+              globalStudioRunStaggerGate.recordRunPressed(this.googleAccountSlot)
               this.logStep('press Run', `${jobLabel} [${activeModelName}]`)
             } else {
               this.logStep(
@@ -7607,13 +7711,13 @@ export class StudioBrowserController {
                 ? canonicalizeStudioModelName(currentUiCard)
                 : activeModelName
               const exhaustedModel = actualUiModel || activeModelName
-              await markModelExhausted(exhaustedModel)
+              await markModelExhausted(exhaustedModel, Date.now(), this.googleAccountSlot)
               if (
                 activeModelName &&
                 activeModelName.toLowerCase() !== exhaustedModel.toLowerCase() &&
                 !currentUiCard
               ) {
-                await markModelExhausted(activeModelName)
+                await markModelExhausted(activeModelName, Date.now(), this.googleAccountSlot)
               }
 
               let nextAvailableModel = await getEffectiveModel(
@@ -7625,7 +7729,7 @@ export class StudioBrowserController {
               )
               if (!nextAvailableModel) {
                 const resetTimeStr = await formatQuotaResetTime()
-                const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`
+                const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam (Account ${this.googleAccountSlot}), reset ${resetTimeStr} par`
                 this.logStep('all models quota exhausted', allExhaustedMsg, 'error')
                 onLog?.('error', `${allExhaustedMsg} (${jobLabel})`)
                 throw new Error(allExhaustedMsg)
@@ -7651,7 +7755,7 @@ export class StudioBrowserController {
               // If the UI is still stuck on the exhausted model (e.g. target fallback model wasn't selectable),
               // mark the attempted fallback exhausted too and pick the next available model
               if (activeModelName.toLowerCase() === exhaustedModel.toLowerCase()) {
-                await markModelExhausted(nextAvailableModel)
+                await markModelExhausted(nextAvailableModel, Date.now(), this.googleAccountSlot)
                 nextAvailableModel = await getEffectiveModel(
                   chosenModel,
                   MODEL_FALLBACK_CHAIN,
@@ -7661,7 +7765,7 @@ export class StudioBrowserController {
                 )
                 if (!nextAvailableModel) {
                   const resetTimeStr = await formatQuotaResetTime()
-                  const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`
+                  const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam (Account ${this.googleAccountSlot}), reset ${resetTimeStr} par`
                   this.logStep('all models quota exhausted', allExhaustedMsg, 'error')
                   onLog?.('error', `${allExhaustedMsg} (${jobLabel})`)
                   throw new Error(allExhaustedMsg)
@@ -8124,7 +8228,7 @@ export class StudioBrowserController {
 
           if (!curVal.ok) {
             validationReason =
-              !doneIndicator && curVal.reason === 'empty' ? 'timeout_10m' : curVal.reason
+              !doneIndicator && curVal.reason === 'empty' ? 'timeout_15m' : curVal.reason
             return
           }
 
@@ -8318,7 +8422,7 @@ export class StudioBrowserController {
               if (qMsg.startsWith('QUOTA_EXCEEDED_ERROR:') || this.isQuotaOrDailyLimitErrorText(qMsg)) {
                 const uiCardNow = await this.readVisibleModelCardText(page)
                 const exhaustedMod = uiCardNow ? canonicalizeStudioModelName(uiCardNow) : activeModelName
-                await markModelExhausted(exhaustedMod)
+                await markModelExhausted(exhaustedMod, Date.now(), this.googleAccountSlot)
                 const nextMod = await getEffectiveModel(
                   chosenModel,
                   MODEL_FALLBACK_CHAIN,
@@ -8328,7 +8432,7 @@ export class StudioBrowserController {
                 )
                 if (!nextMod) {
                   const resetTimeStr = await formatQuotaResetTime()
-                  const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`
+                  const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam (Account ${this.googleAccountSlot}), reset ${resetTimeStr} par`
                   this.logStep('all models quota exhausted', allExhaustedMsg, 'error')
                   onLog?.('error', `${allExhaustedMsg} (${jobLabel})`)
                   throw new Error(allExhaustedMsg)
@@ -8432,7 +8536,7 @@ export class StudioBrowserController {
                   if (contMsg.startsWith('QUOTA_EXCEEDED_ERROR:') || this.isQuotaOrDailyLimitErrorText(contMsg)) {
                     const uiCardNow = await this.readVisibleModelCardText(page)
                     const exhaustedMod = uiCardNow ? canonicalizeStudioModelName(uiCardNow) : activeModelName
-                    await markModelExhausted(exhaustedMod)
+                    await markModelExhausted(exhaustedMod, Date.now(), this.googleAccountSlot)
                     const nextMod = await getEffectiveModel(
                       chosenModel,
                       MODEL_FALLBACK_CHAIN,
@@ -8442,7 +8546,7 @@ export class StudioBrowserController {
                     )
                     if (!nextMod) {
                       const resetTimeStr = await formatQuotaResetTime()
-                      const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`
+                      const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam (Account ${this.googleAccountSlot}), reset ${resetTimeStr} par`
                       this.logStep('all models quota exhausted', allExhaustedMsg, 'error')
                       onLog?.('error', `${allExhaustedMsg} (${jobLabel})`)
                       throw new Error(allExhaustedMsg)

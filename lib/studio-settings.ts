@@ -18,6 +18,35 @@ import {
   MAX_STUDIO_PARALLEL_CONCURRENCY,
 } from './studio-error-classifier'
 
+/** Google account slots for AI Studio workers. Slot 1 = the original Settings cookies. */
+export type GoogleAccountSlot = 1 | 2 | 3
+export const GOOGLE_ACCOUNT_SLOTS: GoogleAccountSlot[] = [1, 2, 3]
+
+export function normalizeGoogleAccountSlot(raw: unknown): GoogleAccountSlot {
+  const n = Number(raw)
+  return n === 2 || n === 3 ? n : 1
+}
+
+/** Extra Google account (slot 2 / 3): same fields as the slot-1 cookies on StudioUserConfig. */
+export interface GoogleAccountRecord {
+  /** Encrypted JSON string (Cookie-Editor array or Playwright storageState) — NEVER sent to client */
+  encryptedCookies?: string
+  lastLoginEmail?: string | null
+  lastLoginStatus?: 'logged_in' | 'logged_out' | 'untested'
+  lastLoginTestedAt?: number | null
+}
+
+export interface PublicGoogleAccount {
+  slot: GoogleAccountSlot
+  hasCookies: boolean
+  cookieCount: number
+  lastLoginEmail: string | null
+  lastLoginStatus: 'logged_in' | 'logged_out' | 'untested'
+  lastLoginTestedAt: number | null
+  /** Models whose daily quota is exhausted on THIS account (model -> reset timestamp) */
+  exhaustedModels: Record<string, number>
+}
+
 export interface StudioUserConfig {
   chunkScanEngine: ChunkScanEngine
   studioModelName: string
@@ -42,6 +71,8 @@ export interface StudioUserConfig {
   lastLoginEmail?: string | null
   lastLoginStatus?: 'logged_in' | 'logged_out' | 'untested'
   lastLoginTestedAt?: number | null
+  /** Google accounts 2 and 3 (account 1 = encryptedCookies / lastLogin* above) */
+  extraGoogleAccounts?: Partial<Record<'2' | '3', GoogleAccountRecord>>
   /** Encrypted Google Drive OAuth token bundle — NEVER sent to client */
   encryptedDriveTokens?: string
   driveConnectedEmail?: string | null
@@ -98,6 +129,8 @@ export interface PublicStudioSettings {
   studioAttachMovieFromDrive: boolean
   hasCookies: boolean
   cookieCount: number
+  /** All 3 Google account slots (1 = the cookies above) with their login + quota status */
+  googleAccounts: PublicGoogleAccount[]
   lastLoginEmail: string | null
   lastLoginStatus: 'logged_in' | 'logged_out' | 'untested'
   lastLoginTestedAt: number | null
@@ -444,10 +477,46 @@ export function parseCookieInputToPlaywright(rawJson: string): PlaywrightCookie[
   return out
 }
 
-export async function saveUserGoogleCookies(username: string, rawCookieJson: string): Promise<{ count: number }> {
+/** Read one account's record (slot 1 maps onto the original top-level fields). */
+function getGoogleAccountRecord(cfg: StudioUserConfig, slot: GoogleAccountSlot): GoogleAccountRecord {
+  if (slot === 1) {
+    return {
+      encryptedCookies: cfg.encryptedCookies,
+      lastLoginEmail: cfg.lastLoginEmail ?? null,
+      lastLoginStatus: cfg.lastLoginStatus ?? 'untested',
+      lastLoginTestedAt: cfg.lastLoginTestedAt ?? null,
+    }
+  }
+  return cfg.extraGoogleAccounts?.[String(slot) as '2' | '3'] || {}
+}
+
+/** Patch one account's record (slot 1 = top-level fields, 2/3 = extraGoogleAccounts). */
+export async function patchGoogleAccountRecord(
+  username: string,
+  slot: GoogleAccountSlot,
+  patch: GoogleAccountRecord,
+): Promise<void> {
+  if (slot === 1) {
+    await saveStudioUserConfig(username, patch)
+    return
+  }
+  const cfg = await loadStudioUserConfig(username)
+  const key = String(slot) as '2' | '3'
+  const merged: GoogleAccountRecord = { ...(cfg.extraGoogleAccounts?.[key] || {}), ...patch }
+  if (!merged.encryptedCookies) delete merged.encryptedCookies
+  await saveStudioUserConfig(username, {
+    extraGoogleAccounts: { ...(cfg.extraGoogleAccounts || {}), [key]: merged },
+  })
+}
+
+export async function saveUserGoogleCookies(
+  username: string,
+  rawCookieJson: string,
+  slot: GoogleAccountSlot = 1,
+): Promise<{ count: number }> {
   const cookies = parseCookieInputToPlaywright(rawCookieJson)
   const encryptedCookies = encryptSecret(JSON.stringify(cookies))
-  await saveStudioUserConfig(username, {
+  await patchGoogleAccountRecord(username, slot, {
     encryptedCookies,
     lastLoginStatus: 'untested',
     lastLoginEmail: null,
@@ -456,11 +525,36 @@ export async function saveUserGoogleCookies(username: string, rawCookieJson: str
   return { count: cookies.length }
 }
 
-export async function loadDecryptedPlaywrightCookies(username: string): Promise<PlaywrightCookie[]> {
+export async function clearUserGoogleCookies(username: string, slot: GoogleAccountSlot = 1): Promise<void> {
+  await patchGoogleAccountRecord(username, slot, {
+    encryptedCookies: undefined,
+    lastLoginStatus: 'untested',
+    lastLoginEmail: null,
+    lastLoginTestedAt: null,
+  })
+}
+
+export async function recordGoogleAccountLoginTest(
+  username: string,
+  slot: GoogleAccountSlot,
+  result: { loggedIn: boolean; email: string | null },
+): Promise<void> {
+  await patchGoogleAccountRecord(username, slot, {
+    lastLoginStatus: result.loggedIn ? 'logged_in' : 'logged_out',
+    lastLoginEmail: result.email,
+    lastLoginTestedAt: Date.now(),
+  })
+}
+
+export async function loadDecryptedPlaywrightCookies(
+  username: string,
+  slot: GoogleAccountSlot = 1,
+): Promise<PlaywrightCookie[]> {
   const cfg = await loadStudioUserConfig(username)
-  if (cfg.encryptedCookies) {
+  const rec = getGoogleAccountRecord(cfg, slot)
+  if (rec.encryptedCookies) {
     try {
-      const plain = decryptSecret(cfg.encryptedCookies)
+      const plain = decryptSecret(rec.encryptedCookies)
       const parsed = parseCookieInputToPlaywright(plain)
       if (parsed.length > 0) return parsed
     } catch {
@@ -468,6 +562,30 @@ export async function loadDecryptedPlaywrightCookies(username: string): Promise<
     }
   }
   return []
+}
+
+/**
+ * Account slots the parallel workers may use: every slot that has cookies, minus slots whose
+ * last Test login said "logged out" (unless that would leave none). Never empty: [1] fallback.
+ */
+export async function getActiveGoogleAccountSlots(username: string): Promise<GoogleAccountSlot[]> {
+  const cfg = await loadStudioUserConfig(username)
+  const withCookies = GOOGLE_ACCOUNT_SLOTS.filter((slot) =>
+    Boolean(getGoogleAccountRecord(cfg, slot).encryptedCookies),
+  )
+  if (withCookies.length === 0) return [1]
+  const notLoggedOut = withCookies.filter(
+    (slot) => getGoogleAccountRecord(cfg, slot).lastLoginStatus !== 'logged_out',
+  )
+  return notLoggedOut.length > 0 ? notLoggedOut : withCookies
+}
+
+export async function getGoogleAccountEmail(
+  username: string,
+  slot: GoogleAccountSlot,
+): Promise<string | null> {
+  const cfg = await loadStudioUserConfig(username)
+  return getGoogleAccountRecord(cfg, slot).lastLoginEmail ?? null
 }
 
 export async function saveUserYtCookies(username: string, rawCookieJson: string): Promise<{ count: number }> {
@@ -507,8 +625,11 @@ export async function clearUserYtCookies(username: string): Promise<void> {
   })
 }
 
-export async function getSettingsCookieFingerprint(username: string): Promise<string> {
-  const cookies = await loadDecryptedPlaywrightCookies(username)
+export async function getSettingsCookieFingerprint(
+  username: string,
+  slot: GoogleAccountSlot = 1,
+): Promise<string> {
+  const cookies = await loadDecryptedPlaywrightCookies(username, slot)
   if (cookies.length === 0) return 'NONE'
   const canonical = JSON.stringify(
     cookies.map((c) => ({ name: c.name, value: c.value, domain: c.domain, path: c.path })),
@@ -572,6 +693,29 @@ export async function getPublicStudioSettings(username: string): Promise<PublicS
   const effectiveModel =
     (await getEffectiveModel(cfg.studioModelName)) || cfg.studioModelName
 
+  const googleAccounts: PublicGoogleAccount[] = []
+  for (const slot of GOOGLE_ACCOUNT_SLOTS) {
+    const rec = getGoogleAccountRecord(cfg, slot)
+    let count = 0
+    if (rec.encryptedCookies) {
+      try {
+        const parsed = JSON.parse(decryptSecret(rec.encryptedCookies))
+        if (Array.isArray(parsed)) count = parsed.length
+      } catch {
+        count = 0
+      }
+    }
+    googleAccounts.push({
+      slot,
+      hasCookies: count > 0,
+      cookieCount: count,
+      lastLoginEmail: rec.lastLoginEmail ?? null,
+      lastLoginStatus: rec.lastLoginStatus ?? 'untested',
+      lastLoginTestedAt: rec.lastLoginTestedAt ?? null,
+      exhaustedModels: (await loadStudioModelQuotaState(Date.now(), slot)).exhausted,
+    })
+  }
+
   return {
     chunkScanEngine: cfg.chunkScanEngine,
     studioModelName: cfg.studioModelName,
@@ -600,6 +744,7 @@ export async function getPublicStudioSettings(username: string): Promise<PublicS
     studioAttachMovieFromDrive: Boolean(cfg.studioAttachMovieFromDrive ?? false),
     hasCookies: cookieCount > 0,
     cookieCount,
+    googleAccounts,
     lastLoginEmail: cfg.lastLoginEmail ?? null,
     lastLoginStatus: cfg.lastLoginStatus ?? 'untested',
     lastLoginTestedAt: cfg.lastLoginTestedAt ?? null,

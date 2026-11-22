@@ -12,7 +12,7 @@ import {
   Sparkles,
   Trash2,
 } from 'lucide-react'
-import type { PublicStudioSettings } from '@/lib/studio-settings'
+import type { PublicGoogleAccount, PublicStudioSettings } from '@/lib/studio-settings'
 import type { StudioThinkingLevel } from '@/lib/studio-model-state'
 import { YtStudioPanel } from './yt-studio-panel'
 
@@ -62,14 +62,6 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
     studio?.studioRunStaggerSec ?? 20,
   )
 
-  const [cookieText, setCookieText] = useState('')
-  const [savingCookies, setSavingCookies] = useState(false)
-  const [testingLogin, setTestingLogin] = useState(false)
-  const [loginTestResult, setLoginTestResult] = useState<{
-    loggedIn: boolean
-    email?: string | null
-    message: string
-  } | null>(null)
   const [savingConfig, setSavingConfig] = useState(false)
   const [configSaved, setConfigSaved] = useState(false)
   const [connectingDrive, setConnectingDrive] = useState(false)
@@ -212,66 +204,6 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
     onRefresh()
   }
 
-  async function saveCookies() {
-    if (!cookieText.trim()) return
-    setSavingCookies(true)
-    setError(null)
-    const res = await fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ googleCookies: cookieText }),
-    })
-    setSavingCookies(false)
-    if (!res.ok) {
-      const j = await res.json().catch(() => ({}))
-      setError(j.error || 'Failed to save Google cookies')
-      return
-    }
-    setCookieText('')
-    onRefresh()
-  }
-
-  async function clearCookies() {
-    setSavingCookies(true)
-    setError(null)
-    await fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ clearGoogleCookies: true }),
-    })
-    setSavingCookies(false)
-    setLoginTestResult(null)
-    onRefresh()
-  }
-
-  async function runLoginTest() {
-    setTestingLogin(true)
-    setError(null)
-    setLoginTestResult(null)
-    try {
-      const res = await fetch('/api/studio/control', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'test_login' }),
-      })
-      const data = await res.json()
-      if (!res.ok || !data.ok) {
-        setError(data.error || 'Login test failed')
-      } else {
-        setLoginTestResult({
-          loggedIn: Boolean(data.loggedIn),
-          email: data.email,
-          message: data.message,
-        })
-      }
-      onRefresh()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setTestingLogin(false)
-    }
-  }
-
   async function connectDrive() {
     setConnectingDrive(true)
     setError(null)
@@ -302,99 +234,7 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* Left column: Google Cookies + Test Login + Google Drive OAuth */}
         <div className="space-y-3">
-          <div className="rounded-lg border border-border bg-card/80 p-3 space-y-2.5">
-            <div className="flex items-center justify-between gap-2 flex-wrap">
-              <div className="flex items-center gap-1.5">
-                <Cookie className="size-4 text-amber-400" />
-                <span className="text-xs font-semibold">Google cookies (AI Studio session)</span>
-              </div>
-              {studio?.hasCookies ? (
-                <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 font-mono text-[11px] text-emerald-400">
-                  <ShieldCheck className="size-3" />
-                  {studio.cookieCount} cookies encrypted
-                </span>
-              ) : (
-                <span className="rounded-full bg-destructive/15 px-2 py-0.5 text-[11px] text-destructive">
-                  not set
-                </span>
-              )}
-            </div>
-
-            <textarea
-              value={cookieText}
-              onChange={(e) => setCookieText(e.target.value)}
-              rows={3}
-              placeholder={
-                studio?.hasCookies
-                  ? 'Cookies stored encrypted on server (never returned). Paste new Cookie-Editor JSON or Playwright storageState to replace...'
-                  : 'Paste JSON exported from Cookie-Editor ([...]) or Playwright storageState ({"cookies":[...]})'
-              }
-              className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring"
-            />
-
-            <div className="flex items-center gap-2 flex-wrap">
-              <button
-                type="button"
-                onClick={saveCookies}
-                disabled={savingCookies || !cookieText.trim()}
-                className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-40"
-              >
-                {savingCookies ? 'Encrypting...' : studio?.hasCookies ? 'Replace Cookies' : 'Save Encrypted'}
-              </button>
-
-              <button
-                type="button"
-                onClick={runLoginTest}
-                disabled={testingLogin || !studio?.hasCookies}
-                className="inline-flex items-center gap-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-40"
-              >
-                {testingLogin ? (
-                  <>
-                    <Loader2 className="size-3.5 animate-spin" />
-                    Testing aistudio.google.com...
-                  </>
-                ) : (
-                  <>
-                    <Sparkles className="size-3.5" />
-                    Test login
-                  </>
-                )}
-              </button>
-
-              {studio?.hasCookies && (
-                <button
-                  type="button"
-                  onClick={clearCookies}
-                  disabled={savingCookies}
-                  className="ml-auto inline-flex items-center gap-1 rounded-md border border-border px-2 py-1.5 text-xs text-muted-foreground hover:text-destructive"
-                  title="Delete stored cookies"
-                >
-                  <Trash2 className="size-3.5" />
-                </button>
-              )}
-            </div>
-
-            {(loginTestResult || studio?.lastLoginStatus !== 'untested') && (
-              <div
-                className={`rounded-md border px-2.5 py-1.5 text-xs ${
-                  (loginTestResult ? loginTestResult.loggedIn : studio?.lastLoginStatus === 'logged_in')
-                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
-                    : 'border-amber-500/40 bg-amber-500/10 text-amber-300'
-                }`}
-              >
-                {loginTestResult ? (
-                  <span>
-                    {loginTestResult.loggedIn ? '✓ Logged IN' : '✗ Logged OUT'} — {loginTestResult.message}
-                  </span>
-                ) : (
-                  <span>
-                    Last test: {studio?.lastLoginStatus === 'logged_in' ? '✓ Logged IN' : '✗ Logged OUT'}
-                    {studio?.lastLoginEmail ? ` (${studio.lastLoginEmail})` : ''}
-                  </span>
-                )}
-              </div>
-            )}
-          </div>
+          <GoogleAccountsPanel studio={studio} onRefresh={onRefresh} />
 
           {/* Google Drive OAuth (drive.file scope) */}
           <div className="rounded-lg border border-border bg-card/80 p-3 space-y-2">
@@ -736,6 +576,272 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
 
       {/* YouTube Studio — Clip Uploader & Login Assist */}
       <YtStudioPanel studio={studio} onRefresh={onRefresh} />
+    </div>
+  )
+}
+
+type GoogleAccountView = Pick<
+  PublicGoogleAccount,
+  'slot' | 'hasCookies' | 'cookieCount' | 'lastLoginEmail' | 'lastLoginStatus' | 'lastLoginTestedAt' | 'exhaustedModels'
+>
+
+/** Same round-robin as resolveGoogleAccountForWorker() on the server (for the preview only). */
+function previewAccountSplit(accounts: GoogleAccountView[], workers: number): string[] {
+  const withCookies = accounts.filter((a) => a.hasCookies).map((a) => a.slot)
+  const notLoggedOut = accounts
+    .filter((a) => a.hasCookies && a.lastLoginStatus !== 'logged_out')
+    .map((a) => a.slot)
+  const active = notLoggedOut.length > 0 ? notLoggedOut : withCookies.length > 0 ? withCookies : [1]
+  const lines: string[] = []
+  for (const acct of active) {
+    const ws: string[] = []
+    for (let i = 1; i <= workers; i++) {
+      if (active[(i - 1) % active.length] === acct) ws.push(`W${String(i).padStart(2, '0')}`)
+    }
+    lines.push(`Account ${acct}: ${ws.length > 0 ? ws.join(', ') : '—'} (${ws.length})`)
+  }
+  return lines
+}
+
+function GoogleAccountsPanel({
+  studio,
+  onRefresh,
+}: {
+  studio?: PublicStudioSettings
+  onRefresh: () => void
+}) {
+  const accounts: GoogleAccountView[] =
+    studio?.googleAccounts && studio.googleAccounts.length > 0
+      ? studio.googleAccounts
+      : [
+          {
+            slot: 1,
+            hasCookies: Boolean(studio?.hasCookies),
+            cookieCount: studio?.cookieCount ?? 0,
+            lastLoginEmail: studio?.lastLoginEmail ?? null,
+            lastLoginStatus: studio?.lastLoginStatus ?? 'untested',
+            lastLoginTestedAt: studio?.lastLoginTestedAt ?? null,
+            exhaustedModels: studio?.studioExhaustedModels ?? {},
+          },
+          ...([2, 3] as const).map((slot) => ({
+            slot,
+            hasCookies: false,
+            cookieCount: 0,
+            lastLoginEmail: null,
+            lastLoginStatus: 'untested' as const,
+            lastLoginTestedAt: null,
+            exhaustedModels: {},
+          })),
+        ]
+  const workers = studio?.studioConcurrency ?? 6
+  const split = previewAccountSplit(accounts, workers)
+
+  return (
+    <div className="rounded-lg border border-border bg-card/80 p-3 space-y-2.5">
+      <div className="flex items-center gap-1.5">
+        <Cookie className="size-4 text-amber-400" />
+        <span className="text-xs font-semibold">Google accounts (AI Studio sessions)</span>
+      </div>
+      <p className="text-[11px] text-muted-foreground leading-relaxed">
+        Account 1 is required; 2 and 3 are optional. Workers are split evenly across the accounts that
+        have cookies (an account whose Test login fails is skipped). Each account has its own model
+        limits, quota and cooldown.
+      </p>
+      <div className="rounded-md border border-sky-500/30 bg-sky-500/10 px-2.5 py-1.5 font-mono text-[11px] text-sky-200">
+        <div className="text-sky-300/80">Split for {workers} parallel windows:</div>
+        {split.map((line) => (
+          <div key={line}>{line}</div>
+        ))}
+      </div>
+      {accounts.map((acct) => (
+        <GoogleAccountCard key={acct.slot} account={acct} onRefresh={onRefresh} />
+      ))}
+    </div>
+  )
+}
+
+function GoogleAccountCard({
+  account,
+  onRefresh,
+}: {
+  account: GoogleAccountView
+  onRefresh: () => void
+}) {
+  const [cookieText, setCookieText] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [testResult, setTestResult] = useState<{ loggedIn: boolean; message: string } | null>(null)
+
+  async function saveCookies() {
+    if (!cookieText.trim()) return
+    setSaving(true)
+    setError(null)
+    setTestResult(null)
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ googleCookies: cookieText, googleAccountSlot: account.slot }),
+    })
+    setSaving(false)
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}))
+      setError(j.error || `Failed to save cookies for Account ${account.slot}`)
+      return
+    }
+    setCookieText('')
+    onRefresh()
+  }
+
+  async function clearCookies() {
+    setSaving(true)
+    setError(null)
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clearGoogleCookies: true, googleAccountSlot: account.slot }),
+    })
+    setSaving(false)
+    setTestResult(null)
+    onRefresh()
+  }
+
+  async function runLoginTest() {
+    setTesting(true)
+    setError(null)
+    setTestResult(null)
+    try {
+      const res = await fetch('/api/studio/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'test_login', googleAccountSlot: account.slot }),
+      })
+      const data = await res.json()
+      if (!res.ok || !data.ok) {
+        setError(data.error || 'Login test failed')
+      } else {
+        setTestResult({ loggedIn: Boolean(data.loggedIn), message: data.message })
+      }
+      onRefresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  const loggedIn = testResult ? testResult.loggedIn : account.lastLoginStatus === 'logged_in'
+  const showStatus = Boolean(testResult) || account.lastLoginStatus !== 'untested'
+  const exhausted = Object.keys(account.exhaustedModels || {})
+
+  return (
+    <div className="rounded-md border border-border/70 bg-background/40 p-2.5 space-y-2">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <span className="text-xs font-semibold">
+          Account {account.slot}
+          {account.slot === 1 ? '' : ' (optional)'}
+          {account.lastLoginEmail ? (
+            <span className="ml-1.5 font-mono font-normal text-muted-foreground">{account.lastLoginEmail}</span>
+          ) : null}
+        </span>
+        {account.hasCookies ? (
+          <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 font-mono text-[11px] text-emerald-400">
+            <ShieldCheck className="size-3" />
+            {account.cookieCount} cookies encrypted
+          </span>
+        ) : (
+          <span
+            className={`rounded-full px-2 py-0.5 text-[11px] ${
+              account.slot === 1 ? 'bg-destructive/15 text-destructive' : 'bg-secondary text-muted-foreground'
+            }`}
+          >
+            not set
+          </span>
+        )}
+      </div>
+
+      <textarea
+        value={cookieText}
+        onChange={(e) => setCookieText(e.target.value)}
+        rows={2}
+        placeholder={
+          account.hasCookies
+            ? `Account ${account.slot} cookies stored encrypted (never returned). Paste new Cookie-Editor JSON to replace...`
+            : `Paste Account ${account.slot} cookies: Cookie-Editor JSON ([...]) or Playwright storageState ({"cookies":[...]})`
+        }
+        className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring"
+      />
+
+      <div className="flex items-center gap-2 flex-wrap">
+        <button
+          type="button"
+          onClick={saveCookies}
+          disabled={saving || !cookieText.trim()}
+          className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-40"
+        >
+          {saving ? 'Encrypting...' : account.hasCookies ? 'Replace Cookies' : 'Save Encrypted'}
+        </button>
+
+        <button
+          type="button"
+          onClick={runLoginTest}
+          disabled={testing || !account.hasCookies}
+          className="inline-flex items-center gap-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-40"
+        >
+          {testing ? (
+            <>
+              <Loader2 className="size-3.5 animate-spin" />
+              Testing Account {account.slot}...
+            </>
+          ) : (
+            <>
+              <Sparkles className="size-3.5" />
+              Test login
+            </>
+          )}
+        </button>
+
+        {account.hasCookies && (
+          <button
+            type="button"
+            onClick={clearCookies}
+            disabled={saving}
+            className="ml-auto inline-flex items-center gap-1 rounded-md border border-border px-2 py-1.5 text-xs text-muted-foreground hover:text-destructive"
+            title={`Delete Account ${account.slot} cookies`}
+          >
+            <Trash2 className="size-3.5" />
+          </button>
+        )}
+      </div>
+
+      {showStatus && (
+        <div
+          className={`rounded-md border px-2.5 py-1.5 text-xs ${
+            loggedIn
+              ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+              : 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+          }`}
+        >
+          {testResult ? (
+            <span>
+              {testResult.loggedIn ? '✓ Logged IN' : '✗ Logged OUT'} — {testResult.message}
+            </span>
+          ) : (
+            <span>
+              Last test: {account.lastLoginStatus === 'logged_in' ? '✓ Logged IN' : '✗ Logged OUT (workers skip this account)'}
+              {account.lastLoginEmail ? ` (${account.lastLoginEmail})` : ''}
+            </span>
+          )}
+        </div>
+      )}
+
+      {exhausted.length > 0 && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-300">
+          Quota khatam: {exhausted.join(', ')}
+        </div>
+      )}
+
+      {error && <div className="text-[11px] text-destructive">{error}</div>}
     </div>
   )
 }

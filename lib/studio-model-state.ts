@@ -45,7 +45,20 @@ export const DEFAULT_STUDIO_THINKING_LEVEL: StudioThinkingLevel = 'high'
 
 export const QUOTA_RESET_TZ = 'America/Los_Angeles'
 
-const MODEL_QUOTA_RECORD_KEY = 'studio-model-quota.json'
+/**
+ * Daily quota is per Google account, so each account slot has its own record.
+ * Slot 1 keeps the original file name so existing state carries over.
+ */
+export type StudioAccountSlot = 1 | 2 | 3
+function quotaRecordKey(accountSlot: number = 1): string {
+  return accountSlot === 2 || accountSlot === 3
+    ? `studio-model-quota-acct${accountSlot}.json`
+    : 'studio-model-quota.json'
+}
+function normalizeAccountSlot(raw: unknown): StudioAccountSlot {
+  const n = Number(raw)
+  return n === 2 || n === 3 ? n : 1
+}
 
 export interface StudioModelQuotaState {
   /** Map of canonical model name -> Unix timestamp (ms) when quota resets */
@@ -171,6 +184,8 @@ export function buildStudioFallbackCycle(chosenModel?: string | null): StudioMod
  */
 interface StudioModelLease {
   model: StudioModelOption
+  /** Google account the worker was on when it took the lease (limits are per account) */
+  account: StudioAccountSlot
   at: number
 }
 /** A lease not refreshed for this long belongs to a crashed / abandoned worker. */
@@ -178,6 +193,29 @@ const MODEL_LEASE_STALE_MS = 30 * 60_000
 
 const globalForModelLeases = globalThis as unknown as {
   __cmtStudioModelLeases?: Map<string, StudioModelLease>
+  __cmtStudioHolderAccounts?: Map<string, StudioAccountSlot>
+}
+
+function holderAccounts(): Map<string, StudioAccountSlot> {
+  if (!globalForModelLeases.__cmtStudioHolderAccounts) {
+    globalForModelLeases.__cmtStudioHolderAccounts = new Map()
+  }
+  return globalForModelLeases.__cmtStudioHolderAccounts
+}
+
+/** Which Google account a worker (holderKey = its profile dir) is using. Default 1. */
+export function setStudioHolderAccount(holderKey: string, accountSlot: number): void {
+  if (!holderKey) return
+  const slot = normalizeAccountSlot(accountSlot)
+  holderAccounts().set(holderKey, slot)
+  // A lease taken on another account no longer counts for this worker
+  const lease = globalForModelLeases.__cmtStudioModelLeases?.get(holderKey)
+  if (lease && lease.account !== slot) globalForModelLeases.__cmtStudioModelLeases?.delete(holderKey)
+}
+
+export function getStudioHolderAccount(holderKey?: string): StudioAccountSlot {
+  if (!holderKey) return 1
+  return holderAccounts().get(holderKey) || 1
 }
 function modelLeases(): Map<string, StudioModelLease> {
   if (!globalForModelLeases.__cmtStudioModelLeases) {
@@ -196,21 +234,27 @@ export function maxWindowsForModel(model: string): number {
   return STUDIO_MODEL_MAX_WINDOWS[canonicalizeStudioModelName(model)] ?? DEFAULT_MAX_WINDOWS_PER_MODEL
 }
 
-/** Number of windows OTHER than `holderKey` currently working on each model. */
+/**
+ * Number of windows OTHER than `holderKey` currently working on each model, on the same
+ * Google account as `holderKey` (or on `accountSlot`; all accounts when neither is given).
+ */
 export function getActiveLeasedModelsByOtherHolders(
   holderKey?: string,
   nowMs: number = Date.now(),
+  accountSlot?: number,
 ): Map<StudioModelOption, number> {
   pruneStaleModelLeases(nowMs)
+  const account = holderKey ? getStudioHolderAccount(holderKey) : accountSlot ? normalizeAccountSlot(accountSlot) : null
   const counts = new Map<StudioModelOption, number>()
   for (const [holder, lease] of modelLeases()) {
     if (holderKey && holder === holderKey) continue
+    if (account !== null && lease.account !== account) continue
     counts.set(lease.model, (counts.get(lease.model) || 0) + 1)
   }
   return counts
 }
 
-/** True when `holderKey` may take `model` without exceeding that model's window limit. */
+/** True when `holderKey` may take `model` without exceeding that model's window limit on its account. */
 export function hasFreeModelSlot(model: string, holderKey?: string, nowMs: number = Date.now()): boolean {
   const canon = canonicalizeStudioModelName(model)
   const others = getActiveLeasedModelsByOtherHolders(holderKey, nowMs).get(canon) || 0
@@ -223,7 +267,9 @@ export function updateExclusiveStudioModelLease(
   modelName: string,
 ): StudioModelOption {
   const canon = canonicalizeStudioModelName(modelName)
-  if (holderKey) modelLeases().set(holderKey, { model: canon, at: Date.now() })
+  if (holderKey) {
+    modelLeases().set(holderKey, { model: canon, account: getStudioHolderAccount(holderKey), at: Date.now() })
+  }
   return canon
 }
 
@@ -232,9 +278,9 @@ export function releaseExclusiveStudioModel(holderKey?: string): void {
   if (holderKey) modelLeases().delete(holderKey)
 }
 
-/** e.g. "Argon 2/2 · 3.8 Flash 1/2 · Hydrogen 0/2 · Neon 0/2 · 3.6 Flash 0/2" */
-export function describeStudioModelLeases(nowMs: number = Date.now()): string {
-  const counts = getActiveLeasedModelsByOtherHolders(undefined, nowMs)
+/** e.g. "Argon 2/2 · 3.8 Flash 1/2 · Hydrogen 0/2 · Neon 0/2 · 3.6 Flash 0/2" (one account) */
+export function describeStudioModelLeases(nowMs: number = Date.now(), accountSlot: number = 1): string {
+  const counts = getActiveLeasedModelsByOtherHolders(undefined, nowMs, accountSlot)
   return STUDIO_MODEL_OPTIONS.map(
     (m) => `${m.replace(/^Gemini /, '')} ${counts.get(m) || 0}/${maxWindowsForModel(m)}`,
   ).join(' · ')
@@ -351,8 +397,9 @@ export function nextPacificMidnight(nowMs: number = Date.now()): number {
 
 export async function loadStudioModelQuotaState(
   nowMs: number = Date.now(),
+  accountSlot: number = 1,
 ): Promise<StudioModelQuotaState> {
-  const saved = await readJSONRecord<StudioModelQuotaState>(MODEL_QUOTA_RECORD_KEY)
+  const saved = await readJSONRecord<StudioModelQuotaState>(quotaRecordKey(accountSlot))
   const rawExhausted =
     saved && saved.exhausted && typeof saved.exhausted === 'object' ? saved.exhausted : {}
 
@@ -388,10 +435,10 @@ export async function loadStudioModelQuotaState(
  */
 const globalForQuotaLock = globalThis as unknown as { __cmtStudioQuotaLock?: Promise<unknown> }
 
-async function withQuotaRecordLock<T>(fn: () => Promise<T>): Promise<T> {
+async function withQuotaRecordLock<T>(accountSlot: number, fn: () => Promise<T>): Promise<T> {
   const prev = globalForQuotaLock.__cmtStudioQuotaLock || Promise.resolve()
   const run = prev.catch(() => undefined).then(async () => {
-    invalidateJSONRecord(MODEL_QUOTA_RECORD_KEY)
+    invalidateJSONRecord(quotaRecordKey(accountSlot))
     return fn()
   })
   globalForQuotaLock.__cmtStudioQuotaLock = run.catch(() => undefined)
@@ -401,11 +448,12 @@ async function withQuotaRecordLock<T>(fn: () => Promise<T>): Promise<T> {
 export async function markModelExhausted(
   model: string,
   nowMs: number = Date.now(),
+  accountSlot: number = 1,
 ): Promise<{ model: string; untilTimestamp: number; state: StudioModelQuotaState }> {
   const canonical = canonicalizeStudioModelName(model)
   const untilTimestamp = nextPacificMidnight(nowMs)
-  return withQuotaRecordLock(async () => {
-    const current = await loadStudioModelQuotaState(nowMs)
+  return withQuotaRecordLock(accountSlot, async () => {
+    const current = await loadStudioModelQuotaState(nowMs, accountSlot)
     const nextState: StudioModelQuotaState = {
       exhausted: {
         ...current.exhausted,
@@ -413,33 +461,56 @@ export async function markModelExhausted(
       },
       updatedAt: nowMs,
     }
-    await writeJSONRecord(MODEL_QUOTA_RECORD_KEY, nextState)
+    await writeJSONRecord(quotaRecordKey(accountSlot), nextState)
     return { model: canonical, untilTimestamp, state: nextState }
   })
 }
 
+/**
+ * Clear exhausted flags. `accountSlot` = one account only; omitted = every account
+ * (the Settings "Reset" button). Returns account 1's new state.
+ */
 export async function resetModelQuotaState(
   model?: string | null,
   nowMs: number = Date.now(),
+  accountSlot?: number,
 ): Promise<StudioModelQuotaState> {
-  return withQuotaRecordLock(async () => {
-    const current = await loadStudioModelQuotaState(nowMs)
-    const nextExhausted: Record<string, number> = { ...current.exhausted }
-    if (model && model.trim()) {
-      const canonical = canonicalizeStudioModelName(model)
-      delete nextExhausted[canonical]
-      delete nextExhausted[model.trim()]
-    } else {
-      for (const k of Object.keys(nextExhausted)) {
-        delete nextExhausted[k]
+  const slots = accountSlot ? [normalizeAccountSlot(accountSlot)] : [1, 2, 3]
+  let first: StudioModelQuotaState | null = null
+  for (const slot of slots) {
+    const res = await withQuotaRecordLock(slot, async () => {
+      const current = await loadStudioModelQuotaState(nowMs, slot)
+      const nextExhausted: Record<string, number> = { ...current.exhausted }
+      if (model && model.trim()) {
+        const canonical = canonicalizeStudioModelName(model)
+        delete nextExhausted[canonical]
+        delete nextExhausted[model.trim()]
+      } else {
+        for (const k of Object.keys(nextExhausted)) {
+          delete nextExhausted[k]
+        }
       }
-    }
-    const nextState: StudioModelQuotaState = {
-      exhausted: nextExhausted,
-      updatedAt: nowMs,
-    }
-    await writeJSONRecord(MODEL_QUOTA_RECORD_KEY, nextState)
-    return nextState
+      const nextState: StudioModelQuotaState = {
+        exhausted: nextExhausted,
+        updatedAt: nowMs,
+      }
+      await writeJSONRecord(quotaRecordKey(slot), nextState)
+      return nextState
+    })
+    if (!first) first = res
+  }
+  return first as StudioModelQuotaState
+}
+
+/** True when every allowed model's daily quota is used up on this account. */
+export async function isAccountFullyExhausted(
+  accountSlot: number,
+  nowMs: number = Date.now(),
+): Promise<boolean> {
+  const state = await loadStudioModelQuotaState(nowMs, accountSlot)
+  return STUDIO_MODEL_OPTIONS.every((m) => {
+    const untilTs = state.exhausted[m]
+    return Boolean(untilTs && untilTs > nowMs)
   })
 }
 
@@ -450,6 +521,8 @@ export interface EffectiveModelWaitOptions {
   onWaitForSlot?: (message: string) => void
   /** Give up waiting after this long and take the least-busy model (default 20 min). */
   maxWaitMs?: number
+  /** Google account whose quota to check (default: the holder's account, else 1). */
+  accountSlot?: number
 }
 
 /**
@@ -500,10 +573,13 @@ export async function getEffectiveModel(
   const waitStarted = Date.now()
   const maxWaitMs = waitOptions?.maxWaitMs ?? 20 * 60_000
   let lastWaitLogAt = 0
+  const account = waitOptions?.accountSlot
+    ? normalizeAccountSlot(waitOptions.accountSlot)
+    : getStudioHolderAccount(holderKey)
 
   for (;;) {
     const now = holderKey ? Date.now() : nowMs
-    const state = await loadStudioModelQuotaState(nowMs)
+    const state = await loadStudioModelQuotaState(nowMs, account)
     const usable = preferred.filter((m) => {
       const untilTs = state.exhausted[m]
       return !untilTs || untilTs <= nowMs
@@ -530,7 +606,7 @@ export async function getEffectiveModel(
     if (Date.now() - lastWaitLogAt >= 30_000) {
       lastWaitLogAt = Date.now()
       waitOptions?.onWaitForSlot?.(
-        `All usable models are at their window limit (${describeStudioModelLeases(now)}) - waiting for a free model slot`,
+        `All usable models on Account ${account} are at their window limit (${describeStudioModelLeases(now, account)}) - waiting for a free model slot`,
       )
     }
     await new Promise((r) => setTimeout(r, 3_000))

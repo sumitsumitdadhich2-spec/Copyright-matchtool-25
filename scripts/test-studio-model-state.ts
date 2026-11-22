@@ -7,6 +7,8 @@ import {
   canonicalizeStudioModelName,
   getActiveLeasedModelsByOtherHolders,
   hasFreeModelSlot,
+  isAccountFullyExhausted,
+  setStudioHolderAccount,
   releaseExclusiveStudioModel,
   getEffectiveModel,
   loadStudioModelQuotaState,
@@ -170,7 +172,34 @@ async function runTests() {
     for (const w of [...workers, 'w07']) releaseExclusiveStudioModel(`lease-test-${w}`)
     assert.equal(getActiveLeasedModelsByOtherHolders().size, 0)
 
-    console.log('ALL TESTS PASSED: nextPacificMidnight (PST/PDT/DST), model chain, canonicalize, getEffectiveModel & per-model window limits')
+    // 6. Multiple Google accounts: quota and model limits are per account
+    await resetModelQuotaState(null, baseNow)
+    await markModelExhausted('Argon', Date.now(), 2)
+    setStudioHolderAccount('acct-test-a1', 1)
+    setStudioHolderAccount('acct-test-a2', 2)
+    assert.equal(await getEffectiveModel('Argon', undefined, Date.now(), 'acct-test-a1'), 'Argon', 'Account 1 Argon still free')
+    assert.equal(
+      await getEffectiveModel('Argon', undefined, Date.now(), 'acct-test-a2'),
+      'Gemini 3.8 Flash',
+      'Account 2 Argon quota used -> 3.8 Flash',
+    )
+    // Two Argon windows on account 1 do not block Argon on account 3
+    setStudioHolderAccount('acct-test-a1b', 1)
+    setStudioHolderAccount('acct-test-a3', 3)
+    assert.equal(await getEffectiveModel('Argon', undefined, Date.now(), 'acct-test-a1b'), 'Argon')
+    assert.ok(!hasFreeModelSlot('Argon', 'acct-test-a1c-unregistered'), 'Account 1 Argon full (2/2)')
+    assert.equal(await getEffectiveModel('Argon', undefined, Date.now(), 'acct-test-a3'), 'Argon', 'Account 3 has its own 2 Argon slots')
+    assert.equal(await isAccountFullyExhausted(2), false)
+    for (const m of ['Gemini 3.8 Flash', 'Hydrogen', 'Neon', 'Gemini 3.6 Flash']) {
+      await markModelExhausted(m, Date.now(), 2)
+    }
+    assert.equal(await isAccountFullyExhausted(2), true, 'Account 2: every model used up')
+    assert.equal(await isAccountFullyExhausted(1), false, 'Account 1 unaffected')
+    for (const h of ['acct-test-a1', 'acct-test-a2', 'acct-test-a1b', 'acct-test-a3']) releaseExclusiveStudioModel(h)
+    await resetModelQuotaState(null, baseNow)
+    assert.equal(await isAccountFullyExhausted(2), false, 'Reset clears every account')
+
+    console.log('ALL TESTS PASSED: nextPacificMidnight (PST/PDT/DST), model chain, canonicalize, getEffectiveModel, per-model window limits & per-account quota')
   } finally {
     if (backup !== null) {
       fs.writeFileSync(statePath, backup, 'utf8')

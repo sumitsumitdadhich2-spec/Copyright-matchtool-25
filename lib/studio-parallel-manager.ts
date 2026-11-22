@@ -45,15 +45,44 @@ import {
   DEFAULT_STUDIO_CONCURRENCY,
   DEFAULT_STUDIO_MINUTE_INPUT,
   DEFAULT_STUDIO_UPLOAD_GATE,
+  getActiveGoogleAccountSlots,
+  getGoogleAccountEmail,
   loadStudioUserConfig,
+  type GoogleAccountSlot,
 } from './studio-settings'
 import {
   DEFAULT_STUDIO_MODEL_NAME,
   MAX_CONCURRENT_MODEL_WINDOWS,
   getEffectiveModel,
+  isAccountFullyExhausted,
   releaseExclusiveStudioModel,
   resolveEffectiveMaxOutputTokensForModel,
 } from './studio-model-state'
+
+/**
+ * Which Google account a worker slot should use.
+ * Active accounts = Settings accounts with cookies (minus ones whose Test login failed).
+ * Workers are spread round-robin by worker number so the load is even:
+ *   1 account : W01..W06 -> A1
+ *   2 accounts: W01 A1, W02 A2, W03 A1, W04 A2, W05 A1, W06 A2   (3 + 3)
+ *   3 accounts: W01 A1, W02 A2, W03 A3, W04 A1, W05 A2, W06 A3   (2 + 2 + 2)
+ * An account whose every model's daily quota is used up is skipped (unless all are).
+ */
+export async function resolveGoogleAccountForWorker(
+  username: string,
+  slotIndex: number,
+): Promise<{ slot: GoogleAccountSlot; activeSlots: GoogleAccountSlot[]; skippedExhausted: GoogleAccountSlot[] }> {
+  const activeSlots = await getActiveGoogleAccountSlots(username)
+  const skippedExhausted: GoogleAccountSlot[] = []
+  const usable: GoogleAccountSlot[] = []
+  for (const acct of activeSlots) {
+    if (await isAccountFullyExhausted(acct)) skippedExhausted.push(acct)
+    else usable.push(acct)
+  }
+  const pool = usable.length > 0 ? usable : activeSlots
+  const slot = pool[(Math.max(1, slotIndex) - 1) % pool.length]
+  return { slot, activeSlots, skippedExhausted }
+}
 import {
   ensureScanChunkTicket,
   globalChunkScanCoordinator,
@@ -184,6 +213,8 @@ export interface ParallelWorkerCardSnapshot {
   workerId: string // "W01" .. "W10"
   workerIndex: number // 1 .. 10
   profileDirName: string // "studio-chrome-profile-w01"
+  /** Google account (Settings slot 1..3) this worker uses */
+  googleAccountSlot?: number
   active: boolean
   leasedByScanId: string | null
   leasedByScanLabel: string | null
@@ -876,6 +907,62 @@ class GlobalProfileSlotPool {
     }
   }
 
+  /**
+   * Cookies of ONE extra account (2 / 3) were saved or deleted: close + wipe only the worker
+   * profiles that use that account (and its Test-login profile). Workers on other accounts
+   * keep running untouched.
+   */
+  public async purgeProfilesForAccount(accountSlot: number): Promise<void> {
+    const tasks: Promise<unknown>[] = []
+    for (const slot of this.slots.values()) {
+      if (slot.controller.getGoogleAccountSlot() !== accountSlot) continue
+      slot.everLaunched = false
+      tasks.push(
+        slot.controller
+          .clearAllBrowserCookiesAndStorage()
+          .catch(() => {})
+          .then(() => slot.controller.closeContext().catch(() => {})),
+      )
+    }
+    const testCtrl = accountTestControllers().get(accountSlot)
+    if (testCtrl) {
+      tasks.push(
+        testCtrl
+          .clearAllBrowserCookiesAndStorage()
+          .catch(() => {})
+          .then(() => testCtrl.closeContext().catch(() => {})),
+      )
+    }
+    await Promise.allSettled(tasks)
+
+    try {
+      if (fs.existsSync(DATA_DIR)) {
+        for (const entry of fs.readdirSync(DATA_DIR)) {
+          const isWorker = entry.startsWith(`${BASE_PROFILE_NAME}-w`)
+          const isAcctTest = entry === `${BASE_PROFILE_NAME}-acct${accountSlot}`
+          if (!isWorker && !isAcctTest) continue
+          const dir = path.join(DATA_DIR, entry)
+          let marker = 1
+          try {
+            marker = Number(fs.readFileSync(path.join(dir, '.google-account'), 'utf8').trim()) || 1
+          } catch {
+            marker = 1
+          }
+          if (isAcctTest || marker === accountSlot) {
+            await killWorkerChromeProcessesByProfileDir(entry).catch(() => {})
+            try {
+              fs.rmSync(dir, { recursive: true, force: true })
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
   public getLeasedSlotsForScan(scanId: string): ProfileSlotEntry[] {
     const out: ProfileSlotEntry[] = []
     for (const slot of this.slots.values()) {
@@ -939,6 +1026,33 @@ if (globalForParallelStudio.__cmtGlobalProfileSlotPool) {
 export const globalProfileSlotPool: GlobalProfileSlotPool =
   globalForParallelStudio.__cmtGlobalProfileSlotPool ||
   (globalForParallelStudio.__cmtGlobalProfileSlotPool = new GlobalProfileSlotPool())
+
+/**
+ * Separate browser for "Test login" of Google accounts 2 and 3 (account 1 uses the main
+ * Studio browser), so the test never mixes an account into a worker profile.
+ */
+const globalForAccountTests = globalThis as unknown as {
+  __cmtStudioAccountTestControllers?: Map<number, StudioBrowserController>
+}
+function accountTestControllers(): Map<number, StudioBrowserController> {
+  if (!globalForAccountTests.__cmtStudioAccountTestControllers) {
+    globalForAccountTests.__cmtStudioAccountTestControllers = new Map()
+  }
+  return globalForAccountTests.__cmtStudioAccountTestControllers
+}
+
+export function getAccountTestController(accountSlot: 2 | 3): StudioBrowserController {
+  let ctrl = accountTestControllers().get(accountSlot)
+  if (!ctrl) {
+    ctrl = new StudioBrowserController({
+      profileDirName: `${BASE_PROFILE_NAME}-acct${accountSlot}`,
+      workerTag: `[ACC${accountSlot}]`,
+      googleAccountSlot: accountSlot,
+    })
+    accountTestControllers().set(accountSlot, ctrl)
+  }
+  return ctrl
+}
 
 // ============================================================================
 // PER-SCAN STUDIO PARALLEL MANAGER
@@ -3507,6 +3621,31 @@ export class StudioParallelManager {
       claimedWin.status = 'ASSIGNED'
       claimedWin.stage = `assigned to ${leasedSlot.workerId}`
 
+      // Pick this worker's Google account (spread evenly over Settings accounts 1..3)
+      try {
+        const acct = await resolveGoogleAccountForWorker(this.username || 'admin', leasedSlot.slotIndex)
+        const prevAcct = leasedSlot.controller.getGoogleAccountSlot()
+        const switched = await leasedSlot.controller.setGoogleAccountSlot(acct.slot)
+        const email = await getGoogleAccountEmail(this.username || 'admin', acct.slot).catch(() => null)
+        this.appendCombinedLog({
+          workerId: leasedSlot.workerId,
+          windowId: claimedWin.id,
+          windowNumber: claimedWin.windowNumber,
+          windowRange: `${claimedWin.startFormatted}–${claimedWin.endFormatted}`,
+          level: 'INFO',
+          step: 'account assigned',
+          message: `${leasedSlot.workerId} -> Account ${acct.slot}${email ? ` (${email})` : ''}${
+            switched ? ` (switched from Account ${prevAcct})` : ''
+          } | active accounts: ${acct.activeSlots.map((a) => `A${a}`).join(', ')}${
+            acct.skippedExhausted.length > 0
+              ? ` | skipped (all models quota used): ${acct.skippedExhausted.map((a) => `A${a}`).join(', ')}`
+              : ''
+          }`,
+        })
+      } catch {
+        /* keep the worker's current account */
+      }
+
       try {
         // Global stagger on first browser launch for this slot
         const staggerMs = globalProfileSlotPool.reserveLaunchStaggerDelayMs(leasedSlot.slotIndex)
@@ -3533,6 +3672,44 @@ export class StudioParallelManager {
         }
 
         await this.executeWindowOnSlot(leasedSlot, claimedWin)
+
+        // All models' quota used up on THIS worker's account, but another account still has
+        // quota: put the window back in the queue (another account's worker / this worker on its
+        // next account picks it up) instead of stopping.
+        if (
+          (claimedWin.status as ParallelWindowStatus) === 'NEEDS_ATTENTION' &&
+          /quota\s+khatam/i.test(claimedWin.error || claimedWin.summaryText || '')
+        ) {
+          const usedAcct = leasedSlot.controller.getGoogleAccountSlot()
+          const activeAccts = await getActiveGoogleAccountSlots(this.username || 'admin').catch(
+            () => [1] as GoogleAccountSlot[],
+          )
+          let otherUsable: GoogleAccountSlot | null = null
+          for (const a of activeAccts) {
+            if (a !== usedAcct && !(await isAccountFullyExhausted(a))) {
+              otherUsable = a
+              break
+            }
+          }
+          if (otherUsable !== null) {
+            claimedWin.status = 'QUEUED'
+            claimedWin.workerId = null
+            claimedWin.stage = 'queued (account quota used)'
+            claimedWin.error = null
+            claimedWin.summaryText = `Account ${usedAcct} quota khatam -> re-queued for another account`
+            this.appendCombinedLog({
+              workerId: leasedSlot.workerId,
+              windowId: claimedWin.id,
+              windowNumber: claimedWin.windowNumber,
+              windowRange: `${claimedWin.startFormatted}–${claimedWin.endFormatted}`,
+              level: 'RETRY',
+              step: 'account quota used -> re-queue',
+              message: `Account ${usedAcct}: all models' daily quota used. Window #${claimedWin.windowNumber} re-queued; Account ${otherUsable} still has quota`,
+            })
+            this.persistStateToDisk()
+            continue
+          }
+        }
 
         if ((claimedWin.status as ParallelWindowStatus) === 'NEEDS_ATTENTION') {
           this.appendCombinedLog({
@@ -4810,6 +4987,7 @@ export class StudioParallelManager {
             workerId: slot.workerId,
             workerIndex: i,
             profileDirName: slot.profileDirName,
+            googleAccountSlot: slot.controller.getGoogleAccountSlot(),
             active: true,
             leasedByScanId: this.scanId,
             leasedByScanLabel: this.scanName,
@@ -4847,6 +5025,7 @@ export class StudioParallelManager {
             workerId: slot.workerId,
             workerIndex: i,
             profileDirName: slot.profileDirName,
+            googleAccountSlot: slot.controller.getGoogleAccountSlot(),
             active: false,
             leasedByScanId: slot.leasedByScanId,
             leasedByScanLabel: slot.leasedByScanLabel,
@@ -4888,6 +5067,7 @@ export class StudioParallelManager {
             workerId: slot.workerId,
             workerIndex: i,
             profileDirName: slot.profileDirName,
+            googleAccountSlot: slot.controller.getGoogleAccountSlot(),
             active: true,
             leasedByScanId: null,
             leasedByScanLabel: null,
