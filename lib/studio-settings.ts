@@ -415,14 +415,78 @@ export async function saveStudioUserConfig(
  * Parse either Cookie-Editor JSON array or Playwright storageState JSON
  * into normalized Playwright cookies.
  */
+/** Fix the usual copy-paste damage before giving up on a cookie JSON paste. */
+function repairCookieJsonText(text: string): string {
+  return text
+    .replace(/^\uFEFF/, '')
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```\s*$/, '')
+    .replace(/[\u201C\u201D\u201E\u201F\u2033]/g, '"') // smart double quotes
+    .replace(/,(\s*[}\]])/g, '$1') // trailing commas: {..., } / [..., ]
+    .replace(/\]\s*,?\s*\[/g, ',') // two exports pasted one after another: [...][...]
+    .trim()
+}
+
+/** Netscape cookies.txt (7 tab-separated columns) -> Cookie-Editor-like objects. */
+function parseNetscapeCookiesTxt(text: string): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = []
+  for (const rawLine of text.split(/\r?\n/)) {
+    let line = rawLine.trim()
+    let httpOnly = false
+    if (line.startsWith('#HttpOnly_')) {
+      httpOnly = true
+      line = line.slice('#HttpOnly_'.length)
+    }
+    if (!line || line.startsWith('#')) continue
+    const cols = line.split('\t')
+    if (cols.length < 7) continue
+    const [domain, , cookiePath, secure, expires, name, ...rest] = cols
+    out.push({
+      domain,
+      path: cookiePath || '/',
+      secure: /^true$/i.test(secure),
+      expirationDate: Number(expires) || undefined,
+      name,
+      value: rest.join('\t'),
+      httpOnly,
+    })
+  }
+  return out
+}
+
+/** "line 115, col 26" + the text around it, so the user can see what broke. */
+function describeJsonErrorPosition(text: string, err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err)
+  const m = msg.match(/position\s+(\d+)/i)
+  if (!m) return msg
+  const pos = Number(m[1])
+  const before = text.slice(0, pos)
+  const line = before.split('\n').length
+  const lineText = (text.split('\n')[line - 1] || '').trim()
+  const shown = lineText.length > 90 ? `${lineText.slice(0, 90)}…` : lineText
+  return `${msg} — line ${line}: ${shown}`
+}
+
 export function parseCookieInputToPlaywright(rawJson: string): PlaywrightCookie[] {
   const trimmed = (rawJson || '').trim()
   if (!trimmed) throw new Error('Cookies JSON is empty')
   let parsed: unknown
   try {
     parsed = JSON.parse(trimmed)
-  } catch (err) {
-    throw new Error(`Invalid JSON in Google cookies field: ${err instanceof Error ? err.message : String(err)}`)
+  } catch (firstErr) {
+    try {
+      parsed = JSON.parse(repairCookieJsonText(trimmed))
+    } catch {
+      const netscape = parseNetscapeCookiesTxt(trimmed)
+      if (netscape.length > 0) {
+        parsed = netscape
+      } else {
+        throw new Error(
+          `Invalid JSON in Google cookies field: ${describeJsonErrorPosition(trimmed, firstErr)}. ` +
+            'Export again from Cookie-Editor (Export -> JSON) on aistudio.google.com and paste the whole text without editing it.',
+        )
+      }
+    }
   }
 
   let rawList: unknown[] = []
