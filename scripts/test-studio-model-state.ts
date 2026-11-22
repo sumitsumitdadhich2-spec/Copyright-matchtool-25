@@ -4,6 +4,7 @@ import path from 'node:path'
 import { DATA_DIR } from '../lib/paths'
 import {
   buildStudioModelChain,
+  canonicalizeStudioModelName,
   getEffectiveModel,
   loadStudioModelQuotaState,
   markModelExhausted,
@@ -50,12 +51,37 @@ async function runTests() {
       'Argon',
       'Gemini 3.8 Flash',
       'Gemini 3.6 Flash',
+      'Neon',
+      'Carbon',
+      'Hydrogen',
     ])
     assert.deepEqual(buildStudioModelChain('Gemini 3.8 Flash'), [
       'Gemini 3.8 Flash',
       'Gemini 3.6 Flash',
+      'Neon',
+      'Carbon',
+      'Hydrogen',
       'Argon',
     ])
+    assert.deepEqual(buildStudioModelChain('Neon'), [
+      'Neon',
+      'Carbon',
+      'Hydrogen',
+      'Argon',
+      'Gemini 3.8 Flash',
+      'Gemini 3.6 Flash',
+    ])
+
+    // 2b. AI Studio model cards are canonicalized by name (Hydrogen is AI Studio's default card
+    // and used to be misread as "Gemini 3.8 Flash")
+    const hydrogenCard =
+      'Gemini 4 Hydrogen gemini-4-hydrogen An efficient model with cutting-edge intelligence for fast, dependable execution'
+    assert.equal(canonicalizeStudioModelName(hydrogenCard), 'Hydrogen')
+    assert.equal(canonicalizeStudioModelName('gemini-4-neon'), 'Neon')
+    assert.equal(canonicalizeStudioModelName('Gemini 4 Carbon'), 'Carbon')
+    assert.equal(canonicalizeStudioModelName('Gemini 4 Argon gemini-4-argon'), 'Argon')
+    assert.equal(canonicalizeStudioModelName('Gemini 3.6 Flash gemini-3.6-flash'), 'Gemini 3.6 Flash')
+    assert.equal(canonicalizeStudioModelName('Gemini 3.7 Flash'), 'Gemini 3.8 Flash')
 
     // 3. Test getEffectiveModel: Argon exhausted -> Gemini 3.8 Flash; after reset time -> back to Argon
     await resetModelQuotaState()
@@ -91,7 +117,23 @@ async function runTests() {
       'Expired Argon entry should be removed from studio-model-state.json',
     )
 
-    console.log('ALL TESTS PASSED: nextPacificMidnight (PST/PDT/DST) & getEffectiveModel')
+    // 4. Two workers marking two different models at the same moment must BOTH persist
+    // (the old read-modify-write lost one of them, so an exhausted model was retried later)
+    await resetModelQuotaState(null, baseNow)
+    await Promise.all([
+      markModelExhausted('Argon', baseNow),
+      markModelExhausted('Gemini 3.8 Flash', baseNow),
+      markModelExhausted('Neon', baseNow),
+    ])
+    const concurrentState = await loadStudioModelQuotaState(baseNow + 1000)
+    assert.ok(concurrentState.exhausted['Argon'], 'Argon must stay marked exhausted')
+    assert.ok(concurrentState.exhausted['Gemini 3.8 Flash'], '3.8 Flash must stay marked exhausted')
+    assert.ok(concurrentState.exhausted['Neon'], 'Neon must stay marked exhausted')
+    const nextAfterThree = await getEffectiveModel('Argon', undefined, baseNow + 1000)
+    assert.equal(nextAfterThree, 'Gemini 3.6 Flash', 'Next free model after Argon/3.8/Neon is 3.6 Flash')
+    await resetModelQuotaState(null, baseNow)
+
+    console.log('ALL TESTS PASSED: nextPacificMidnight (PST/PDT/DST), model chain, canonicalize & getEffectiveModel')
   } finally {
     if (backup !== null) {
       fs.writeFileSync(statePath, backup, 'utf8')

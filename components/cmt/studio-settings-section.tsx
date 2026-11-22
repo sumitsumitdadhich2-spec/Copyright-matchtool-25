@@ -20,6 +20,9 @@ const STUDIO_MODEL_DROPDOWN_OPTIONS = [
   'Argon',
   'Gemini 3.8 Flash',
   'Gemini 3.6 Flash',
+  'Neon',
+  'Carbon',
+  'Hydrogen',
 ] as const
 
 interface Props {
