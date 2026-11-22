@@ -5,6 +5,9 @@ import { DATA_DIR } from '../lib/paths'
 import {
   buildStudioModelChain,
   canonicalizeStudioModelName,
+  getActiveLeasedModelsByOtherHolders,
+  hasFreeModelSlot,
+  releaseExclusiveStudioModel,
   getEffectiveModel,
   loadStudioModelQuotaState,
   markModelExhausted,
@@ -50,26 +53,23 @@ async function runTests() {
     assert.deepEqual(buildStudioModelChain('Argon'), [
       'Argon',
       'Gemini 3.8 Flash',
-      'Gemini 3.6 Flash',
-      'Neon',
-      'Carbon',
       'Hydrogen',
+      'Neon',
+      'Gemini 3.6 Flash',
     ])
     assert.deepEqual(buildStudioModelChain('Gemini 3.8 Flash'), [
       'Gemini 3.8 Flash',
-      'Gemini 3.6 Flash',
-      'Neon',
-      'Carbon',
       'Hydrogen',
+      'Neon',
+      'Gemini 3.6 Flash',
       'Argon',
     ])
     assert.deepEqual(buildStudioModelChain('Neon'), [
       'Neon',
-      'Carbon',
-      'Hydrogen',
+      'Gemini 3.6 Flash',
       'Argon',
       'Gemini 3.8 Flash',
-      'Gemini 3.6 Flash',
+      'Hydrogen',
     ])
 
     // 2b. AI Studio model cards are canonicalized by name (Hydrogen is AI Studio's default card
@@ -78,7 +78,8 @@ async function runTests() {
       'Gemini 4 Hydrogen gemini-4-hydrogen An efficient model with cutting-edge intelligence for fast, dependable execution'
     assert.equal(canonicalizeStudioModelName(hydrogenCard), 'Hydrogen')
     assert.equal(canonicalizeStudioModelName('gemini-4-neon'), 'Neon')
-    assert.equal(canonicalizeStudioModelName('Gemini 4 Carbon'), 'Carbon')
+    // Carbon is not usable on this account: never returned as a model option
+    assert.equal(canonicalizeStudioModelName('Gemini 4 Carbon'), 'Gemini 3.8 Flash')
     assert.equal(canonicalizeStudioModelName('Gemini 4 Argon gemini-4-argon'), 'Argon')
     assert.equal(canonicalizeStudioModelName('Gemini 3.6 Flash gemini-3.6-flash'), 'Gemini 3.6 Flash')
     assert.equal(canonicalizeStudioModelName('Gemini 3.7 Flash'), 'Gemini 3.8 Flash')
@@ -130,10 +131,46 @@ async function runTests() {
     assert.ok(concurrentState.exhausted['Gemini 3.8 Flash'], '3.8 Flash must stay marked exhausted')
     assert.ok(concurrentState.exhausted['Neon'], 'Neon must stay marked exhausted')
     const nextAfterThree = await getEffectiveModel('Argon', undefined, baseNow + 1000)
-    assert.equal(nextAfterThree, 'Gemini 3.6 Flash', 'Next free model after Argon/3.8/Neon is 3.6 Flash')
+    assert.equal(nextAfterThree, 'Hydrogen', 'Next free model after Argon/3.8/Neon is Hydrogen')
     await resetModelQuotaState(null, baseNow)
 
-    console.log('ALL TESTS PASSED: nextPacificMidnight (PST/PDT/DST), model chain, canonicalize & getEffectiveModel')
+    // 5. Per-model window limit: max 2 windows on the same model at once.
+    // 6 workers all asking for Argon -> Argon, Argon, 3.8, 3.8, Hydrogen, Hydrogen
+    const workers = ['w01', 'w02', 'w03', 'w04', 'w05', 'w06']
+    const assigned: string[] = []
+    for (const w of workers) {
+      assigned.push(await getEffectiveModel('Argon', undefined, Date.now(), `lease-test-${w}`))
+    }
+    assert.deepEqual(assigned, [
+      'Argon',
+      'Argon',
+      'Gemini 3.8 Flash',
+      'Gemini 3.8 Flash',
+      'Hydrogen',
+      'Hydrogen',
+    ])
+    const counts = getActiveLeasedModelsByOtherHolders()
+    assert.equal(counts.get('Argon'), 2, 'Never more than 2 windows on Argon')
+
+    // A worker that already holds Argon keeps it (its own slot is not counted against it)
+    assert.equal(await getEffectiveModel('Argon', undefined, Date.now(), 'lease-test-w01'), 'Argon')
+
+    // w03 (3.8) hits an error and falls back excluding 3.8: Argon/Hydrogen are full -> Neon
+    assert.equal(
+      await getEffectiveModel('Argon', undefined, Date.now(), 'lease-test-w03', ['Gemini 3.8 Flash']),
+      'Neon',
+    )
+
+    // When an Argon window finishes, the next window can take Argon again
+    releaseExclusiveStudioModel('lease-test-w01')
+    assert.equal(await getEffectiveModel('Argon', undefined, Date.now(), 'lease-test-w07'), 'Argon')
+    assert.ok(hasFreeModelSlot('Gemini 3.6 Flash', 'lease-test-w08'))
+    assert.ok(!hasFreeModelSlot('Argon', 'lease-test-w08'), 'Argon is full again (w02 + w07)')
+
+    for (const w of [...workers, 'w07']) releaseExclusiveStudioModel(`lease-test-${w}`)
+    assert.equal(getActiveLeasedModelsByOtherHolders().size, 0)
+
+    console.log('ALL TESTS PASSED: nextPacificMidnight (PST/PDT/DST), model chain, canonicalize, getEffectiveModel & per-model window limits')
   } finally {
     if (backup !== null) {
       fs.writeFileSync(statePath, backup, 'utf8')

@@ -3717,12 +3717,29 @@ export class StudioParallelManager {
     }
 
     try {
+      // Takes a model slot for this worker: max windows per model (e.g. Argon 2 at once),
+      // otherwise the next free allowed model (3.8 Flash -> Hydrogen -> Neon -> 3.6 Flash).
       const effectiveWinModel =
         (await getEffectiveModel(
           cfg.studioModelName,
           undefined,
           Date.now(),
           slot.profileDirName,
+          undefined,
+          {
+            isAborted: () => this.stoppingAll || this.stoppedWindowIds.has(win.id),
+            onWaitForSlot: (msg) => {
+              this.appendCombinedLog({
+                workerId,
+                windowId: win.id,
+                windowNumber: win.windowNumber,
+                windowRange: windowRangeStr,
+                level: 'INFO',
+                step: 'waiting for model slot',
+                message: msg,
+              })
+            },
+          },
         )) ||
         cfg.studioModelName ||
         DEFAULT_STUDIO_MODEL_NAME

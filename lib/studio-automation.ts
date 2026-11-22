@@ -27,7 +27,9 @@ import {
   canonicalizeStudioModelName,
   gemini4NamedModelIn,
   gemini4SlugFor,
+  describeStudioModelLeases,
   getEffectiveModel,
+  hasFreeModelSlot,
   loadStudioModelQuotaState,
   markModelExhausted,
   normalizeStudioThinkingLevel,
@@ -3320,7 +3322,10 @@ export class StudioBrowserController {
       baseCandidates,
     ).filter(
       (m, idx) =>
-        idx === 0 || nonExhaustedCandidates.length === 0 || !isExhaustedNow(m),
+        idx === 0 ||
+        ((nonExhaustedCandidates.length === 0 || !isExhaustedNow(m)) &&
+          // Never fall back onto a model that already runs in its max number of windows
+          hasFreeModelSlot(m, this.profileDirName)),
     )
 
     for (let i = 0; i < candidatesToTry.length; i++) {
@@ -6397,8 +6402,8 @@ export class StudioBrowserController {
     const MAX_INVALID_RESULT_RETRIES = parallelMode ? MAX_ATTEMPTS : 3
     let invalidResultRetries = 0
 
-    // Requirement: Only 3 models exist: Argon, Gemini 3.8 Flash, Gemini 3.6 Flash (never 3.7).
-    // Enforce 1 window = 1 model across concurrent active windows via this.profileDirName lease.
+    // Allowed models: Argon, Gemini 3.8 Flash, Hydrogen, Neon, Gemini 3.6 Flash (never Carbon / 3.7).
+    // Max windows per model (STUDIO_MODEL_MAX_WINDOWS, e.g. Argon 2) via this.profileDirName lease.
     const chosenModel = canonicalizeStudioModelName(
       modelName || userCfg.studioModelName || DEFAULT_STUDIO_MODEL_NAME,
     )
@@ -6419,7 +6424,22 @@ export class StudioBrowserController {
       MODEL_FALLBACK_CHAIN,
       Date.now(),
       this.profileDirName,
+      undefined,
+      {
+        isAborted: () => this.isStopping(scope),
+        onWaitForSlot: (msg) => {
+          this.logStep('waiting for model slot', `${jobLabel}: ${msg}`, 'info')
+          onLog?.('info', `${jobLabel}: ${msg}`)
+        },
+      },
     )
+    if (initialEffectiveModel) {
+      this.logStep(
+        'model assigned',
+        `${jobLabel}: ${initialEffectiveModel} (models in use: ${describeStudioModelLeases()})`,
+        'info',
+      )
+    }
     if (!initialEffectiveModel) {
       const resetTimeStr = await formatQuotaResetTime()
       throw new Error(`NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`)
@@ -7242,6 +7262,8 @@ export class StudioBrowserController {
             ? Math.max(20, userCfg.studioRunStaggerSec || DEFAULT_STUDIO_RUN_STAGGER_SEC)
             : userCfg.studioRunStaggerSec ?? DEFAULT_STUDIO_RUN_STAGGER_SEC
           globalStudioRunStaggerGate.setStaggerMs(staggerSec * 1000)
+          // Keep this window's model slot fresh (stale leases expire after 30 min)
+          updateExclusiveStudioModelLease(this.profileDirName, activeModelName)
           await globalStudioRunStaggerGate.acquireRunSlot(jobLabel, {
             isAborted: () => this.isStopping(scope),
             onWait: (waitRemainingSec) => {
@@ -8297,7 +8319,13 @@ export class StudioBrowserController {
                 const uiCardNow = await this.readVisibleModelCardText(page)
                 const exhaustedMod = uiCardNow ? canonicalizeStudioModelName(uiCardNow) : activeModelName
                 await markModelExhausted(exhaustedMod)
-                const nextMod = await getEffectiveModel(chosenModel, MODEL_FALLBACK_CHAIN)
+                const nextMod = await getEffectiveModel(
+                  chosenModel,
+                  MODEL_FALLBACK_CHAIN,
+                  Date.now(),
+                  this.profileDirName,
+                  [exhaustedMod],
+                )
                 if (!nextMod) {
                   const resetTimeStr = await formatQuotaResetTime()
                   const allExhaustedMsg = `NEEDS_ATTENTION: saare models ka quota khatam, reset ${resetTimeStr} par`

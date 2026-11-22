@@ -1,26 +1,36 @@
 import { invalidateJSONRecord, readJSONRecord, writeJSONRecord } from './json-record'
 
 /**
- * AI Studio models the parallel scan can use, in fallback order.
- * The Gemini 4 "element" models (Neon, Carbon, Hydrogen) come after the
- * long-tested Argon / Flash models, so an existing setup keeps its old order and
- * simply gets extra daily quota at the end of the fallback chain.
+ * The ONLY AI Studio models the parallel scan may use, in fallback order.
+ * (Gemini 4 Carbon is not available on this account, so it is never used.)
  */
 export const STUDIO_MODEL_OPTIONS = [
   'Argon',
   'Gemini 3.8 Flash',
-  'Gemini 3.6 Flash',
-  'Neon',
-  'Carbon',
   'Hydrogen',
+  'Neon',
+  'Gemini 3.6 Flash',
 ] as const
 
 export type StudioModelOption = (typeof STUDIO_MODEL_OPTIONS)[number]
 
 /**
- * Up to 6 parallel windows can run simultaneously on the same configured model.
- * Keeps Chrome process count and RAM stable while maximizing throughput.
+ * Max number of parallel windows that may hold the SAME model at once.
+ * While 2 windows are working on Argon, no other window gets Argon; it is given the
+ * next free model instead (3.8 Flash -> Hydrogen -> Neon -> 3.6 Flash). Spreading the
+ * windows over several models also spreads the per-model "high demand" (503) load and
+ * the per-model daily quota.
  */
+export const STUDIO_MODEL_MAX_WINDOWS: Record<StudioModelOption, number> = {
+  Argon: 2,
+  'Gemini 3.8 Flash': 2,
+  Hydrogen: 2,
+  Neon: 2,
+  'Gemini 3.6 Flash': 2,
+}
+/** Default per-model window limit for a model missing from STUDIO_MODEL_MAX_WINDOWS. */
+export const DEFAULT_MAX_WINDOWS_PER_MODEL = 2
+/** Total parallel worker slots (all models together). */
 export const MAX_CONCURRENT_MODEL_WINDOWS = 6
 export const MAX_PARALLEL_CONCURRENCY = 6
 
@@ -60,7 +70,11 @@ export function thinkingLevelToDisplayLabel(level?: StudioThinkingLevel | string
   return 'High'
 }
 
-/** Gemini 4 models are shown in AI Studio as "Gemini 4 <Name>" (slug gemini-4-<name>). */
+/**
+ * Gemini 4 models are shown in AI Studio as "Gemini 4 <Name>" (slug gemini-4-<name>).
+ * Carbon is listed only so its card is recognised (and never mistaken for another model);
+ * it is not in STUDIO_MODEL_OPTIONS and is never selected.
+ */
 export const GEMINI4_NAMED_MODELS = ['Argon', 'Neon', 'Carbon', 'Hydrogen'] as const
 export type Gemini4NamedModel = (typeof GEMINI4_NAMED_MODELS)[number]
 
@@ -80,9 +94,9 @@ export function gemini4SlugFor(name: Gemini4NamedModel): string {
 
 /**
  * Canonicalize to one of STUDIO_MODEL_OPTIONS:
- * - 'Argon' | 'Neon' | 'Carbon' | 'Hydrogen' (Gemini 4, matched by name)
+ * - 'Argon' | 'Neon' | 'Hydrogen' (Gemini 4, matched by name)
  * - 'Gemini 3.8 Flash' | 'Gemini 3.6 Flash'
- * (3.7 is removed everywhere; any 3.7 or unknown model maps to 'Gemini 3.8 Flash').
+ * (3.7, Carbon and any unknown model map to 'Gemini 3.8 Flash').
  * Named models are checked first so a card like "Gemini 4 Hydrogen ..." is never
  * mistaken for a Flash model.
  */
@@ -90,7 +104,7 @@ export function canonicalizeStudioModelName(raw?: string | null): StudioModelOpt
   const trimmed = (raw || '').trim()
   if (!trimmed) return DEFAULT_STUDIO_MODEL_NAME
   const named = gemini4NamedModelIn(trimmed)
-  if (named) return named
+  if (named && named !== 'Carbon') return named
   if (/3\.8/.test(trimmed)) return 'Gemini 3.8 Flash'
   if (/3\.6/.test(trimmed)) return 'Gemini 3.6 Flash'
   if (/3\.7/.test(trimmed)) return 'Gemini 3.8 Flash'
@@ -150,23 +164,88 @@ export function buildStudioFallbackCycle(chosenModel?: string | null): StudioMod
   return full
 }
 
-export function getActiveLeasedModelsByOtherHolders(): Map<StudioModelOption, number> {
-  return new Map<StudioModelOption, number>()
+/**
+ * Model leases: which parallel worker (holderKey = its Chrome profile dir) is currently
+ * working on which model. Kept on globalThis so every Next.js bundle in this process
+ * (parallel manager + Studio automation) sees the same map.
+ */
+interface StudioModelLease {
+  model: StudioModelOption
+  at: number
+}
+/** A lease not refreshed for this long belongs to a crashed / abandoned worker. */
+const MODEL_LEASE_STALE_MS = 30 * 60_000
+
+const globalForModelLeases = globalThis as unknown as {
+  __cmtStudioModelLeases?: Map<string, StudioModelLease>
+}
+function modelLeases(): Map<string, StudioModelLease> {
+  if (!globalForModelLeases.__cmtStudioModelLeases) {
+    globalForModelLeases.__cmtStudioModelLeases = new Map()
+  }
+  return globalForModelLeases.__cmtStudioModelLeases
 }
 
+function pruneStaleModelLeases(nowMs: number = Date.now()) {
+  for (const [holder, lease] of modelLeases()) {
+    if (nowMs - lease.at > MODEL_LEASE_STALE_MS) modelLeases().delete(holder)
+  }
+}
+
+export function maxWindowsForModel(model: string): number {
+  return STUDIO_MODEL_MAX_WINDOWS[canonicalizeStudioModelName(model)] ?? DEFAULT_MAX_WINDOWS_PER_MODEL
+}
+
+/** Number of windows OTHER than `holderKey` currently working on each model. */
+export function getActiveLeasedModelsByOtherHolders(
+  holderKey?: string,
+  nowMs: number = Date.now(),
+): Map<StudioModelOption, number> {
+  pruneStaleModelLeases(nowMs)
+  const counts = new Map<StudioModelOption, number>()
+  for (const [holder, lease] of modelLeases()) {
+    if (holderKey && holder === holderKey) continue
+    counts.set(lease.model, (counts.get(lease.model) || 0) + 1)
+  }
+  return counts
+}
+
+/** True when `holderKey` may take `model` without exceeding that model's window limit. */
+export function hasFreeModelSlot(model: string, holderKey?: string, nowMs: number = Date.now()): boolean {
+  const canon = canonicalizeStudioModelName(model)
+  const others = getActiveLeasedModelsByOtherHolders(holderKey, nowMs).get(canon) || 0
+  return others < maxWindowsForModel(canon)
+}
+
+/** Record (or refresh) that `holderKey` is now working on `modelName`. */
 export function updateExclusiveStudioModelLease(
-  _holderKey: string,
+  holderKey: string,
   modelName: string,
 ): StudioModelOption {
-  return canonicalizeStudioModelName(modelName)
+  const canon = canonicalizeStudioModelName(modelName)
+  if (holderKey) modelLeases().set(holderKey, { model: canon, at: Date.now() })
+  return canon
 }
 
-export function releaseExclusiveStudioModel(_holderKey?: string): void {
-  // No-op: multiple windows share the same model
+/** Free the worker's model slot when its window job ends (DONE / FAILED / STOPPED). */
+export function releaseExclusiveStudioModel(holderKey?: string): void {
+  if (holderKey) modelLeases().delete(holderKey)
 }
 
+/** e.g. "Argon 2/2 · 3.8 Flash 1/2 · Hydrogen 0/2 · Neon 0/2 · 3.6 Flash 0/2" */
+export function describeStudioModelLeases(nowMs: number = Date.now()): string {
+  const counts = getActiveLeasedModelsByOtherHolders(undefined, nowMs)
+  return STUDIO_MODEL_OPTIONS.map(
+    (m) => `${m.replace(/^Gemini /, '')} ${counts.get(m) || 0}/${maxWindowsForModel(m)}`,
+  ).join(' · ')
+}
+
+/**
+ * Allowed models from `chain` (then every other allowed model), de-duplicated, with models
+ * that still have a free window slot for `holderKey` first and full ones last.
+ */
 export function orderChainByUnleasedFirst(
-  _holderKey: string | undefined,
+  holderKey: string | undefined,
   chain: readonly string[],
 ): StudioModelOption[] {
   const normalizedChain: StudioModelOption[] = []
@@ -178,16 +257,18 @@ export function orderChainByUnleasedFirst(
       normalizedChain.push(canon)
     }
   }
-  return normalizedChain
+  const free = normalizedChain.filter((m) => hasFreeModelSlot(m, holderKey))
+  const full = normalizedChain.filter((m) => !hasFreeModelSlot(m, holderKey))
+  return [...free, ...full]
 }
 
 export function orderFallbacksKeepingTargetFirst(
-  _holderKey: string | undefined,
+  holderKey: string | undefined,
   targetModelName: string,
   chain: readonly string[],
 ): StudioModelOption[] {
   const targetCanon = canonicalizeStudioModelName(targetModelName)
-  const rest = orderChainByUnleasedFirst(undefined, chain).filter(
+  const rest = orderChainByUnleasedFirst(holderKey, chain).filter(
     (m) => m.toLowerCase() !== targetCanon.toLowerCase(),
   )
   return [targetCanon, ...rest]
@@ -279,7 +360,7 @@ export async function loadStudioModelQuotaState(
   let changed = false
 
   for (const [modelKey, untilTs] of Object.entries(rawExhausted)) {
-    if (/3\.7/.test(modelKey)) {
+    if (/3\.7/.test(modelKey) || /\bcarbon\b/i.test(modelKey)) {
       changed = true
       continue
     }
@@ -362,20 +443,34 @@ export async function resetModelQuotaState(
   })
 }
 
+export interface EffectiveModelWaitOptions {
+  /** Stop waiting for a free model slot (scan stopped). */
+  isAborted?: () => boolean
+  /** Called (at most every 30s) while every usable model is at its window limit. */
+  onWaitForSlot?: (message: string) => void
+  /** Give up waiting after this long and take the least-busy model (default 20 min). */
+  maxWaitMs?: number
+}
+
 /**
  * Starting from `chosenModel`, return the first model in `chain` that is not exhausted
- * (or whose `untilTimestamp <= nowMs`), prioritizing models NOT currently leased by
- * another active window when `holderKey` is provided.
+ * (or whose `untilTimestamp <= nowMs`). Models in `excludeModels` are tried last.
+ *
+ * When `holderKey` (the worker's profile dir) is given, the per-model window limit
+ * (STUDIO_MODEL_MAX_WINDOWS) is enforced and the chosen model is LEASED to that worker in
+ * the same synchronous step, so two workers can never both take the last Argon slot.
+ * If every non-exhausted model is at its limit, waits for a slot to free up.
+ *
  * If all models in the chain are exhausted, returns `''` (empty string).
  */
 export async function getEffectiveModel(
   chosenModel?: string | null,
   chain?: string[],
   nowMs: number = Date.now(),
-  _holderKey?: string,
+  holderKey?: string,
   excludeModels?: string[],
+  waitOptions?: EffectiveModelWaitOptions,
 ): Promise<string> {
-  const state = await loadStudioModelQuotaState(nowMs)
   const baseChain = chain && chain.length > 0 ? chain : buildStudioFallbackCycle(chosenModel)
   const startCanonical = canonicalizeStudioModelName(chosenModel || baseChain[0])
   const startIdx = baseChain.findIndex(
@@ -386,30 +481,58 @@ export async function getEffectiveModel(
       ? [...baseChain.slice(startIdx), ...baseChain.slice(0, startIdx)]
       : [...baseChain]
 
-  const orderedCandidates = rotatedChain.map((c) => canonicalizeStudioModelName(c))
+  // Only allowed models, each once, in chain order
+  const orderedCandidates: StudioModelOption[] = []
+  for (const c of rotatedChain) {
+    const canon = canonicalizeStudioModelName(c)
+    if (!orderedCandidates.includes(canon)) orderedCandidates.push(canon)
+  }
 
   const excludedSet = new Set(
     (excludeModels || []).map((m) => canonicalizeStudioModelName(m).toLowerCase()),
   )
+  // Preferred order: non-excluded models first, excluded ones only as a last resort
+  const preferred = [
+    ...orderedCandidates.filter((m) => !excludedSet.has(m.toLowerCase())),
+    ...orderedCandidates.filter((m) => excludedSet.has(m.toLowerCase())),
+  ]
 
-  for (const candidate of orderedCandidates) {
-    const canon = canonicalizeStudioModelName(candidate)
-    if (excludedSet.has(canon.toLowerCase())) continue
-    const untilTs = state.exhausted[canon]
-    if (!untilTs || untilTs <= nowMs) {
-      return canon
+  const waitStarted = Date.now()
+  const maxWaitMs = waitOptions?.maxWaitMs ?? 20 * 60_000
+  let lastWaitLogAt = 0
+
+  for (;;) {
+    const now = holderKey ? Date.now() : nowMs
+    const state = await loadStudioModelQuotaState(nowMs)
+    const usable = preferred.filter((m) => {
+      const untilTs = state.exhausted[m]
+      return !untilTs || untilTs <= nowMs
+    })
+    if (usable.length === 0) return ''
+
+    if (!holderKey) return usable[0]
+
+    // Synchronous from here to the lease write: no other worker can grab the slot in between
+    const withSlot = usable.find((m) => hasFreeModelSlot(m, holderKey, now))
+    if (withSlot) {
+      updateExclusiveStudioModelLease(holderKey, withSlot)
+      return withSlot
     }
-  }
 
-  if (excludedSet.size > 0) {
-    for (const candidate of orderedCandidates) {
-      const canon = canonicalizeStudioModelName(candidate)
-      const untilTs = state.exhausted[canon]
-      if (!untilTs || untilTs <= nowMs) {
-        return canon
-      }
+    const waitedMs = Date.now() - waitStarted
+    if (waitOptions?.isAborted?.() || waitedMs >= maxWaitMs) {
+      // Last resort (stopped / waited too long): least-busy usable model
+      const counts = getActiveLeasedModelsByOtherHolders(holderKey, now)
+      const leastBusy = [...usable].sort((a, b) => (counts.get(a) || 0) - (counts.get(b) || 0))[0]
+      updateExclusiveStudioModelLease(holderKey, leastBusy)
+      return leastBusy
     }
+    if (Date.now() - lastWaitLogAt >= 30_000) {
+      lastWaitLogAt = Date.now()
+      waitOptions?.onWaitForSlot?.(
+        `All usable models are at their window limit (${describeStudioModelLeases(now)}) - waiting for a free model slot`,
+      )
+    }
+    await new Promise((r) => setTimeout(r, 3_000))
   }
-
-  return ''
 }
