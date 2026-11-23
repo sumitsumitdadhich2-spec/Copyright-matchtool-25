@@ -55,6 +55,7 @@ import {
 import {
   DEFAULT_STUDIO_MODEL_NAME,
   MAX_CONCURRENT_MODEL_WINDOWS,
+  firstModelWithQuota,
   getEffectiveModel,
   isAccountFullyExhausted,
   releaseExclusiveStudioModel,
@@ -3689,6 +3690,32 @@ export class StudioParallelManager {
           /quota\s+khatam/i.test(claimedWin.error || claimedWin.summaryText || '')
         ) {
           const usedAcct = leasedSlot.controller.getGoogleAccountSlot()
+          // Fixed-model account with a quota fallback order (e.g. Only Neon -> 3.6 Flash ->
+          // Hydrogen -> Argon): one model ran out but the next still has quota on this same
+          // account -> re-queue so the next run uses that model.
+          if (!(await isGoogleAccountOutOfQuota(this.username || 'admin', usedAcct))) {
+            const acctRun = await getGoogleAccountRunSettings(this.username || 'admin', usedAcct).catch(() => null)
+            const nextModel = acctRun && acctRun.modelMode !== 'auto'
+              ? await firstModelWithQuota(allowedModelsForAccountMode(acctRun.modelMode), usedAcct)
+              : ''
+            const prevModel = claimedWin.modelName || acctRun?.modelMode || 'model'
+            claimedWin.status = 'QUEUED'
+            claimedWin.workerId = null
+            claimedWin.stage = 'queued (model quota used)'
+            claimedWin.error = null
+            claimedWin.summaryText = `Account ${usedAcct}: ${prevModel} quota khatam -> next ${nextModel || 'model'}`
+            this.appendCombinedLog({
+              workerId: leasedSlot.workerId,
+              windowId: claimedWin.id,
+              windowNumber: claimedWin.windowNumber,
+              windowRange: `${claimedWin.startFormatted}–${claimedWin.endFormatted}`,
+              level: 'RETRY',
+              step: 'model quota used -> next model',
+              message: `Account ${usedAcct}: ${prevModel} daily quota used. Window #${claimedWin.windowNumber} re-queued; next model on this account: ${nextModel || '?'}`,
+            })
+            this.persistStateToDisk()
+            continue
+          }
           const activeAccts = await getActiveGoogleAccountSlots(this.username || 'admin').catch(
             () => [1] as GoogleAccountSlot[],
           )
@@ -3909,7 +3936,13 @@ export class StudioParallelManager {
         this.username || 'admin',
         slot.controller.getGoogleAccountSlot(),
       ).catch(() => null)
-      const fixedModel = acctRun && acctRun.modelMode !== 'auto' ? acctRun.modelMode : null
+      const fixedModel =
+        acctRun && acctRun.modelMode !== 'auto'
+          ? (await firstModelWithQuota(
+              allowedModelsForAccountMode(acctRun.modelMode),
+              slot.controller.getGoogleAccountSlot(),
+            )) || acctRun.modelMode
+          : null
       const effectiveWinModel =
         (await getEffectiveModel(
           fixedModel || cfg.studioModelName,

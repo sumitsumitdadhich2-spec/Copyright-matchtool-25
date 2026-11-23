@@ -71,9 +71,23 @@ export function resolveAccountThinkingLevel(thinking: GoogleAccountThinking): St
   return thinking === 'default' ? DEFAULT_ACCOUNT_THINKING_LEVEL : thinking
 }
 
-/** Models an account may use: just the fixed one, or every allowed model in Auto mode. */
+/**
+ * Fixed-model accounts that may move on to other models ONLY when the fixed model's daily
+ * quota is used up, in this order. 403 / 503 / internal errors still stay on the current model.
+ *   Only Neon: Neon -> Gemini 3.6 Flash -> Hydrogen -> Argon (last)
+ * A fixed model not listed here never falls back.
+ */
+export const FIXED_MODEL_QUOTA_FALLBACK: Partial<Record<StudioModelOption, StudioModelOption[]>> = {
+  Neon: ['Gemini 3.6 Flash', 'Hydrogen', 'Argon'],
+}
+
+/**
+ * Models an account may use, in quota order: every allowed model in Auto mode, else the fixed
+ * model followed by its quota fallbacks (FIXED_MODEL_QUOTA_FALLBACK).
+ */
 export function allowedModelsForAccountMode(mode: GoogleAccountModelMode): StudioModelOption[] {
-  return mode === 'auto' ? [...STUDIO_MODEL_OPTIONS] : [mode]
+  if (mode === 'auto') return [...STUDIO_MODEL_OPTIONS]
+  return [mode, ...(FIXED_MODEL_QUOTA_FALLBACK[mode] ?? []).filter((m) => m !== mode)]
 }
 
 export interface PublicGoogleAccount {

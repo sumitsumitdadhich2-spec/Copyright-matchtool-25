@@ -7,6 +7,7 @@ import {
   canonicalizeStudioModelName,
   getActiveLeasedModelsByOtherHolders,
   hasFreeModelSlot,
+  firstModelWithQuota,
   isAccountFullyExhausted,
   setStudioHolderAccount,
   releaseExclusiveStudioModel,
@@ -16,6 +17,7 @@ import {
   nextPacificMidnight,
   resetModelQuotaState,
 } from '../lib/studio-model-state'
+import { allowedModelsForAccountMode } from '../lib/studio-settings'
 
 async function runTests() {
   const statePath = path.join(DATA_DIR, 'studio-model-state.json')
@@ -206,6 +208,22 @@ async function runTests() {
     assert.equal(await getEffectiveModel('Neon', ['Neon'], Date.now(), 'acct-test-fixed'), '', 'Neon-only: no fallback')
     assert.equal(await getEffectiveModel('Argon', ['Argon'], Date.now(), 'acct-test-fixed', ['Argon']), 'Argon')
     releaseExclusiveStudioModel('acct-test-fixed')
+    // Only Neon: on quota end -> 3.6 Flash -> Hydrogen -> Argon (last); other fixed models stay alone
+    const neonOrder = allowedModelsForAccountMode('Neon')
+    assert.deepEqual(neonOrder, ['Neon', 'Gemini 3.6 Flash', 'Hydrogen', 'Argon'])
+    assert.deepEqual(allowedModelsForAccountMode('Argon'), ['Argon'])
+    await resetModelQuotaState(null, Date.now(), 3)
+    assert.equal(await firstModelWithQuota(neonOrder, 3), 'Neon', 'Neon first while it has quota')
+    await markModelExhausted('Neon', Date.now(), 3)
+    assert.equal(await isAccountFullyExhausted(3, Date.now(), neonOrder), false, 'Neon out but account still usable')
+    assert.equal(await firstModelWithQuota(neonOrder, 3), 'Gemini 3.6 Flash', 'Neon out -> 3.6 Flash')
+    await markModelExhausted('Gemini 3.6 Flash', Date.now(), 3)
+    assert.equal(await firstModelWithQuota(neonOrder, 3), 'Hydrogen', '3.6 out -> Hydrogen')
+    await markModelExhausted('Hydrogen', Date.now(), 3)
+    assert.equal(await firstModelWithQuota(neonOrder, 3), 'Argon', 'Hydrogen out -> Argon (last)')
+    await markModelExhausted('Argon', Date.now(), 3)
+    assert.equal(await firstModelWithQuota(neonOrder, 3), '', 'all four out -> none')
+    assert.equal(await isAccountFullyExhausted(3, Date.now(), neonOrder), true)
     for (const h of ['acct-test-a1', 'acct-test-a2', 'acct-test-a1b', 'acct-test-a3']) releaseExclusiveStudioModel(h)
     await resetModelQuotaState(null, baseNow)
     assert.equal(await isAccountFullyExhausted(2), false, 'Reset clears every account')

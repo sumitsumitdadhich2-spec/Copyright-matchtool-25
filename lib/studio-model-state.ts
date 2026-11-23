@@ -518,6 +518,24 @@ export async function isAccountFullyExhausted(
   })
 }
 
+/**
+ * First model in `order` whose daily quota is NOT used up on this account ('' if all are).
+ * Used for fixed-model accounts: e.g. Only Neon -> Neon, then 3.6 Flash, Hydrogen, Argon.
+ */
+export async function firstModelWithQuota(
+  order: readonly string[],
+  accountSlot: number,
+  nowMs: number = Date.now(),
+): Promise<string> {
+  const state = await loadStudioModelQuotaState(nowMs, accountSlot)
+  for (const raw of order) {
+    const m = canonicalizeStudioModelName(raw)
+    const untilTs = state.exhausted[m]
+    if (!untilTs || untilTs <= nowMs) return m
+  }
+  return ''
+}
+
 export interface EffectiveModelWaitOptions {
   /** Stop waiting for a free model slot (scan stopped). */
   isAborted?: () => boolean

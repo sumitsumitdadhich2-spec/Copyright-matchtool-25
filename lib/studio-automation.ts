@@ -14,6 +14,7 @@ import {
   DEFAULT_STUDIO_UPLOAD_GATE,
   DEFAULT_STUDIO_RUN_STAGGER_SEC,
   computeEffectiveMaxInputTokens,
+  allowedModelsForAccountMode,
   getGoogleAccountRunSettings,
   resolveAccountThinkingLevel,
   getSettingsCookieFingerprint,
@@ -32,6 +33,7 @@ import {
   gemini4SlugFor,
   describeStudioModelLeases,
   getActiveLeasedModelsByOtherHolders,
+  firstModelWithQuota,
   getEffectiveModel,
   maxWindowsForModel,
   setStudioHolderAccount,
@@ -6496,7 +6498,13 @@ export class StudioBrowserController {
     // Per Google account settings (Settings -> account box): fixed model or Auto, and thinking
     // (Default = Medium). These win over the global settings.
     const acctRun = await getGoogleAccountRunSettings(username, this.googleAccountSlot)
-    const accountFixedModel = acctRun.modelMode !== 'auto' ? acctRun.modelMode : null
+    const accountSetModel = acctRun.modelMode !== 'auto' ? acctRun.modelMode : null
+    // Fixed-model account: this job uses the first model in its quota order that still has quota
+    // (e.g. Only Neon -> Neon, then 3.6 Flash, Hydrogen, Argon). Only quota moves it on.
+    const accountQuotaOrder = accountSetModel ? allowedModelsForAccountMode(accountSetModel) : []
+    const accountFixedModel = accountSetModel
+      ? (await firstModelWithQuota(accountQuotaOrder, this.googleAccountSlot)) || accountSetModel
+      : null
     const effectiveThinkingLevel = normalizeStudioThinkingLevel(
       resolveAccountThinkingLevel(acctRun.thinking),
     )
@@ -6544,7 +6552,11 @@ export class StudioBrowserController {
     this.logStep(
       'account settings',
       `${jobLabel}: Account ${this.googleAccountSlot} -> model ${
-        accountFixedModel ? `ONLY ${accountFixedModel}` : `Auto (start ${chosenModel})`
+        accountSetModel
+          ? accountFixedModel !== accountSetModel
+            ? `${accountFixedModel} (set: Only ${accountSetModel}, its quota is used up; order ${accountQuotaOrder.join(' -> ')})`
+            : `ONLY ${accountFixedModel}${accountQuotaOrder.length > 1 ? ` (on quota end: ${accountQuotaOrder.slice(1).join(' -> ')})` : ''}`
+          : `Auto (start ${chosenModel})`
       } · thinking ${effectiveThinkingLevel}${acctRun.thinking === 'default' ? ' (default)' : ''}`,
       'info',
     )
@@ -6582,7 +6594,7 @@ export class StudioBrowserController {
     }
     if (!initialEffectiveModel) {
       const resetTimeStr = await formatQuotaResetTime()
-      throw new Error(`NEEDS_ATTENTION: ${accountFixedModel ? `${accountFixedModel} ka quota khatam (Account ${this.googleAccountSlot} par sirf ${accountFixedModel} set hai)` : `saare models ka quota khatam (Account ${this.googleAccountSlot})`}, reset ${resetTimeStr} par`)
+      throw new Error(`NEEDS_ATTENTION: ${accountFixedModel ? `${accountFixedModel} ka quota khatam (Account ${this.googleAccountSlot}, set: Only ${accountSetModel}${accountQuotaOrder.length > 1 ? `, order ${accountQuotaOrder.join(' -> ')}` : ''})` : `saare models ka quota khatam (Account ${this.googleAccountSlot})`}, reset ${resetTimeStr} par`)
     }
 
     let activeModelName = initialEffectiveModel
@@ -7812,7 +7824,7 @@ export class StudioBrowserController {
               )
               if (!nextAvailableModel) {
                 const resetTimeStr = await formatQuotaResetTime()
-                const allExhaustedMsg = `NEEDS_ATTENTION: ${accountFixedModel ? `${accountFixedModel} ka quota khatam (Account ${this.googleAccountSlot} par sirf ${accountFixedModel} set hai)` : `saare models ka quota khatam (Account ${this.googleAccountSlot})`}, reset ${resetTimeStr} par`
+                const allExhaustedMsg = `NEEDS_ATTENTION: ${accountFixedModel ? `${accountFixedModel} ka quota khatam (Account ${this.googleAccountSlot}, set: Only ${accountSetModel}${accountQuotaOrder.length > 1 ? `, order ${accountQuotaOrder.join(' -> ')}` : ''})` : `saare models ka quota khatam (Account ${this.googleAccountSlot})`}, reset ${resetTimeStr} par`
                 this.logStep('all models quota exhausted', allExhaustedMsg, 'error')
                 onLog?.('error', `${allExhaustedMsg} (${jobLabel})`)
                 throw new Error(allExhaustedMsg)
@@ -7848,7 +7860,7 @@ export class StudioBrowserController {
                 )
                 if (!nextAvailableModel) {
                   const resetTimeStr = await formatQuotaResetTime()
-                  const allExhaustedMsg = `NEEDS_ATTENTION: ${accountFixedModel ? `${accountFixedModel} ka quota khatam (Account ${this.googleAccountSlot} par sirf ${accountFixedModel} set hai)` : `saare models ka quota khatam (Account ${this.googleAccountSlot})`}, reset ${resetTimeStr} par`
+                  const allExhaustedMsg = `NEEDS_ATTENTION: ${accountFixedModel ? `${accountFixedModel} ka quota khatam (Account ${this.googleAccountSlot}, set: Only ${accountSetModel}${accountQuotaOrder.length > 1 ? `, order ${accountQuotaOrder.join(' -> ')}` : ''})` : `saare models ka quota khatam (Account ${this.googleAccountSlot})`}, reset ${resetTimeStr} par`
                   this.logStep('all models quota exhausted', allExhaustedMsg, 'error')
                   onLog?.('error', `${allExhaustedMsg} (${jobLabel})`)
                   throw new Error(allExhaustedMsg)
@@ -8515,7 +8527,7 @@ export class StudioBrowserController {
                 )
                 if (!nextMod) {
                   const resetTimeStr = await formatQuotaResetTime()
-                  const allExhaustedMsg = `NEEDS_ATTENTION: ${accountFixedModel ? `${accountFixedModel} ka quota khatam (Account ${this.googleAccountSlot} par sirf ${accountFixedModel} set hai)` : `saare models ka quota khatam (Account ${this.googleAccountSlot})`}, reset ${resetTimeStr} par`
+                  const allExhaustedMsg = `NEEDS_ATTENTION: ${accountFixedModel ? `${accountFixedModel} ka quota khatam (Account ${this.googleAccountSlot}, set: Only ${accountSetModel}${accountQuotaOrder.length > 1 ? `, order ${accountQuotaOrder.join(' -> ')}` : ''})` : `saare models ka quota khatam (Account ${this.googleAccountSlot})`}, reset ${resetTimeStr} par`
                   this.logStep('all models quota exhausted', allExhaustedMsg, 'error')
                   onLog?.('error', `${allExhaustedMsg} (${jobLabel})`)
                   throw new Error(allExhaustedMsg)
@@ -8629,7 +8641,7 @@ export class StudioBrowserController {
                     )
                     if (!nextMod) {
                       const resetTimeStr = await formatQuotaResetTime()
-                      const allExhaustedMsg = `NEEDS_ATTENTION: ${accountFixedModel ? `${accountFixedModel} ka quota khatam (Account ${this.googleAccountSlot} par sirf ${accountFixedModel} set hai)` : `saare models ka quota khatam (Account ${this.googleAccountSlot})`}, reset ${resetTimeStr} par`
+                      const allExhaustedMsg = `NEEDS_ATTENTION: ${accountFixedModel ? `${accountFixedModel} ka quota khatam (Account ${this.googleAccountSlot}, set: Only ${accountSetModel}${accountQuotaOrder.length > 1 ? `, order ${accountQuotaOrder.join(' -> ')}` : ''})` : `saare models ka quota khatam (Account ${this.googleAccountSlot})`}, reset ${resetTimeStr} par`
                       this.logStep('all models quota exhausted', allExhaustedMsg, 'error')
                       onLog?.('error', `${allExhaustedMsg} (${jobLabel})`)
                       throw new Error(allExhaustedMsg)

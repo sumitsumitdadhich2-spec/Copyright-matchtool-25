@@ -838,7 +838,9 @@ function GoogleAccountCard({
       </div>
       {account.modelMode !== 'auto' && (
         <div className="text-[11px] text-sky-300">
-          Only {account.modelMode} is used on this account (no fallback to other models).
+          {account.modelMode === 'Neon'
+            ? 'Neon is used on this account. Only when its daily quota runs out: Gemini 3.6 Flash -> Hydrogen -> Argon (last).'
+            : `Only ${account.modelMode} is used on this account (no fallback to other models).`}
           {account.modelMode === 'Argon' ? ' Output length = 1000000.' : ''}
         </div>
       )}
