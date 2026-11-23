@@ -6528,8 +6528,8 @@ export class StudioBrowserController {
       ? Math.max(Math.round(totalVideoSec * 500), Math.round(totalVideoSec * activeMeasuredRate * 0.85))
       : Math.round(totalVideoSec * 500)
 
-    const MAX_ATTEMPTS = params.maxAttempts ?? (parallelMode ? 5 : 3)
-    const MAX_PERMISSION_RETRIES = 10
+    const MAX_ATTEMPTS = params.maxAttempts ?? (parallelMode ? 20 : 3)
+    const MAX_PERMISSION_RETRIES = 20
     let permissionDeniedRetries = 0
     const MAX_POLICY_RETRIES = 5
     let policyBlockedRetries = 0

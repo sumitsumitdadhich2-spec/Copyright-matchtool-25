@@ -1551,7 +1551,7 @@ export function StudioParallelGrid({
                     </span>
                     {w.attempt > 0 && (
                       <span>
-                        try {w.attempt}/{w.maxAttempts || 5}
+                        try {w.attempt}/{w.maxAttempts || 20}
                         {w.permRetry > 0 ? ` · 403:${w.permRetry}` : ''}
                       </span>
                     )}
@@ -1787,7 +1787,7 @@ export function StudioParallelGrid({
                         {win.stage} · {shortModelBadge(win.modelName)}
                         {win.tokens ? ` · ${Math.round(win.tokens / 1000)}K tok` : ''}
                         {win.attempt > 0 ? ` · try ${win.attempt}/${win.maxAttempts}` : ''}
-                        {win.permRetry > 0 ? ` · 403 ${win.permRetry}/10` : ''}
+                        {win.permRetry > 0 ? ` · 403 ${win.permRetry}/20` : ''}
                       </span>
                     )}
                   </div>
