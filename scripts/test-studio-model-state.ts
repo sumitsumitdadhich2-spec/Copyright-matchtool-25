@@ -11,6 +11,7 @@ import {
   isAccountFullyExhausted,
   setStudioHolderAccount,
   releaseExclusiveStudioModel,
+  updateExclusiveStudioModelLease,
   getEffectiveModel,
   loadStudioModelQuotaState,
   markModelExhausted,
@@ -224,6 +225,20 @@ async function runTests() {
     await markModelExhausted('Argon', Date.now(), 3)
     assert.equal(await firstModelWithQuota(neonOrder, 3), '', 'all four out -> none')
     assert.equal(await isAccountFullyExhausted(3, Date.now(), neonOrder), true)
+    // Window limit is never broken: 2 windows already on Neon (account 4) -> a 3rd window of an
+    // "Only Neon" account takes the next model of its order; with no other model it does not wait-and-overbook.
+    await resetModelQuotaState(null, Date.now(), 4)
+    for (const h of ['lim-a', 'lim-b', 'lim-c']) setStudioHolderAccount(h, 4)
+    updateExclusiveStudioModelLease('lim-a', 'Neon')
+    updateExclusiveStudioModelLease('lim-b', 'Neon')
+    assert.equal(await getEffectiveModel('Neon', neonOrder, Date.now(), 'lim-c'), 'Gemini 3.6 Flash', '3rd window spills to 3.6 Flash')
+    releaseExclusiveStudioModel('lim-c')
+    assert.equal(
+      await getEffectiveModel('Neon', ['Neon'], Date.now(), 'lim-c', undefined, { maxWaitMs: 0 }),
+      '',
+      'no free Neon slot -> no 3rd Neon',
+    )
+    for (const h of ['lim-a', 'lim-b', 'lim-c']) releaseExclusiveStudioModel(h)
     for (const h of ['acct-test-a1', 'acct-test-a2', 'acct-test-a1b', 'acct-test-a3']) releaseExclusiveStudioModel(h)
     await resetModelQuotaState(null, baseNow)
     assert.equal(await isAccountFullyExhausted(2), false, 'Reset clears every account')

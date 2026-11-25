@@ -5803,7 +5803,8 @@ export class StudioBrowserController {
    */
   private isQuotaOrDailyLimitErrorText(text: string | null | undefined): boolean {
     if (!text) return false
-    return /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|rateLimitExceeded|too\s+many\s+requests|you\s+have\s+exceeded\s+your\s+quota|exceeded\s+your\s+(?:current\s+)?quota|reached\s+(?:the|your)\s+daily\s+limits?|you(?:'ve|\s+have)?\s+reached\s+(?:the|your)\s+daily\s+limits?|daily\s+limits?\s+(?:of\s+tokens|reached|exceeded)|daily\s+quota|please\s+select\s+another\s+model)/i.test(
+    // Only a real quota message means "this model's quota is over" (not a per-minute rate limit / 429)
+    return /(quota\s+exceeded|resource[_\s]+exhausted|you\s+have\s+exceeded\s+your\s+quota|exceeded\s+your\s+(?:current\s+)?quota|reached\s+(?:the|your)\s+daily\s+limits?|you(?:'ve|\s+have)?\s+reached\s+(?:the|your)\s+daily\s+limits?|daily\s+limits?\s+(?:of\s+tokens|reached|exceeded)|daily\s+quota|please\s+select\s+another\s+model)/i.test(
       text,
     )
   }
@@ -6621,10 +6622,24 @@ export class StudioBrowserController {
     )
     // Fixed model account -> the chain is just that model: every fallback (403 / 503 / quota /
     // internal error) stays on it, and the model picker never falls back to another model.
+    // Fixed model account (e.g. "Only Neon"): its list = the quota order starting at the model in
+    // use (Neon -> 3.6 Flash -> Hydrogen -> Argon). The next model is used only when the current one
+    // has no quota, has no free window slot (max 2 windows per model per account), or stays
+    // "not available" after 5 Continues. 403 / internal errors stay on the current model.
+    const fixedQuotaChain: string[] = accountFixedModel
+      ? (() => {
+          const order = accountQuotaOrder.map((m) => canonicalizeStudioModelName(m))
+          const i = order.indexOf(chosenModel)
+          return i >= 0 ? [...order.slice(i), ...order.slice(0, i)] : [chosenModel, ...order]
+        })()
+      : []
     const MODEL_FALLBACK_CHAIN = accountFixedModel
-      ? [chosenModel]
+      ? fixedQuotaChain
       : buildStudioFallbackCycle(chosenModel)
-    this.allowedModelsForJob = accountFixedModel ? [chosenModel] : null
+    this.allowedModelsForJob = accountFixedModel ? [...fixedQuotaChain] : null
+    /** 403 / internal-error retries: a fixed account stays on its current model. */
+    const retryChainFor = (current: string): string[] =>
+      accountFixedModel ? [canonicalizeStudioModelName(current)] : MODEL_FALLBACK_CHAIN
     this.logStep(
       'account settings',
       `${jobLabel}: Account ${this.googleAccountSlot} -> model ${
@@ -7426,8 +7441,13 @@ export class StudioBrowserController {
         let doneIndicator: 'COMPLETION_GATE' | 'INCOMPLETE_60S_CAP' | 'RESCUED_ON_LATE_403' | null = null
         let permissionDeniedTriggered = false
         let modelUnavailableDetected = false
-        // "Model isn't available" handling: Continue in the same chat, as many times as needed
+        // "Model isn't available" handling: Continue in the same chat, as many times as needed.
+        // 5 Continues on one model; still unavailable -> switch model in the SAME chat (next model of
+        // this job's list that has quota + a free window slot), then 5 Continues on that model, etc.
+        const CONTINUES_PER_MODEL = 5
         let modelUnavailContinueCount = 0
+        let modelUnavailContinueOnModel = 0
+        const modelUnavailTriedModels: string[] = []
         let internalErrorDetected = false
         let internalErrorContinueTriedInChat = false
         let quotaContinuePartialText: string | null = null
@@ -7450,6 +7470,72 @@ export class StudioBrowserController {
           } catch {
             /* ignore */
           }
+        }
+
+        const onModelUnavailableSameChat = async (reason: string) => {
+          await cancelStuckStopButtonIfVisible()
+          if (modelUnavailContinueOnModel >= CONTINUES_PER_MODEL) {
+            const prevModel = canonicalizeStudioModelName(activeModelName)
+            if (!modelUnavailTriedModels.includes(prevModel)) modelUnavailTriedModels.push(prevModel)
+            // Next model in this job's list: has quota (quota is only "over" after a quota message)
+            // and a free window slot on this account. Every model tried -> start the round again.
+            let nextModel = await getEffectiveModel(
+              chosenModel,
+              MODEL_FALLBACK_CHAIN,
+              Date.now(),
+              this.profileDirName,
+              modelUnavailTriedModels,
+              { isAborted: () => this.isStopping(scope), maxWaitMs: 0 },
+            )
+            if (nextModel && modelUnavailTriedModels.includes(canonicalizeStudioModelName(nextModel))) {
+              modelUnavailTriedModels.length = 0
+              modelUnavailTriedModels.push(prevModel)
+              nextModel = await getEffectiveModel(
+                chosenModel,
+                MODEL_FALLBACK_CHAIN,
+                Date.now(),
+                this.profileDirName,
+                [prevModel],
+                { isAborted: () => this.isStopping(scope), maxWaitMs: 0 },
+              )
+            }
+            if (nextModel && canonicalizeStudioModelName(nextModel) !== prevModel) {
+              const switched = await this.selectModelInRunSettings(page, nextModel, MODEL_FALLBACK_CHAIN)
+              activeModelName = switched.selectedModelName || nextModel
+              this.activeModelName = activeModelName
+              updateExclusiveStudioModelLease(this.profileDirName, activeModelName)
+              if (/\bargon\b/i.test(activeModelName)) {
+                await this.setOutputLengthInRunSettings(
+                  page,
+                  resolveEffectiveMaxOutputTokensForModel(activeModelName),
+                  activeModelName,
+                )
+              }
+              const swMsg = `${jobLabel}: ${prevModel} still not available after ${CONTINUES_PER_MODEL} Continues -> model changed to ${activeModelName} in the SAME chat (Account ${this.googleAccountSlot}: ${describeStudioModelLeases(Date.now(), this.googleAccountSlot)})`
+              this.logStep('model unavailable -> switch model (same chat)', swMsg, 'warn')
+              onLog?.('warn', swMsg)
+            } else {
+              const stayMsg = `${jobLabel}: ${prevModel} still not available after ${CONTINUES_PER_MODEL} Continues, no other model with quota + free slot -> keep continuing on ${prevModel}`
+              this.logStep('model unavailable -> no other model', stayMsg, 'warn')
+              onLog?.('warn', stayMsg)
+            }
+            modelUnavailContinueOnModel = 0
+          }
+          modelUnavailContinueOnModel += 1
+          modelUnavailContinueCount += 1
+          await this.sendContinueAfterModelUnavailable(page, {
+            jobLabel,
+            activeModelName: `${activeModelName} (${modelUnavailContinueOnModel}/${CONTINUES_PER_MODEL} on this model)`,
+            continueCount: modelUnavailContinueCount,
+            reason,
+            scope,
+            onLog,
+          })
+          capturedRunError = null
+          stopEverSeen = false
+          stopGoneConsecutivePolls = 0
+          stableSeconds = 0
+          runStarted = Date.now()
         }
 
         // Snapshot pre-run model turn state so a pre-existing failed turn on the same page doesn't false-trigger before the new run starts
@@ -7722,7 +7808,7 @@ export class StudioBrowserController {
               const nextModelInCycle =
                 (await getEffectiveModel(
                   chosenModel,
-                  MODEL_FALLBACK_CHAIN,
+                  retryChainFor(prevModel),
                   Date.now(),
                   this.profileDirName,
                   [prevModel],
@@ -7865,9 +7951,7 @@ export class StudioBrowserController {
             )
 
             const netQuotaExceeded =
-              capturedRunError !== null &&
-              (capturedRunError.status === 429 ||
-                this.isQuotaOrDailyLimitErrorText(capturedRunError.body))
+              capturedRunError !== null && this.isQuotaOrDailyLimitErrorText(capturedRunError.body)
 
             const domQuotaExceeded =
               errBannerText !== null && this.isQuotaOrDailyLimitErrorText(errBannerText)
@@ -8014,7 +8098,7 @@ export class StudioBrowserController {
                 const nextModelInCycle =
                   (await getEffectiveModel(
                     chosenModel,
-                    MODEL_FALLBACK_CHAIN,
+                    retryChainFor(prevModel),
                     Date.now(),
                     this.profileDirName,
                     [prevModel],
@@ -8035,21 +8119,7 @@ export class StudioBrowserController {
                 break
               }
               if (isModelUnavailableOrHighDemandError(errBannerText, capturedRunError?.status)) {
-                modelUnavailContinueCount += 1
-                await cancelStuckStopButtonIfVisible()
-                await this.sendContinueAfterModelUnavailable(page, {
-                  jobLabel,
-                  activeModelName,
-                  continueCount: modelUnavailContinueCount,
-                  reason: errBannerText,
-                  scope,
-                  onLog,
-                })
-                capturedRunError = null
-                stopEverSeen = false
-                stopGoneConsecutivePolls = 0
-                stableSeconds = 0
-                runStarted = Date.now()
+                await onModelUnavailableSameChat(errBannerText)
                 continue
               }
               if (
@@ -8170,21 +8240,7 @@ export class StudioBrowserController {
                   'HTTP 503 UNAVAILABLE'
                 ).slice(0, 140)
                 {
-                modelUnavailContinueCount += 1
-                await cancelStuckStopButtonIfVisible()
-                await this.sendContinueAfterModelUnavailable(page, {
-                  jobLabel,
-                  activeModelName,
-                  continueCount: modelUnavailContinueCount,
-                  reason: unavailReason,
-                  scope,
-                  onLog,
-                })
-                capturedRunError = null
-                stopEverSeen = false
-                stopGoneConsecutivePolls = 0
-                stableSeconds = 0
-                runStarted = Date.now()
+                await onModelUnavailableSameChat(unavailReason)
                 continue
               }
               }
@@ -8543,7 +8599,7 @@ export class StudioBrowserController {
           const nextFallback =
             (await getEffectiveModel(
               chosenModel,
-              MODEL_FALLBACK_CHAIN,
+              retryChainFor(prevModel),
               Date.now(),
               this.profileDirName,
               [prevModel],
@@ -8797,7 +8853,7 @@ export class StudioBrowserController {
               const nextFallback =
                 (await getEffectiveModel(
                   chosenModel,
-                  MODEL_FALLBACK_CHAIN,
+                  retryChainFor(prevModel),
                   Date.now(),
                   this.profileDirName,
                   [prevModel],

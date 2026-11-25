@@ -839,7 +839,7 @@ function GoogleAccountCard({
       {account.modelMode !== 'auto' && (
         <div className="text-[11px] text-sky-300">
           {account.modelMode === 'Neon'
-            ? 'Neon is used on this account. Only when its daily quota runs out: Gemini 3.6 Flash -> Hydrogen -> Argon (last).'
+            ? 'Neon first. Next model (Gemini 3.6 Flash -> Hydrogen -> Argon) only when Neon\'s quota is over, Neon already runs in 2 windows on this account, or Neon stays "not available" after 5 Continues.'
             : `Only ${account.modelMode} is used on this account (no fallback to other models).`}
           {account.modelMode === 'Argon' ? ' Output length = 1000000.' : ''}
         </div>

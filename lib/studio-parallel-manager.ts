@@ -3946,7 +3946,16 @@ export class StudioParallelManager {
       const effectiveWinModel =
         (await getEffectiveModel(
           fixedModel || cfg.studioModelName,
-          fixedModel ? [fixedModel] : undefined,
+          // Fixed account: its quota order from the current model (Only Neon -> Neon, 3.6 Flash,
+          // Hydrogen, Argon). When Neon already runs in 2 windows on this account, the next
+          // window takes the next model with a free slot instead of waiting (never a 3rd Neon).
+          fixedModel && acctRun && acctRun.modelMode !== 'auto'
+            ? (() => {
+                const order = allowedModelsForAccountMode(acctRun.modelMode)
+                const i = order.indexOf(fixedModel as (typeof order)[number])
+                return i >= 0 ? [...order.slice(i), ...order.slice(0, i)] : [fixedModel, ...order]
+              })()
+            : undefined,
           Date.now(),
           slot.profileDirName,
           undefined,

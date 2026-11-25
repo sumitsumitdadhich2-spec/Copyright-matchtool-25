@@ -2157,10 +2157,36 @@ export class YtStudioBrowserController {
 
           // Step 6: Wait until file byte upload finishes (Uploading X% done & visible Save button enabled),
           // then click Save (#done-button) and VERIFY the Visibility step actually closes!
-          const deadline = Date.now() + 150_000;
-          while (Date.now() < deadline) {
+          // Keep waiting while the upload % is still moving (up to 8 min); give up only when it
+          // has not changed for 90s, and log what the dialog shows so a stuck upload is visible.
+          const hardDeadline = Date.now() + 8 * 60_000;
+          let lastProgTxt = '';
+          let lastProgChangeAt = Date.now();
+          let lastProgLogAt = 0;
+          let readyToSaveSeen = false;
+          while (Date.now() < hardDeadline && Date.now() - lastProgChangeAt < 90_000) {
             if (!shareUrl) {
               shareUrl = await this.extractShareUrlFromUploadModal(uploadPage, ignoreVideoIds);
+            }
+            const progNow = await uploadPage
+              .evaluate(() => {
+                const el = document.querySelector(
+                  'ytcp-uploads-dialog ytcp-video-upload-progress, ytcp-video-upload-progress, .progress-label'
+                ) as HTMLElement | null;
+                return (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+              })
+              .catch(() => '');
+            if (progNow !== lastProgTxt) {
+              lastProgTxt = progNow;
+              lastProgChangeAt = Date.now();
+            }
+            if (Date.now() - lastProgLogAt >= 30_000) {
+              lastProgLogAt = Date.now();
+              this.log(
+                'upload progress',
+                `[W${String(windowNumber).padStart(2, '0')}] ${progNow || '(no progress text)'}`,
+                'info'
+              );
             }
             const readyToSave = await uploadPage
               .evaluate(() => {
@@ -2195,9 +2221,17 @@ export class YtStudioBrowserController {
               .catch(() => false);
 
             if (readyToSave) {
+              readyToSaveSeen = true;
               break;
             }
             await uploadPage.waitForTimeout(1000);
+          }
+          if (!readyToSaveSeen) {
+            this.log(
+              'upload stuck',
+              `[W${String(windowNumber).padStart(2, '0')}] Save never became ready; last progress: "${lastProgTxt || 'none'}" (unchanged for ${Math.round((Date.now() - lastProgChangeAt) / 1000)}s)`,
+              'warn'
+            );
           }
 
           if (!shareUrl) {
@@ -2358,7 +2392,11 @@ export class YtStudioBrowserController {
           }
 
           if (!shareUrl) {
-            throw new Error('Upload saved, but could not extract https://youtu.be/<id> share URL from dialog or Content page.');
+            throw new Error(
+              readyToSaveSeen
+                ? 'Upload saved, but could not extract https://youtu.be/<id> share URL from dialog or Content page.'
+                : `YouTube upload did not finish (Save never ready, last progress "${lastProgTxt || 'none'}") and the video is not on the Content page.`
+            );
           }
 
           const idMatch =

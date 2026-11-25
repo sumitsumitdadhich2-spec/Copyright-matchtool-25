@@ -72,8 +72,9 @@ export function resolveAccountThinkingLevel(thinking: GoogleAccountThinking): St
 }
 
 /**
- * Fixed-model accounts that may move on to other models ONLY when the fixed model's daily
- * quota is used up, in this order. 403 / 503 / internal errors still stay on the current model.
+ * Fixed-model accounts that may move on to other models, in this order, when the current
+ * model's quota is over, it already runs in its max windows on the account, or it stays
+ * "not available" after 5 Continues. 403 / internal errors stay on the current model.
  *   Only Neon: Neon -> Gemini 3.6 Flash -> Hydrogen -> Argon (last)
  * A fixed model not listed here never falls back.
  */

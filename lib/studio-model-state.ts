@@ -541,7 +541,7 @@ export interface EffectiveModelWaitOptions {
   isAborted?: () => boolean
   /** Called (at most every 30s) while every usable model is at its window limit. */
   onWaitForSlot?: (message: string) => void
-  /** Give up waiting after this long and take the least-busy model (default 20 min). */
+  /** 0 = do not wait: return "" when no usable model has a free window slot. Otherwise waits. */
   maxWaitMs?: number
   /** Google account whose quota to check (default: the holder's account, else 1). */
   accountSlot?: number
@@ -592,8 +592,6 @@ export async function getEffectiveModel(
     ...orderedCandidates.filter((m) => excludedSet.has(m.toLowerCase())),
   ]
 
-  const waitStarted = Date.now()
-  const maxWaitMs = waitOptions?.maxWaitMs ?? 20 * 60_000
   let lastWaitLogAt = 0
   const account = waitOptions?.accountSlot
     ? normalizeAccountSlot(waitOptions.accountSlot)
@@ -617,14 +615,11 @@ export async function getEffectiveModel(
       return withSlot
     }
 
-    const waitedMs = Date.now() - waitStarted
-    if (waitOptions?.isAborted?.() || waitedMs >= maxWaitMs) {
-      // Last resort (stopped / waited too long): least-busy usable model
-      const counts = getActiveLeasedModelsByOtherHolders(holderKey, now)
-      const leastBusy = [...usable].sort((a, b) => (counts.get(a) || 0) - (counts.get(b) || 0))[0]
-      updateExclusiveStudioModelLease(holderKey, leastBusy)
-      return leastBusy
-    }
+    // The window limit per model per account is never broken (no 3rd window on a model):
+    // maxWaitMs 0 = "just look" -> '' when no model has a free slot; stopped -> first usable
+    // model WITHOUT taking a lease; otherwise keep waiting for a free slot.
+    if (waitOptions?.maxWaitMs === 0) return ''
+    if (waitOptions?.isAborted?.()) return usable[0]
     if (Date.now() - lastWaitLogAt >= 30_000) {
       lastWaitLogAt = Date.now()
       waitOptions?.onWaitForSlot?.(
