@@ -189,6 +189,8 @@ export class YtStudioBrowserController {
   private actionLock: Promise<void> = Promise.resolve();
   private boundContext: BrowserContext | null = null;
   private manualTabSelection = false;
+  /** Clips whose upload was started at least once in this server run (retries re-check the Content page first). */
+  private uploadStartedClipPaths = new Set<string>();
   private inFlightClipUploads: Map<
     string,
     Promise<{ ytUrl: string; ytVideoId: string; reused: boolean }>
@@ -204,6 +206,9 @@ export class YtStudioBrowserController {
   private screenshotInFlight: Promise<void> | null = null;
 
   private ensureInternalCollections(): void {
+    if (!this.uploadStartedClipPaths) {
+      this.uploadStartedClipPaths = new Set();
+    }
     if (!this.inFlightClipUploads) {
       this.inFlightClipUploads = new Map();
     }
@@ -1442,6 +1447,47 @@ export class YtStudioBrowserController {
     }
   }
 
+  /**
+   * Look for THIS window's uploaded video on the Content page. Match order (videos already used
+   * in this session are skipped): exact title "cmt-<prefix>-w<N>" -> same scan prefix + window
+   * number -> row still titled with the clip's file name.
+   */
+  private async findWindowVideoOnContentPage(params: {
+    scanId: string;
+    windowNumber: number;
+    clipPath: string;
+    title: string;
+    username: string;
+    ignoreVideoIds?: Set<string>;
+  }): Promise<{ ytUrl: string; videoId: string } | null> {
+    const { scanId, windowNumber, clipPath, title, username, ignoreVideoIds } = params;
+    const scanPrefixLower = (scanId ? scanId.slice(0, 8) : '').toLowerCase();
+    const clipBase = path.basename(clipPath).replace(/\.[^.]+$/, '').toLowerCase();
+    const summary = await this.checkAndVerifyContentPage({
+      scanId,
+      expectedWindows: [{ windowNumber, clipPath, title }],
+      waitForSdReady: false,
+      username,
+    });
+    const candidates = summary.items.filter(
+      (it) => it.videoId && !(ignoreVideoIds && ignoreVideoIds.has(it.videoId))
+    );
+    const t = title.toLowerCase();
+    const matched =
+      candidates.find((it) => it.title.toLowerCase() === t) ||
+      candidates.find(
+        (it) =>
+          it.windowNumber === windowNumber &&
+          !!it.scanPrefix &&
+          !!scanPrefixLower &&
+          it.scanPrefix.toLowerCase() === scanPrefixLower
+      ) ||
+      candidates.find((it) => !!clipBase && it.title.toLowerCase() === clipBase) ||
+      null;
+    if (!matched) return null;
+    return { ytUrl: matched.ytUrl || `https://youtu.be/${matched.videoId}`, videoId: matched.videoId };
+  }
+
   async uploadWindowClip(opts: {
     clipPath: string;
     scanId: string;
@@ -1684,6 +1730,38 @@ export class YtStudioBrowserController {
             }
           }
 
+          // Retry case: the video may already be on the channel from an earlier try whose link was
+          // not read. Check the Content page once more so it is reused, not uploaded again.
+          if (!forceUpload && (attempt > 1 || this.uploadStartedClipPaths.has(clipPath))) {
+            const prevUpload = await this.findWindowVideoOnContentPage({
+              scanId,
+              windowNumber,
+              clipPath,
+              title,
+              username,
+            }).catch(() => null);
+            if (prevUpload?.ytUrl) {
+              this.uploadedVideoIdsInSession.add(prevUpload.videoId);
+              saveClipYtSidecar(clipPath, {
+                scanId,
+                windowNumber,
+                ytUrl: prevUpload.ytUrl,
+                ytVideoId: prevUpload.videoId,
+                ytUploadedAt: Date.now(),
+                ytDeleted: false,
+              });
+              onProgress?.('link ready');
+              this.log(
+                'already uploaded',
+                `[W${String(windowNumber).padStart(2, '0')}] Video already on channel (Content page) -> ${prevUpload.ytUrl}, skipping duplicate upload`,
+                'ok'
+              );
+              return { ytUrl: prevUpload.ytUrl, ytVideoId: prevUpload.videoId, reused: true };
+            }
+            await uploadPage.bringToFront().catch(() => {});
+          }
+
+          this.uploadStartedClipPaths.add(clipPath);
           this.log(
             'upload start',
             `[W${String(windowNumber).padStart(2, '0')}] Uploading ${path.basename(clipPath)} as "${title}" (attempt ${attempt}/2)`,
@@ -2249,20 +2327,33 @@ export class YtStudioBrowserController {
           }
 
           // If shareUrl was not captured inside the dialog, read it from the Content table row by exact title or windowNumber
+          // The new row can take a while to show on the Content table, so check it up to 4 times.
           if (!shareUrl) {
-            const contentSummary = await this.checkAndVerifyContentPage({
-              scanId,
-              expectedWindows: [{ windowNumber, clipPath, title }],
-              waitForSdReady: false,
-              username,
-            });
-            const matched = contentSummary.items.find(
-              (it) =>
-                (it.title === title || it.windowNumber === windowNumber) &&
-                !ignoreVideoIds.has(it.videoId)
-            );
-            if (matched?.ytUrl) {
-              shareUrl = matched.ytUrl;
+            for (let chk = 1; chk <= 4 && !shareUrl; chk++) {
+              if (chk > 1) {
+                this.log(
+                  'finding link',
+                  `[W${String(windowNumber).padStart(2, '0')}] Upload saved, link not on Content page yet -> checking again (${chk}/4) in 15s`,
+                  'warn'
+                );
+                await uploadPage.waitForTimeout(15000).catch(() => {});
+              }
+              const found = await this.findWindowVideoOnContentPage({
+                scanId,
+                windowNumber,
+                clipPath,
+                title,
+                username,
+                ignoreVideoIds,
+              }).catch(() => null);
+              if (found?.ytUrl) {
+                shareUrl = found.ytUrl;
+                this.log(
+                  'link found on Content page',
+                  `[W${String(windowNumber).padStart(2, '0')}] ${found.ytUrl} (check ${chk}/4)`,
+                  'ok'
+                );
+              }
             }
           }
 

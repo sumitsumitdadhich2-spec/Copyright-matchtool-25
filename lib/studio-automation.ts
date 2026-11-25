@@ -5869,6 +5869,82 @@ export class StudioBrowserController {
   }
 
   /**
+   * "Model isn't available right now" / high demand on a Run: do NOT open a new chat and do NOT
+   * switch model. Mark the error (banner + failed model turn) as handled, wait a little, then send
+   * a "Continue" message in the SAME chat so the model starts thinking again from where it was.
+   * The caller keeps polling the same chat and repeats this until the real result arrives.
+   */
+  private async sendContinueAfterModelUnavailable(
+    page: Page,
+    params: {
+      jobLabel: string
+      activeModelName: string
+      continueCount: number
+      reason: string
+      scope?: { scanId?: string | null; username?: string | null }
+      onLog?: (level: 'info' | 'warn' | 'error' | 'success', msg: string) => void
+    },
+  ): Promise<void> {
+    const { jobLabel, activeModelName, continueCount, reason, scope, onLog } = params
+    const CONTINUE_PROMPT =
+      'Continue from where you stopped and finish the complete answer to my request above, in exactly the same format.'
+
+    // Mark every visible error banner and the failed last model turn as handled so the poll loop
+    // does not detect this same error again.
+    await this.markPageErrorBannersHandled(page)
+    await page
+      .evaluate((turnSels) => {
+        const re =
+          /(model\s+isn['’]t\s+available\s+right\s+now|model\s+is\s+(?:not|currently)\s+available|please\s+wait\s+a\s+minute\s+and\s+try\s+again|currently\s+experiencing\s+high\s+demand|service\s+is\s+(?:currently\s+)?unavailable|model\s+is\s+overloaded)/i
+        for (const ts of turnSels) {
+          if (ts.includes(':has-text(')) continue
+          try {
+            for (const node of Array.from(document.querySelectorAll(ts))) {
+              const el = node as HTMLElement
+              const txt = (el.innerText || el.textContent || '').trim()
+              if (txt.length <= 600 && re.test(txt)) el.setAttribute('data-cmt-handled-error', 'true')
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+      }, [...STUDIO_SELECTORS.modelTurnContainers])
+      .catch(() => {})
+
+    // Short wait (10s, 20s, then 30s max) so the model is free again; never a new chat.
+    const waitSec = Math.min(30, 10 * Math.max(1, continueCount))
+    const waitMsg = `${jobLabel}: model not available (${reason.slice(0, 100)}) -> waiting ${waitSec}s, then sending "Continue" #${continueCount} in the SAME chat on ${activeModelName} (no new chat)`
+    this.logStep('model unavailable -> continue same chat', waitMsg, 'warn')
+    onLog?.('warn', waitMsg)
+    const waitUntil = Date.now() + waitSec * 1000
+    while (Date.now() < waitUntil) {
+      await this.waitIfPausedOrThrowIfStopped(scope)
+      await new Promise((r) => setTimeout(r, 1000))
+    }
+    await this.waitIfPausedOrThrowIfStopped(scope)
+
+    const promptInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.promptInput, 8000)
+    if (!promptInput) {
+      throw new Error('Could not find prompt input to send Continue after model unavailable')
+    }
+    await promptInput.click().catch(() => {})
+    await promptInput.fill(CONTINUE_PROMPT)
+    await new Promise((r) => setTimeout(r, 400))
+    const runBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 4000)
+    if (runBtn) {
+      await runBtn.click()
+    } else {
+      await promptInput.press('Control+Enter')
+    }
+    this.logStep(
+      `continue #${continueCount} sent (model unavailable)`,
+      `${jobLabel} [${activeModelName}] — waiting for the model to continue in the same chat`,
+      'info',
+    )
+    onLog?.('info', `${jobLabel}: "Continue" #${continueCount} sent in same chat — model thinking again`)
+  }
+
+  /**
    * FIX 3(c): Send a follow-up "Continue EXACTLY from where you stopped..." message in the same AI Studio chat,
    * wait for the new model turn to finish streaming, and fetch its text.
    */
@@ -7329,7 +7405,7 @@ export class StudioBrowserController {
         }
         page.on('response', onRunResponse)
 
-        const runStarted = Date.now()
+        let runStarted = Date.now()
         // Max time a single Run may stay generating / "Thinking" (all models)
         const TIMEOUT_MS = 15 * 60_000
         const INCOMPLETE_REASONS = new Set([
@@ -7350,6 +7426,8 @@ export class StudioBrowserController {
         let doneIndicator: 'COMPLETION_GATE' | 'INCOMPLETE_60S_CAP' | 'RESCUED_ON_LATE_403' | null = null
         let permissionDeniedTriggered = false
         let modelUnavailableDetected = false
+        // "Model isn't available" handling: Continue in the same chat, as many times as needed
+        let modelUnavailContinueCount = 0
         let internalErrorDetected = false
         let internalErrorContinueTriedInChat = false
         let quotaContinuePartialText: string | null = null
@@ -7957,9 +8035,22 @@ export class StudioBrowserController {
                 break
               }
               if (isModelUnavailableOrHighDemandError(errBannerText, capturedRunError?.status)) {
-                modelUnavailableDetected = true
-                transientBannerReason = `model_unavailable:${errBannerText.slice(0, 80)}`
-                break
+                modelUnavailContinueCount += 1
+                await cancelStuckStopButtonIfVisible()
+                await this.sendContinueAfterModelUnavailable(page, {
+                  jobLabel,
+                  activeModelName,
+                  continueCount: modelUnavailContinueCount,
+                  reason: errBannerText,
+                  scope,
+                  onLog,
+                })
+                capturedRunError = null
+                stopEverSeen = false
+                stopGoneConsecutivePolls = 0
+                stableSeconds = 0
+                runStarted = Date.now()
+                continue
               }
               if (
                 capturedRunError?.status === 401 ||
@@ -8027,6 +8118,12 @@ export class StudioBrowserController {
                     }
                     const lastTurn = turns[turns.length - 1] as HTMLElement | undefined
                     if (!lastTurn) return null
+                    if (
+                      lastTurn.getAttribute('data-cmt-handled-error') === 'true' ||
+                      lastTurn.closest('[data-cmt-handled-error="true"]')
+                    ) {
+                      return null
+                    }
                     const t = (lastTurn.innerText || lastTurn.textContent || '').trim()
                     if (t.length > 600) return null
                     if (
@@ -8072,18 +8169,24 @@ export class StudioBrowserController {
                   capturedRunError?.body ||
                   'HTTP 503 UNAVAILABLE'
                 ).slice(0, 140)
-                this.logStep(
-                  'model unavailable (503) -> switch model',
-                  `${jobLabel} [${activeModelName}] (${unavailReason})`,
-                  'warn',
-                )
-                onLog?.(
-                  'warn',
-                  `${jobLabel}: model unavailable / high demand (${unavailReason}) -> switching model`,
-                )
-                modelUnavailableDetected = true
-                transientBannerReason = `model_unavailable:${unavailReason.slice(0, 80)}`
-                break
+                {
+                modelUnavailContinueCount += 1
+                await cancelStuckStopButtonIfVisible()
+                await this.sendContinueAfterModelUnavailable(page, {
+                  jobLabel,
+                  activeModelName,
+                  continueCount: modelUnavailContinueCount,
+                  reason: unavailReason,
+                  scope,
+                  onLog,
+                })
+                capturedRunError = null
+                stopEverSeen = false
+                stopGoneConsecutivePolls = 0
+                stableSeconds = 0
+                runStarted = Date.now()
+                continue
+              }
               }
 
               const netInternalError =

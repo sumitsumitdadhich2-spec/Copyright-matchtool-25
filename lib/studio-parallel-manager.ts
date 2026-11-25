@@ -4417,6 +4417,54 @@ export class StudioParallelManager {
     }
   }
 
+  private retryRestartWatcherActive = false
+
+  /**
+   * A retry clicked while the scan is still "active" can land after every worker lane already
+   * left its loop (pool shutting down). Nobody would pick the re-queued window up, so wait for the
+   * pool to finish and start again with the queued windows.
+   */
+  private scheduleRestartForQueuedRetries(username?: string) {
+    if (this.retryRestartWatcherActive) return
+    this.retryRestartWatcherActive = true
+    void (async () => {
+      try {
+        const deadline = Date.now() + 30 * 60_000
+        while ((this.active || this.starting) && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 2000))
+        }
+        if (this.active || this.starting || this.stoppingAll) return
+        const queued = this.windows.filter(
+          (w) => w.status === 'QUEUED' && !this.stoppedWindowIds.has(w.id),
+        )
+        if (queued.length === 0) return
+        this.appendCombinedLog({
+          workerId: 'SYS',
+          level: 'RETRY',
+          step: 'retry restart',
+          message: `Worker pool had finished before the retry was picked up -> starting again for ${queued.length} queued window(s): #${queued.map((w) => w.windowNumber).join(', #')}`,
+        })
+        await this.startParallelScan({
+          username: username || this.username || 'admin',
+          scanId: this.scanId,
+          minuteInput: this.minuteInput,
+          concurrency: this.concurrency,
+          resumeExisting: true,
+        })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        this.appendCombinedLog({
+          workerId: 'SYS',
+          level: 'ERROR',
+          step: 'retry restart failed',
+          message: `Could not restart the scan for retried windows: ${msg}`,
+        })
+      } finally {
+        this.retryRestartWatcherActive = false
+      }
+    })()
+  }
+
   public async retryWindow(windowId: string, username?: string) {
     const win = this.windows.find((w) => w.id === windowId)
     if (!win) return
@@ -4447,10 +4495,13 @@ export class StudioParallelManager {
         concurrency: this.concurrency,
         resumeExisting: true,
       })
-    } else if (this.usingOriginalMovieClips && this.startWindowClipTask) {
-      this.clipsTotal += 1
-      this.clipsExtracting = this.clipsReady < this.clipsTotal
-      this.startWindowClipTask(win)
+    } else {
+      if (this.usingOriginalMovieClips && this.startWindowClipTask) {
+        this.clipsTotal += 1
+        this.clipsExtracting = this.clipsReady < this.clipsTotal
+        this.startWindowClipTask(win)
+      }
+      this.scheduleRestartForQueuedRetries(username)
     }
   }
 
@@ -4494,12 +4545,15 @@ export class StudioParallelManager {
         concurrency: this.concurrency,
         resumeExisting: true,
       })
-    } else if (count > 0 && this.usingOriginalMovieClips && this.startWindowClipTask) {
-      this.clipsTotal += count
-      this.clipsExtracting = this.clipsReady < this.clipsTotal
-      for (const w of retriedWins) {
-        this.startWindowClipTask(w)
+    } else if (count > 0) {
+      if (this.usingOriginalMovieClips && this.startWindowClipTask) {
+        this.clipsTotal += count
+        this.clipsExtracting = this.clipsReady < this.clipsTotal
+        for (const w of retriedWins) {
+          this.startWindowClipTask(w)
+        }
       }
+      this.scheduleRestartForQueuedRetries(username)
     }
     return count
   }
@@ -4539,12 +4593,15 @@ export class StudioParallelManager {
         concurrency: this.concurrency,
         resumeExisting: true,
       })
-    } else if (count > 0 && this.usingOriginalMovieClips && this.startWindowClipTask) {
-      this.clipsTotal += count
-      this.clipsExtracting = this.clipsReady < this.clipsTotal
-      for (const w of retriedWins) {
-        this.startWindowClipTask(w)
+    } else if (count > 0) {
+      if (this.usingOriginalMovieClips && this.startWindowClipTask) {
+        this.clipsTotal += count
+        this.clipsExtracting = this.clipsReady < this.clipsTotal
+        for (const w of retriedWins) {
+          this.startWindowClipTask(w)
+        }
       }
+      this.scheduleRestartForQueuedRetries(username)
     }
     return count
   }
