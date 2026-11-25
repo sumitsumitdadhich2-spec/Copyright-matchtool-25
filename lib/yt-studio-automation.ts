@@ -198,6 +198,11 @@ export class YtStudioBrowserController {
   private busyUploadPages: Set<Page> = new Set();
   private contentProgress: YtContentProgressSummary | null = null;
   private dailyUploadLimitReached = false;
+  /** YouTube stopped accepting uploads (upload limit): new uploads fail fast until this time. */
+  private uploadBlockedUntil = 0;
+  private uploadBlockedReason = '';
+  /** Uploads in a row that never got a video on YouTube (Save never ready, no link). */
+  private consecutiveDeadUploads = 0;
   private uploadedVideoIdsInSession: Set<string> = new Set();
   private unlistedFixQueue: Promise<void> = Promise.resolve();
   private unlistedFixQueuePending = 0;
@@ -206,6 +211,9 @@ export class YtStudioBrowserController {
   private screenshotInFlight: Promise<void> | null = null;
 
   private ensureInternalCollections(): void {
+    if (this.uploadBlockedUntil === undefined) this.uploadBlockedUntil = 0;
+    if (this.uploadBlockedReason === undefined) this.uploadBlockedReason = '';
+    if (this.consecutiveDeadUploads === undefined) this.consecutiveDeadUploads = 0;
     if (!this.uploadStartedClipPaths) {
       this.uploadStartedClipPaths = new Set();
     }
@@ -1562,6 +1570,13 @@ export class YtStudioBrowserController {
       const title = `cmt-${scanPrefix}-w${windowNumber}`;
       let lastErr: Error | null = null;
 
+      if (!forceUpload && Date.now() < this.uploadBlockedUntil) {
+        const mins = Math.ceil((this.uploadBlockedUntil - Date.now()) / 60_000);
+        throw new Error(
+          `YT_UPLOAD_LIMIT: YouTube is not taking new uploads right now (${this.uploadBlockedReason}). Next try in ${mins} min — retry W${windowNumber} later (YouTube's limit resets ~24h after the earlier uploads).`
+        );
+      }
+
       for (let attempt = 1; attempt <= 2; attempt++) {
         const uploadPage = await this.acquireUploadPage(username);
         try {
@@ -2226,10 +2241,19 @@ export class YtStudioBrowserController {
             }
             await uploadPage.waitForTimeout(1000);
           }
+          let stuckDialogText = '';
+          let limitText: string | null = null;
           if (!readyToSaveSeen) {
+            limitText = await this.detectDailyUploadLimitOnPage(uploadPage);
+            stuckDialogText = await uploadPage
+              .evaluate(() => {
+                const d = document.querySelector('ytcp-uploads-dialog') as HTMLElement | null;
+                return (d?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+              })
+              .catch(() => '');
             this.log(
               'upload stuck',
-              `[W${String(windowNumber).padStart(2, '0')}] Save never became ready; last progress: "${lastProgTxt || 'none'}" (unchanged for ${Math.round((Date.now() - lastProgChangeAt) / 1000)}s)`,
+              `[W${String(windowNumber).padStart(2, '0')}] Save never became ready; last progress: "${lastProgTxt || 'none'}" (unchanged for ${Math.round((Date.now() - lastProgChangeAt) / 1000)}s)${limitText ? ` · LIMIT: "${limitText}"` : ''} · dialog: "${stuckDialogText || 'empty'}"`,
               'warn'
             );
           }
@@ -2391,6 +2415,23 @@ export class YtStudioBrowserController {
             }
           }
 
+          if (!shareUrl && !readyToSaveSeen) {
+            // The upload never became a video on YouTube. Two such windows in a row (or a limit
+            // message) = YouTube's upload limit: stop uploading for 60 min instead of wasting
+            // ~3 min per window and a 2nd attempt each time.
+            this.consecutiveDeadUploads += 1;
+            if (limitText || this.consecutiveDeadUploads >= 2) {
+              this.uploadBlockedUntil = Date.now() + 60 * 60_000;
+              this.uploadBlockedReason = limitText
+                ? `YouTube says: "${limitText}"`
+                : `${this.consecutiveDeadUploads} uploads in a row never became a video (likely the 24h upload limit)`;
+              this.log('upload limit', `[W${String(windowNumber).padStart(2, '0')}] ${this.uploadBlockedReason} -> pausing uploads for 60 min`, 'error');
+              await this.dismissAllUploadDialogs(uploadPage).catch(() => {});
+              throw new Error(`YT_UPLOAD_LIMIT: ${this.uploadBlockedReason}. Uploads paused 60 min; retry this window later.`);
+            }
+          }
+          if (shareUrl) this.consecutiveDeadUploads = 0;
+
           if (!shareUrl) {
             throw new Error(
               readyToSaveSeen
@@ -2439,6 +2480,10 @@ export class YtStudioBrowserController {
             `[W${String(windowNumber).padStart(2, '0')}] Attempt ${attempt}/2 failed: ${msg}`,
             'error'
           );
+          if (msg.startsWith('YT_UPLOAD_LIMIT:')) {
+            // No 2nd attempt: the upload page is released in finally below.
+            throw lastErr;
+          }
           await this.dumpFailureScreenshot(uploadPage, `upload-w${windowNumber}-a${attempt}`);
           await this.dismissAllUploadDialogs(uploadPage).catch(() => {});
           await uploadPage.waitForTimeout(2000).catch(() => {});
