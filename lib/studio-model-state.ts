@@ -615,6 +615,11 @@ export async function getEffectiveModel(
       return withSlot
     }
 
+    // Waiting for a slot: this window is NOT running, so it must not keep a model reserved.
+    // Otherwise windows that are all waiting block each other forever (e.g. 3 windows each
+    // holding Neon and each seeing "Neon 2/2 by others" = deadlock).
+    releaseExclusiveStudioModel(holderKey)
+
     // The window limit per model per account is never broken (no 3rd window on a model):
     // maxWaitMs 0 = "just look" -> '' when no model has a free slot; stopped -> first usable
     // model WITHOUT taking a lease; otherwise keep waiting for a free slot.

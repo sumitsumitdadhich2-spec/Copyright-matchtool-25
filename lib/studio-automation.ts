@@ -7515,6 +7515,8 @@ export class StudioBrowserController {
               this.logStep('model unavailable -> switch model (same chat)', swMsg, 'warn')
               onLog?.('warn', swMsg)
             } else {
+              // Still running in this chat -> keep this window's slot on its current model
+              updateExclusiveStudioModelLease(this.profileDirName, activeModelName)
               const stayMsg = `${jobLabel}: ${prevModel} still not available after ${CONTINUES_PER_MODEL} Continues, no other model with quota + free slot -> keep continuing on ${prevModel}`
               this.logStep('model unavailable -> no other model', stayMsg, 'warn')
               onLog?.('warn', stayMsg)

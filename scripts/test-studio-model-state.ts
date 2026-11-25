@@ -239,6 +239,22 @@ async function runTests() {
       'no free Neon slot -> no 3rd Neon',
     )
     for (const h of ['lim-a', 'lim-b', 'lim-c']) releaseExclusiveStudioModel(h)
+    // Deadlock guard: 3 windows all holding Neon (account 5). A window that has to wait drops its
+    // own lease, so the others are no longer blocked by it.
+    for (const h of ['dl-a', 'dl-b', 'dl-c']) {
+      setStudioHolderAccount(h, 5)
+      updateExclusiveStudioModelLease(h, 'Neon')
+    }
+    assert.equal(
+      await getEffectiveModel('Neon', ['Neon'], Date.now(), 'dl-c', undefined, { maxWaitMs: 0 }),
+      '',
+    )
+    assert.equal(
+      await getEffectiveModel('Neon', ['Neon'], Date.now(), 'dl-a', undefined, { maxWaitMs: 0 }),
+      'Neon',
+      'after the waiting window lets go, Neon is 1/2 for the others -> runs',
+    )
+    for (const h of ['dl-a', 'dl-b', 'dl-c']) releaseExclusiveStudioModel(h)
     for (const h of ['acct-test-a1', 'acct-test-a2', 'acct-test-a1b', 'acct-test-a3']) releaseExclusiveStudioModel(h)
     await resetModelQuotaState(null, baseNow)
     assert.equal(await isAccountFullyExhausted(2), false, 'Reset clears every account')
