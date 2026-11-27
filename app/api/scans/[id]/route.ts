@@ -38,6 +38,8 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
   return NextResponse.json({
     scan,
     running,
+    // Gemini Minute Finder busy -> header Start / Resume stay off (finder starts the scan itself)
+    minuteFinderRunning: isMinuteFinderRunning(id),
     usage: key ? getAllUsage(key) : null,
   })
 }

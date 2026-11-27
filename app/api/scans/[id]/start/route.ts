@@ -3,7 +3,7 @@ import { getSession } from '@/lib/users'
 import { enqueueBackgroundScan } from '@/lib/background-queue'
 import { getAllUserApiKeys, setUserVerifierEnabled } from '@/lib/user-keys'
 import { deductTokens, refundTokens, SCAN_TOKEN_COST } from '@/lib/tokens'
-import { isMinuteFinderRunning, stopAndWaitMinuteFinder } from '@/lib/gemini-minute-finder'
+import { isMinuteFinderRunning } from '@/lib/gemini-minute-finder'
 import { getScan, saveScan } from '@/lib/store'
 import { loadStudioUserConfig } from '@/lib/studio-settings'
 
@@ -26,6 +26,19 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     // no body
   }
 
+  // While the Gemini Minute Finder runs, Start / Resume are off: the finder starts the chunk
+  // scan itself when it is done. To scan right away, Stop the finder first (finder panel).
+  if (isMinuteFinderRunning(id)) {
+    return NextResponse.json(
+      {
+        error:
+          'Gemini Minute Finder abhi chal raha hai — khatam hote hi scan apne aap start hoga. Abhi scan chahiye to pehle finder panel me Stop dabao.',
+        minuteFinderRunning: true,
+      },
+      { status: 409 },
+    )
+  }
+
   await loadStudioUserConfig(session.username)
   scan.chunkScanEngine = 'studio'
   scan.verifierEnabled = false
@@ -45,18 +58,13 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     charged = true
   }
 
-  // Manual Start = the user's decision. A Gemini Minute Finder still running
-  // for this scan is stopped first so it cannot fire its own scheduler.start
-  // (or keep burning quota) underneath the manual scan.
+  // Finder could have started between the check above and here: never stop it from Start.
   if (isMinuteFinderRunning(id)) {
-    const idle = await stopAndWaitMinuteFinder(id, 'manual Start dabaya gaya', 20_000)
-    if (!idle) {
-      if (charged) await refundTokens(session.username, SCAN_TOKEN_COST)
-      return NextResponse.json(
-        { error: 'Gemini Minute Finder abhi band ho raha hai (request in flight) — kuch seconds baad Start dobara dabao.' },
-        { status: 409 },
-      )
-    }
+    if (charged) await refundTokens(session.username, SCAN_TOKEN_COST)
+    return NextResponse.json(
+      { error: 'Gemini Minute Finder abhi chal raha hai — pehle finder panel me Stop dabao.', minuteFinderRunning: true },
+      { status: 409 },
+    )
   }
 
   const result = await enqueueBackgroundScan(id, session.username, resume)

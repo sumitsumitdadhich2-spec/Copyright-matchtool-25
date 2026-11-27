@@ -356,7 +356,7 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
                 <span>{prescan.error}</span>
               </p>
               <p className="text-[11px] text-muted-foreground">
-                Fallback: header ka <span className="font-medium text-foreground">Start scan</span> hamesha available hai (manual Full scan) — wo is finder par depend nahi karta.
+                Fallback: finder band hone ke baad header ka <span className="font-medium text-foreground">Start scan</span> (manual Full scan) chal sakta hai. Finder chalte waqt Start band rehta hai.
               </p>
             </div>
           )}

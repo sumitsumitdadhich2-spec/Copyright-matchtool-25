@@ -54,6 +54,8 @@ import type { PublicStudioSettings } from '@/lib/studio-settings'
 interface ScanResponse {
   scan: Scan
   running: boolean
+  /** Gemini Minute Finder running for this scan -> Start / Resume off */
+  minuteFinderRunning?: boolean
   usage: Record<string, number> | null
 }
 
@@ -73,7 +75,7 @@ export function Dashboard() {
       const rendering = latest?.scan?.renderJob?.status === 'rendering'
       const segmenting =
         latest?.scan?.shortSegmentingProgress !== undefined && latest.scan.shortSegmentingProgress < 100
-      return st === 'scanning' || st === 'chunking' || latest?.running || latest?.scan?.background?.state === 'queued' || latest?.scan?.background?.state === 'running' || rendering || segmenting ? 1500 : 5000
+      return st === 'scanning' || st === 'chunking' || latest?.running || latest?.minuteFinderRunning || latest?.scan?.background?.state === 'queued' || latest?.scan?.background?.state === 'running' || rendering || segmenting ? 1500 : 5000
     },
   })
 
@@ -93,7 +95,10 @@ export function Dashboard() {
 
   // Scan is BLOCKED when a normal user's tokens are exhausted (admin is unlimited).
   const scanBlocked = user.role !== 'admin' && exhausted
-  const canStart = Boolean(scan && !running && !queued && status === 'ready' && scan.chunkCount > 0 && !scanBlocked)
+  // Minute Finder running -> Start / Resume off so the finder is never stopped by mistake
+  // (it starts the chunk scan itself when done; Stop it in its panel to scan right away).
+  const finderRunning = Boolean(data?.minuteFinderRunning)
+  const canStart = Boolean(scan && !running && !queued && status === 'ready' && scan.chunkCount > 0 && !scanBlocked && !finderRunning)
 
   // Unverified candidate groups or unverified matches that need verification/rescan
   const unverifiedGroupCount = scan
@@ -127,6 +132,7 @@ export function Dashboard() {
   )
   const canResume = Boolean(
     scan &&
+      !finderRunning &&
       !running &&
       !queued &&
       (hasResumableWork || hasUnverifiedWork) &&
@@ -389,6 +395,7 @@ export function Dashboard() {
             type="button"
             onClick={() => action('start')}
             disabled={!canStart || busy}
+            title={finderRunning ? 'Minute Finder chal raha hai — khatam hote hi scan apne aap start hoga (abhi chahiye to finder panel me Stop dabao)' : undefined}
             className="btn-press flex items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground shadow-md shadow-primary/25 hover:shadow-lg hover:shadow-primary/30 disabled:opacity-40 disabled:shadow-none"
           >
             <Play className="size-4" aria-hidden /> Start scan
@@ -397,6 +404,7 @@ export function Dashboard() {
             type="button"
             onClick={() => action('start', { resume: true })}
             disabled={!canResume || busy}
+            title={finderRunning ? 'Minute Finder chal raha hai — Resume band hai' : undefined}
             className="btn-press flex items-center gap-1.5 rounded-lg border border-input bg-card px-4 py-2 text-sm font-medium hover:border-primary/40 hover:bg-secondary disabled:opacity-40"
           >
             <RotateCcw className="size-4" aria-hidden /> Resume
